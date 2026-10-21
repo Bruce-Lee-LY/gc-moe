@@ -1,0 +1,182 @@
+"""Raw-address 1D bulk copies for the GC rank-to-rank token pull.
+
+CuTe's tiled TMA atoms require tensor-map descriptors. The reference uses
+the raw-address cp.async.bulk forms for this particular remote token path;
+the matrix load path will use CuTe tensor-map atoms separately.
+"""
+
+from __future__ import annotations
+
+import cutlass.cute as cute
+from cutlass import Uint8, Uint32, Uint64
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
+
+
+# SM100 TMA cache hints: raw 1D pulls
+# are evicted first; the immediately-consumed 1D store uses normal eviction.
+EVICT_NORMAL = 0x1000000000000000
+EVICT_FIRST = 0x12F0000000000000
+
+
+@dsl_user_op
+def generic_tensormap_ptr(param_ptr: cute.Pointer,
+                          *, loc=None, ip=None) -> cute.Pointer:
+    """Convert a selected by-value TensorMap parameter to a generic pointer.
+
+    The JIT value-formal bridge supplies the raw parameter-space address.
+    Call this on the full loader warp after task phase selection and before
+    elected TMA issue for each task.
+    """
+    address = param_ptr.toint(loc=loc, ip=ip).ir_value()
+    generic = llvm.inline_asm(
+        T.i64(), [address], 'cvta.param.u64 $0, $1;', '=l,l',
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return cute.make_ptr(Uint8, Uint64(generic), cute.AddressSpace.generic,
+                         assumed_align=128, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def prefetch_tensormap(desc: cute.Pointer, *, loc=None, ip=None) -> None:
+    """Prefetch a TensorMap through its generic 64-bit address."""
+    llvm.inline_asm(None, [desc.toint(loc=loc, ip=ip).ir_value()],
+                    'prefetch.tensormap [$0];', 'l',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT,
+                    loc=loc, ip=ip)
+
+
+@dsl_user_op
+def bulk_zero_shared(dst_smem: cute.Pointer, num_bytes: Uint32,
+                      *, loc=None, ip=None) -> None:
+    """Zero an eight-byte-aligned shared-memory region from one issuer."""
+    llvm.inline_asm(
+        None, [Uint64(dst_smem.toint(loc=loc, ip=ip)).ir_value(loc=loc, ip=ip),
+               Uint64(num_bytes).ir_value(loc=loc, ip=ip)],
+        'st.bulk.weak.shared::cta [$0], $1, 0;',
+        'l,l,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def bulk_g2s_1d(dst_smem: cute.Pointer, src_gmem: cute.Pointer,
+                num_bytes: Uint32, mbar_smem: cute.Pointer,
+                *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None, [dst_smem.toint(loc=loc, ip=ip).ir_value(),
+               src_gmem.toint(loc=loc, ip=ip).ir_value(),
+               num_bytes.ir_value(loc=loc, ip=ip),
+               mbar_smem.toint(loc=loc, ip=ip).ir_value(),
+               Uint64(EVICT_FIRST).ir_value(loc=loc, ip=ip)],
+        'cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.'
+        'L2::cache_hint [$0], [$1], $2, [$3], $4;',
+        'r,l,r,r,l,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def bulk_s2g_1d(dst_gmem: cute.Pointer, src_smem: cute.Pointer,
+                num_bytes: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None, [dst_gmem.toint(loc=loc, ip=ip).ir_value(),
+               src_smem.toint(loc=loc, ip=ip).ir_value(),
+               num_bytes.ir_value(loc=loc, ip=ip),
+               Uint64(EVICT_NORMAL).ir_value(loc=loc, ip=ip)],
+        'cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint '
+        '[$0], [$1], $2, $3;',
+        'l,r,r,l,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def tile_g2s_2cta_2d(dst_smem: cute.Pointer, desc_gmem: cute.Pointer,
+                     mbar_smem: cute.Pointer, inner: Uint32, outer: Uint32,
+                     cache_hint: Uint64, *, loc=None, ip=None) -> None:
+    """SM100 2CTA 2D TensorMap load; both CTAs target the leader barrier."""
+    bar = mbar_smem.toint(loc=loc, ip=ip).ir_value()
+    bar_leader = llvm.inline_asm(T.i32(), [bar],
+                                 'and.b32 $0, $1, 0xfeffffff;', '=r,r',
+                                 asm_dialect=llvm.AsmDialect.AD_ATT)
+    llvm.inline_asm(
+        None, [dst_smem.toint(loc=loc, ip=ip).ir_value(),
+               desc_gmem.toint(loc=loc, ip=ip).ir_value(), bar_leader,
+               inner.ir_value(loc=loc, ip=ip), outer.ir_value(loc=loc, ip=ip),
+               cache_hint.ir_value(loc=loc, ip=ip)],
+        'cp.async.bulk.tensor.2d.cta_group::2.shared::cluster.global.'
+        'mbarrier::complete_tx::bytes.L2::cache_hint '
+        '[$0], [$1, {$3, $4}], [$2], $5;',
+        'r,l,r,r,r,l,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def tile_g2s_2cta_4d(dst_smem: cute.Pointer, desc_gmem: cute.Pointer,
+                     mbar_smem: cute.Pointer, k: Uint32, n: Uint32,
+                     domain: Uint32, expert: Uint32, cache_hint: Uint64,
+                     *, loc=None, ip=None) -> None:
+    """SM100 2CTA 4D load, including TensorMap FP4→8bit SMEM unpack."""
+    bar = mbar_smem.toint(loc=loc, ip=ip).ir_value()
+    bar_leader = llvm.inline_asm(T.i32(), [bar],
+                                 'and.b32 $0, $1, 0xfeffffff;', '=r,r',
+                                 asm_dialect=llvm.AsmDialect.AD_ATT)
+    llvm.inline_asm(
+        None, [dst_smem.toint(loc=loc, ip=ip).ir_value(),
+               desc_gmem.toint(loc=loc, ip=ip).ir_value(), bar_leader,
+               k.ir_value(loc=loc, ip=ip), n.ir_value(loc=loc, ip=ip),
+               domain.ir_value(loc=loc, ip=ip), expert.ir_value(loc=loc, ip=ip),
+               cache_hint.ir_value(loc=loc, ip=ip)],
+        'cp.async.bulk.tensor.4d.cta_group::2.shared::cluster.global.'
+        'mbarrier::complete_tx::bytes.L2::cache_hint '
+        '[$0], [$1, {$3, $4, $5, $6}], [$2], $7;',
+        'r,l,r,r,r,r,r,l,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def tile_s2g_2d(desc_gmem: cute.Pointer, src_smem: cute.Pointer,
+                inner: Uint32, outer: Uint32,
+                *, loc=None, ip=None) -> None:
+    """Reference L1 epilogue's unhinted TensorMap 2D global store."""
+    llvm.inline_asm(
+        None, [desc_gmem.toint(loc=loc, ip=ip).ir_value(),
+               src_smem.toint(loc=loc, ip=ip).ir_value(),
+               inner.ir_value(loc=loc, ip=ip), outer.ir_value(loc=loc, ip=ip)],
+        'cp.async.bulk.tensor.2d.global.shared::cta.bulk_group '
+        '[$0, {$2, $3}], [$1];',
+        'l,r,r,r,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def tma_store_fence(*, loc=None, ip=None) -> None:
+    """Publish completed STSM/shared stores to the async TMA proxy.
+
+    Call only after the epilogue warp group's shared-memory synchronization
+    and before issuing ``tile_s2g_2d`` on its elected TMA store lane.
+    """
+    llvm.inline_asm(None, [], 'fence.proxy.async.shared::cta;', '',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def tma_store_arrive(*, loc=None, ip=None) -> None:
+    """Commit the caller's issued S2G copies as one TMA bulk group."""
+    llvm.inline_asm(None, [], 'cp.async.bulk.commit_group;', '',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def tma_store_wait_1(*, loc=None, ip=None) -> None:
+    """Wait until only the newest of two committed store groups remains.
+
+    Used before recycling the older of two shared output stages.  This uses
+    ``wait_group`` without ``.read`` to wait for store completion.
+    """
+    llvm.inline_asm(None, [], 'cp.async.bulk.wait_group 1;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def tma_store_wait_0(*, loc=None, ip=None) -> None:
+    """Drain committed S2G stores before publishing the L2 ready signal."""
+    llvm.inline_asm(None, [], 'cp.async.bulk.wait_group 0;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
