@@ -59,17 +59,25 @@ def cast_grouped_weights_to_fp4(
 
 
 def cast_shared_weight_to_fp8(
-    weight: torch.Tensor, shared_recipe=SHARED_RECIPE,
+    weight: torch.Tensor, weight_recipe=SHARED_RECIPE,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     n, k = weight.shape
-    if shared_recipe == (1, 1, 32):
+    if weight_recipe == (1, 1, 32):
         quantized, scales = per_token_cast_to_fp8(weight, use_ue8m0=True, gran_k=32)
     else:
+        assert weight_recipe in ((1, 32, 32), (1, 128, 128))
         quantized, scales = per_block_cast_to_fp8(
-            weight, use_ue8m0=True, gran_k=shared_recipe[2]
+            weight, use_ue8m0=True, gran_k=weight_recipe[2]
         )
+    scale_recipe = weight_recipe[1:]
+    if weight_recipe == (1, 32, 32):
+        block_scales = scales
+        scales = block_scales.repeat_interleave(32, dim=0)[:n]
+        assert torch.equal(scales[::32].contiguous().view(torch.uint8),
+                           block_scales.contiguous().view(torch.uint8))
+        scale_recipe = (1, 32)
     scales = deep_gemm.transform_sf_into_required_layout(
-        scales, n, k, shared_recipe[1:], num_groups=None
+        scales, n, k, scale_recipe, num_groups=None
     )
     return quantized, scales
 
@@ -241,7 +249,8 @@ def build_weights(args, rank, world, device, reference=False):
     del raw
     raw = build_shared_weights(args.intermediate_hidden, args.hidden, args.num_shared_experts, device)
     recipe = (1, 128, 128) if args.shared_weight_gran_k == 128 else (1, 1, 32)
-    shared = tuple(cast_shared_weight_to_fp8(w, recipe) for w in raw)
+    weight_recipe = (1, args.shared_weight_gran_k, args.shared_weight_gran_k)
+    shared = tuple(cast_shared_weight_to_fp8(w, weight_recipe) for w in raw)
     base_shared = deep_gemm.transform_weights_for_mega_moe(*shared, activation=args.activation)
     gc_shared = gc_moe.transform_weights_for_gc_moe(*shared, activation=args.activation)
     for left, right in [(base_routed, gc_routed), (base_shared, gc_shared)]:
@@ -421,7 +430,9 @@ def main():
                          aligned_capacity={'baseline': base_buffer.num_max_tokens_per_rank,
                                            'candidate': gc_buffer.num_max_tokens_per_rank},
                          routed_recipe=ROUTED_RECIPE,
-                         shared_recipe=recipe, activation_gran_k=ACTIVATION_GRAN_K,
+                         shared_recipe=recipe,
+                         shared_weight_recipe=(1, args.shared_weight_gran_k, args.shared_weight_gran_k),
+                         activation_gran_k=ACTIVATION_GRAN_K,
                          eager_repeats=args.gc_replays, graph_repeats=args.gc_replays,
                          reference='external Torch dequant, distributed routed sum and local shared branch; no MoE reference calls',
                          operators={'baseline': 'deep_gemm.fp8_fp4_mega_moe', 'candidate': 'gc_moe.fp8_fp4_gc_moe'},

@@ -6,40 +6,74 @@ import cutlass
 import cutlass.cute as cute
 import math
 from cutlass import Float32, Int32, Uint8, Uint16, Uint32, Uint64
-from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm
 
 from ..comm.gc_barrier import (
+    DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS,
+    grid_sync,
+    nvlink_barrier,
+    sync_dispatch_threads,
+    wait_sys_u64_eq,
+)
+from ..common.math import (
+    abs_f32,
+    f32x2_to_e4m3x2_bits,
+    fmax_f32,
+    pack_bf16_pair,
+    ue8m0_fp8_inv,
+    ue8m0_fp8_scale_exp,
+    warp_group4_max,
+)
+from ..common.tma_copy import load_mixed_k128_tma
+from ..jit_kernels.heuristics.gc_moe import get_combine_geometry
+from ..layout.gc_moe import (
+    GCBufferLayout,
+    MAX_RANKS,
+    SIGNAL_OFFSETS,
+    get_role_shared_layout,
+)
+from ..layout.sym_buffer import mapped_peer_base
+from ..mma.sm100 import (
+    MixedMmaTile,
+    blockscaled_instr_desc_hi,
+    issue_mixed_k128,
+    kmajor_smem_desc,
+    kmajor_smem_desc_from_start,
+    select_weight_format,
+)
+from ..ptx.ld_st import (
     atom_add_u64,
-    atom_sys_add_u64,
     atom_shared_add_u32,
-    device_trap,
-    elect_one_sync,
+    atom_sys_add_u64,
+    bulk_zero_shared,
     ld_acquire_gpu_u32,
     ld_acquire_gpu_u64,
+    ld_global_u32x3,
+    ld_global_u32x4,
     ld_global_u64,
+    ld_shared_u32x4,
     ld_volatile_u32,
     ld_volatile_u64,
-    mapped_peer_base,
     red_gpu_add_s32,
     red_gpu_add_u32,
     red_release_gpu_add_u32,
     red_release_gpu_xor_u64,
     red_release_sys_add_u64,
+    st_global_u32x4,
     st_global_u64,
     st_release_sys_u64,
-    sync_epilogue_threads,
-    sync_dispatch_threads,
-    grid_sync,
-    nvlink_barrier,
-    wait_sys_u64_eq,
+    st_shared_u32x4,
+    stmatrix_bf16x8_trans,
+    stmatrix_fp8x4_trans_late,
 )
-from ..layout.gc_moe import GCBufferLayout, MAX_RANKS, SIGNAL_OFFSETS, get_role_shared_layout
+from ..ptx.tcgen05 import (
+    tcgen05_after_thread_sync,
+    tcgen05_before_thread_sync,
+    tmem_free_2cta,
+    tmem_load_16dp256b4,
+)
 from ..ptx.tma import (
     bulk_g2s_1d,
     bulk_s2g_1d,
-    bulk_zero_shared,
     generic_tensormap_ptr,
     prefetch_tensormap,
     tile_s2g_2d,
@@ -48,103 +82,37 @@ from ..ptx.tma import (
     tma_store_wait_0,
     tma_store_wait_1,
 )
-from ..ptx.tcgen05 import (
-    blockscaled_instr_desc_hi,
-    kmajor_smem_desc,
-    kmajor_smem_desc_from_start,
-    tcgen05_after_thread_sync,
-    tcgen05_before_thread_sync,
-    tmem_free_2cta,
-    tmem_load_16dp256b4,
-    tmem_wait_load,
-    ld_shared_u32x4,
-    st_global_u32x4,
-    stmatrix_fp8x4_trans_late,
-    stmatrix_bf16x8_trans,
+from ..ptx.utils import (
+    accumulate_bf16_into_f32,
+    assume_u32_lt,
+    device_trap,
+    elect_one_sync,
+    sync_aligned,
+    sync_unaligned,
+    undefined_u32,
+    warp_first_set_bit,
+    warp_nth_set_bit,
     warpgroup_reg_alloc,
     warpgroup_reg_dealloc,
 )
 from ..scheduler.gc_moe import (
     GCBlockPhase,
     TASK_EMPTY_CONSUMERS,
+    advance_expert,
     claim_task,
+    locate_routed_pool_block,
     publish_iteration,
     publish_shared_phase,
     release_task_info,
     wait_task_slot,
 )
-from .mma_pipeline import MixedMmaTile, issue_mixed_k128, load_mixed_k128_tma
-from .epilogue_math import (
-    abs_f32,
-    f32x2_to_bf16x2_bits,
-    f32x2_to_e4m3x2_bits,
-    swiglu_pair,
-    sync_epilogue_warpgroup,
-    ue8m0_fp8_inv,
-    ue8m0_fp8_scale_exp,
-)
-
-
-@dsl_user_op
-def _select_weight_format(is_shared: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Keep the reference's shared/routed descriptor choice in one MMA path."""
-    return Uint32(llvm.inline_asm(
-        T.i32(), [is_shared.ir_value(loc=loc, ip=ip)],
-        '{ .reg .pred p; setp.ne.u32 p, $1, 0; '
-        'selp.b32 $0, 0, 5, p; }', '=r,r', has_side_effects=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT))
-
-
-@dsl_user_op
-def _assume_u32_lt(value: Uint32, bound: Uint32,
-                   *, loc=None, ip=None) -> None:
-    """CuTe translation of the reference's unsigned __builtin_assume."""
-    condition = llvm.icmp(
-        llvm.ICmpPredicate.ult,
-        value.ir_value(loc=loc, ip=ip),
-        bound.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
-    llvm.intr_assume(condition, [], [], loc=loc, ip=ip)
-
-
-def _role3_combine_geometry(hidden: int, reusable_bytes: int,
-                            launch_bytes: int) -> tuple[int, int, int, int]:
-    """Reusable-prefix and per-warp combine scratch geometry."""
-    if hidden <= 0 or reusable_bytes <= 0 or launch_bytes <= 0:
-        raise ValueError('invalid role3 combine resources')
-    chunks = 1 if 48 * hidden <= reusable_bytes and hidden <= 4096 else 2
-    if hidden % chunks:
-        raise ValueError('role3 hidden must divide into whole chunks')
-    chunk_bytes = 2 * hidden // chunks
-    scratch_bytes = 3 * 8 * chunk_bytes
-    if scratch_bytes > reusable_bytes:
-        raise ValueError('role3 combine scratch exceeds reusable shared memory')
-    if chunk_bytes % 512:
-        raise ValueError('role3 combine chunk needs one 16-byte value per lane')
-    if scratch_bytes + 16 * 8 > launch_bytes:
-        raise ValueError('role3 compact combine allocation exceeds launch shared memory')
-    if chunks == 2 and hidden > 4096 and hidden % 1024 == 0:
-        chunks = 4
-        chunk_bytes //= 2
-        scratch_bytes //= 2
-    return chunks, chunk_bytes, scratch_bytes, chunk_bytes // 512
+from .epilogue_math import swiglu_pair
 
 
 @cute.jit
-def _pack_bf16_pair(first: Float32, second: Float32) -> Uint32:
-    """Reference cast_into_bf16_and_pack: paired RN conversion."""
-    return f32x2_to_bf16x2_bits(first, second)
-
-
-@dsl_user_op
-def _add_bf16_into_f32(acc: Float32, bf16_bits: Uint16,
-                       *, loc=None, ip=None) -> Float32:
-    """Reference ptx::accumulate: one BF16-to-FP32 add with RN semantics."""
-    value = llvm.inline_asm(
-        T.f32(), [bf16_bits.ir_value(loc=loc, ip=ip),
-                  acc.ir_value(loc=loc, ip=ip)],
-        'add.rn.f32.bf16 $0, $1, $2;', '=f,h,f',
-        has_side_effects=False, asm_dialect=llvm.AsmDialect.AD_ATT)
-    return Float32(value)
+def sync_epilogue_warpgroup(warpgroup: Uint32) -> None:
+    """Reference WG-local barrier ID 3 + warpgroup, with 128 callers."""
+    sync_aligned(128, Uint32(3) + warpgroup)
 
 
 @cute.jit
@@ -182,30 +150,6 @@ def _release_w1_tmem(accum_empty: cute.Pointer, stage: Uint32) -> None:
 
 
 @cute.jit
-def _w1_fmax(a: Float32, b: Float32) -> Float32:
-    # Source fmaxf semantics, including the reduction's NaN selection.
-    return Float32(_w1_max_f32(a, b))
-
-
-@dsl_user_op
-def _w1_max_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
-    result = llvm.inline_asm(
-        T.f32(), [a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip)],
-        'max.f32 $0, $1, $2;', '=f,f,f', has_side_effects=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT)
-    return Float32(result)
-
-
-@cute.jit
-def _w1_group4_max(value: Float32) -> Float32:
-    # Reduce within each lane%4 group.
-    for offset in cutlass.range_constexpr(3):
-        value = _w1_fmax(value, cute.arch.shuffle_sync_bfly(
-            value, 4 << offset))
-    return value
-
-
-@cute.jit
 def _w1_pack_fp8x4(a: Float32, b: Float32,
                     c: Float32, d: Float32) -> Uint32:
     """Pack reference channel0/token0, channel0/token1, channel1/token0/1."""
@@ -215,183 +159,27 @@ def _w1_pack_fp8x4(a: Float32, b: Float32,
 
 
 @cute.jit
-def _warp_inclusive_m_blocks(value: Uint32, lane: Uint32) -> Uint32:
-    """Full-warp inclusive sum for one expert-count wave."""
-    for shift in cutlass.range_constexpr(5):
-        offset = 1 << shift
-        neighbor = cute.arch.shuffle_sync_up(value, offset, mask_and_clamp=0)
-        if lane >= Uint32(offset):
-            value += neighbor
-    return value
-
-
-@cute.jit
-def _locate_routed_pool_block_register(counts: cute.Tensor,
-                                       pool_block: Uint32, lane: Uint32,
-                                       local_experts: cutlass.Constexpr,
-                                       block_m: cutlass.Constexpr):
-    """Reference GCMoEScheduler::create_task from per-lane count registers."""
-    expert = Uint32(0)
-    m_block = Uint32(0)
-    valid_m = Uint32(0)
-    block_offset = Uint32(0)
-    for wave in cutlass.range_constexpr((local_experts + 31) // 32):
-        expert_idx = Uint32(wave * 32) + lane
-        received = counts[wave]
-        blocks = (received + Uint32(block_m - 1)) // Uint32(block_m)
-        inclusive = _warp_inclusive_m_blocks(blocks, lane)
-        lane_offset = block_offset + inclusive - blocks
-        is_owner = expert_idx < Uint32(local_experts) and \
-            pool_block >= lane_offset and pool_block < lane_offset + blocks
-        owner_mask = Uint32(cute.arch.vote_ballot_sync(is_owner))
-        if owner_mask != Uint32(0):
-            owner_lane = _warp_first_set_bit(owner_mask)
-            local_m = pool_block - lane_offset
-            local_valid = min(Uint32(block_m),
-                              received - local_m * Uint32(block_m))
-            expert = cute.arch.shuffle_sync(expert_idx, owner_lane)
-            m_block = cute.arch.shuffle_sync(local_m, owner_lane)
-            valid_m = cute.arch.shuffle_sync(local_valid, owner_lane)
-        block_offset += cute.arch.shuffle_sync(inclusive, 31)
-    return expert, m_block, valid_m
-
-
-@cute.jit
-def _role1_cached_num_tokens(counts: cute.Tensor, expert: Int32,
-                             lane: Uint32,
-                             local_experts: cutlass.Constexpr) -> Uint32:
-    """GCMoEScheduler::get_num_tokens from expert wave*32+lane registers."""
-    selected = Uint32(0)
-    for wave in cutlass.range_constexpr((local_experts + 31) // 32):
-        if Uint32(expert) == Uint32(wave * 32) + lane:
-            selected = counts[wave]
-    return cute.arch.shuffle_sync(selected, Uint32(expert) % Uint32(32))
-
-
-@cute.jit
-def _role1_advance_expert(counts: cute.Tensor, token_idx: Uint32,
-                          current_expert: Int32, expert_start: Uint32,
-                          expert_end: Uint32, pool_block_offset: Uint32,
-                          lane: Uint32, local_experts: cutlass.Constexpr,
-                          block_m: cutlass.Constexpr):
-    """Advance the unpadded token interval and its padded pool prefix."""
-    while token_idx >= expert_end and current_expert < Int32(local_experts):
-        current_expert += Int32(1)
-        if current_expert < Int32(local_experts):
-            pool_block_offset += (expert_end - expert_start +
-                                  Uint32(block_m - 1)) // Uint32(block_m)
-            expert_start = expert_end
-            expert_end += _role1_cached_num_tokens(
-                counts, current_expert, lane, local_experts)
-    return current_expert, expert_start, expert_end, pool_block_offset
-
-
-@dsl_user_op
-def _warp_first_set_bit(mask: Uint32, *, loc=None, ip=None) -> Uint32:
-    """Unsigned __ffs(mask)-1, including UINT_MAX for an empty mask."""
-    lane = llvm.inline_asm(
-        T.i32(), [mask.ir_value(loc=loc, ip=ip)],
-        '{ .reg .b32 reversed; .reg .b32 first; '
-        'brev.b32 reversed, $1; '
-        'bfind.shiftamt.u32 first, reversed; '
-        'mov.b32 $0, first; }',
-        '=r,r', has_side_effects=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT)
-    return Uint32(lane)
-
-
-@dsl_user_op
-def _warp_nth_set_bit(mask: Uint32, one_based_offset: Uint32,
-                      *, loc=None, ip=None) -> Uint32:
-    """PTX fns.b32, matching reference __fns(mask, 0, offset)."""
-    lane = llvm.inline_asm(
-        T.i32(), [mask.ir_value(loc=loc, ip=ip),
-                  one_based_offset.ir_value(loc=loc, ip=ip)],
-        'fns.b32 $0, $1, 0, $2;', '=r,r,r', has_side_effects=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT)
-    return Uint32(lane)
-
-
-@dsl_user_op
-def _load_global_u32x4(src: cute.Pointer, *, loc=None, ip=None) -> tuple[Uint32, Uint32, Uint32, Uint32]:
-    """Read one aligned 16-byte source scale-factor vector."""
-    words = llvm.inline_asm(
-        ir.Type.parse('!llvm.struct<(i32,i32,i32,i32)>'),
-        [src.toint(loc=loc, ip=ip).ir_value()],
-        'ld.global.v4.b32 {$0, $1, $2, $3}, [$4];',
-        '=r,=r,=r,=r,l', has_side_effects=True,
-        asm_dialect=llvm.AsmDialect.AD_ATT)
-    return tuple(Uint32(llvm.extractvalue(T.i32(), words, [i])) for i in range(4))
-
-
-@dsl_user_op
-def _load_routed_metadata(src: cute.Pointer, *, loc=None,
-                           ip=None) -> tuple[Uint32, Uint32, Uint32]:
-    """Read one valid row's source metadata before W2 shared stores."""
-    values = llvm.inline_asm(
-        ir.Type.parse('!llvm.struct<(i32,i32,i32)>'),
-        [src.toint(loc=loc, ip=ip).ir_value()],
-        'ld.global.u32 $0, [$3]; '
-        'ld.global.u32 $1, [$3+4]; '
-        'ld.global.u32 $2, [$3+8];',
-        '=r,=r,=r,l,~{memory}', has_side_effects=True,
-        asm_dialect=llvm.AsmDialect.AD_ATT)
-    return tuple(Uint32(llvm.extractvalue(T.i32(), values, [i]))
-                 for i in range(3))
-
-@dsl_user_op
-def _undefined_u32(*, loc=None, ip=None) -> Uint32:
-    return Uint32(llvm.mlir_undef(T.i32(), loc=loc, ip=ip))
-
-
-@cute.jit
 def _load_w2_source_metadata(base: cute.Pointer, row_in_block: Uint32,
                               valid_m: Uint32, pool_token: Uint32,
                               rank_idx: Uint32, is_shared,
                               topk: cutlass.Constexpr,
                               has_shared: cutlass.Constexpr):
     """Read valid rows with fresh undefined values for inactive rows."""
-    src_rank = _undefined_u32()
-    src_token = _undefined_u32()
-    topk_slot = _undefined_u32()
+    src_rank = undefined_u32()
+    src_token = undefined_u32()
+    topk_slot = undefined_u32()
     if row_in_block < valid_m:
         if cutlass.const_expr(has_shared):
             src_rank = rank_idx
             src_token = pool_token
             topk_slot = Uint32(topk)
             if not is_shared:
-                src_rank, src_token, topk_slot = _load_routed_metadata(
+                src_rank, src_token, topk_slot = ld_global_u32x3(
                     base + pool_token * Uint32(3))
         else:
-            src_rank, src_token, topk_slot = _load_routed_metadata(
+            src_rank, src_token, topk_slot = ld_global_u32x3(
                 base + pool_token * Uint32(3))
     return src_rank, src_token, topk_slot
-
-
-@dsl_user_op
-def _sync_role3_entry(*, loc=None, ip=None) -> None:
-    """Reference barrier 1 joins all 128 dispatch and 256 combine threads."""
-    llvm.inline_asm(None, [], 'barrier.sync 1, 384;', '',
-                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
-
-
-@dsl_user_op
-def _sync_role3_epilogue(*, loc=None, ip=None) -> None:
-    """Reference barrier 2 joins the eight combine warps after peer waits."""
-    llvm.inline_asm(None, [], 'bar.sync 2, 256;', '',
-                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
-
-
-@dsl_user_op
-def _st_role3_shared_u32x4(dst: cute.Pointer, a: Uint32, b: Uint32,
-                           c: Uint32, d: Uint32, *, loc=None, ip=None) -> None:
-    """One lane writes one contiguous 16-byte BF16 combine output vector."""
-    llvm.inline_asm(
-        None, [dst.toint(loc=loc, ip=ip).ir_value(),
-               a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip),
-               c.ir_value(loc=loc, ip=ip), d.ir_value(loc=loc, ip=ip)],
-        'st.shared.v4.b32 [$0], {$1, $2, $3, $4};', 'r,r,r,r,r',
-        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
 
 
 class GCMoERoleKernel:
@@ -414,7 +202,7 @@ class GCMoERoleKernel:
                  math_stages: int = 2,
                  combine_reusable_bytes: int | None = None,
                  combine_launch_bytes: int | None = None,
-                 nvlink_timeout_secs: int = 3600):
+                 nvlink_timeout_secs: int = DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS):
         if role not in (1, 2, 3):
             raise ValueError('role must be dispatch, compute or finalize')
         if local_experts < 1 or local_experts > 512 or \
@@ -505,7 +293,7 @@ class GCMoERoleKernel:
                 raise ValueError('role3 shared storage differs from the configured layout')
             (self.combine_chunks, self.combine_chunk_bytes,
              self.combine_scratch_bytes, self.combine_uint4_per_lane) = \
-                _role3_combine_geometry(hidden, combine_reusable_bytes,
+                get_combine_geometry(hidden, combine_reusable_bytes,
                                         combine_launch_bytes)
             self.finalize_sms = min(
                 compute_sms,
@@ -624,6 +412,12 @@ class GCMoERoleKernel:
                 Uint64(rank_idx * 8), cute.AddressSpace.gmem,
                 assumed_align=8)
             red_release_sys_add_u64(dst, Uint64(1))
+        # Dual-buffered receive sums: this replay consumes the generation
+        # selected by the persistent parity word; the bump below flips it
+        # for the next replay while this kernel clears the retired one.
+        gen = ld_volatile_u32(
+            signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4) & Uint32(1)
+        recv_ptr = recv_ptr + gen * Uint32(self.local_experts * 2)
         # GCMoEScheduler::fetch_expert_recv_count: each lane keeps
         # experts wave*32+lane in registers while combine reuses SMEM.
         for wave in cutlass.range_constexpr(
@@ -641,6 +435,16 @@ class GCMoERoleKernel:
         # any CTA clears the global receive sums.
         grid_sync(signals, Uint32(block), Uint32(tid),
                   self.finalize_sms, 0, sync_participants=128)
+        # Every CTA consumed this replay's receive generation above; flip
+        # the persistent parity so the next replay publishes into the
+        # alternate generation.  Cross-rank ordering of the retired
+        # generation's clear against the next-next publish is carried by
+        # the tag 1 rank barrier and the combine-ready release/acquire
+        # chain, replacing the former tail NVLink barrier.
+        if block == Uint32(0) and tid == Uint32(0):
+            red_gpu_add_u32(
+                signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4,
+                Uint32(1))
         warpgroup_reg_dealloc(48 if self.local_experts <= 64 else 96)
 
         if block == 0:
@@ -693,6 +497,7 @@ class GCMoERoleKernel:
                     recv_rank_idx = recv_rank * Uint32(self.local_experts) + local_expert
                     st_global_u64(
                         signals.iterator + SIGNAL_OFFSETS['expert_recv_count'] // 4 +
+                        gen * Uint32(self.num_ranks * self.local_experts * 2) +
                         recv_rank_idx * Uint32(2), Uint64(0))
                     recv_rank += Uint32(128)
                 cute.arch.sync_warp()
@@ -709,12 +514,10 @@ class GCMoERoleKernel:
                 cute.arch.sync_warp()
                 local_expert += Uint32(self.finalize_sms - 1)
 
-        # The prologue grid barrier waits for every dispatch CTA's
-        # cleanup. Combine warps do not participate in tag 2.
-        nvlink_barrier(signals, peer_ptrs, Uint32(block), Uint32(tid),
-                       self.num_ranks, self.finalize_sms,
-                       True, False, rank_idx, 2,
-                       self.nvlink_timeout_secs, sync_participants=128)
+        # The former tail NVLink barrier (tag 2) is gone: the receive
+        # signals are dual-buffered by recv_parity, so peers' next publish
+        # targets the alternate generation and ordering is carried by the
+        # tag 1 rank barrier plus the combine-ready release/acquire chain.
 
     @cute.jit
     def _role3_combine(self, signals: cute.Tensor, rank_idx: Uint32,
@@ -732,7 +535,7 @@ class GCMoERoleKernel:
         while peer < Uint32(self.num_ranks):
             wait_sys_u64_eq(ready + peer * 2, Uint64(1), rank_idx, peer)
             peer += Uint32(8)
-        _sync_role3_epilogue()
+        sync_aligned(256, 2)
         if cutlass.const_expr(self.finalize_output):
             # One warp owns a token chunk. Each load slot has one
             # transaction-counted barrier; store has its own region.
@@ -767,9 +570,9 @@ class GCMoERoleKernel:
                     if cutlass.const_expr(self.shared_experts > 0):
                         slot = (Uint32(self.topk) if
                                 (mask & (Uint32(1) << Uint32(self.topk))) != Uint32(0)
-                                else _warp_first_set_bit(mask))
+                                else warp_first_set_bit(mask))
                     else:
-                        slot = _warp_first_set_bit(mask)
+                        slot = warp_first_set_bit(mask)
                     mask ^= Uint32(1) << slot
                     if elect_one_sync():
                         src = combine + \
@@ -791,9 +594,9 @@ class GCMoERoleKernel:
                         if cutlass.const_expr(self.shared_experts > 0):
                             slot = (Uint32(self.topk) if
                                     (mask & (Uint32(1) << Uint32(self.topk))) != Uint32(0)
-                                    else _warp_first_set_bit(mask))
+                                    else warp_first_set_bit(mask))
                         else:
-                            slot = _warp_first_set_bit(mask)
+                            slot = warp_first_set_bit(mask)
                         mask ^= Uint32(1) << slot
                         if elect_one_sync():
                             src = combine + \
@@ -819,11 +622,11 @@ class GCMoERoleKernel:
                         for q in cutlass.range_constexpr(4):
                             packed = words[q]
                             reduced[j * 8 + q * 2] = \
-                                _add_bf16_into_f32(
+                                accumulate_bf16_into_f32(
                                     reduced[j * 8 + q * 2],
                                     Uint16(packed & Uint32(0xffff)))
                             reduced[j * 8 + q * 2 + 1] = \
-                                _add_bf16_into_f32(
+                                accumulate_bf16_into_f32(
                                     reduced[j * 8 + q * 2 + 1],
                                     Uint16(packed >> Uint32(16)))
                     cute.arch.fence_view_async_shared()
@@ -834,13 +637,13 @@ class GCMoERoleKernel:
                 for j in cutlass.range_constexpr(u4_per_lane):
                     packed_words = cute.make_rmem_tensor((4,), Uint32)
                     for q in cutlass.range_constexpr(4):
-                        packed_words[q] = _pack_bf16_pair(
+                        packed_words[q] = pack_bf16_pair(
                             reduced[j * 8 + q * 2],
                             reduced[j * 8 + q * 2 + 1])
                     if cutlass.const_expr(j == 0):
                         tma_store_wait_0()
                         cute.arch.sync_warp()
-                    _st_role3_shared_u32x4(
+                    st_shared_u32x4(
                         store_words + (j * 32 + lane) * 4,
                         packed_words[0], packed_words[1],
                         packed_words[2], packed_words[3])
@@ -891,7 +694,14 @@ class GCMoERoleKernel:
                 ready_off = SIGNAL_OFFSETS['combine_ready_grid_idx'] // 4
                 st_release_sys_u64(
                     signals.iterator + ready_off + tid * Uint32(2), Uint64(0))
-            recv_ptr = signals.iterator + SIGNAL_OFFSETS['expert_recv_count_sum'] // 4
+            # Dual-buffered receive signals: replay N publishes and reads
+            # generation N % 2; role 3 flips the persistent parity word
+            # after consuming each replay, and clears only the retired
+            # generation, so no cross-rank tail barrier is needed.
+            gen = ld_volatile_u32(
+                signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4) & Uint32(1)
+            recv_ptr = signals.iterator + SIGNAL_OFFSETS['expert_recv_count_sum'] // 4 + \
+                gen * Uint32(self.local_experts * 2)
             send_ptr = signals.iterator + SIGNAL_OFFSETS['expert_send_count'] // 4
             routes = cute.make_tensor(
                 cute.recast_ptr(signals.iterator + self.topk_offset_words, dtype=Uint64),
@@ -966,12 +776,14 @@ class GCMoERoleKernel:
                         expert_idx * Uint32(2))
                     remote_count = cute.make_ptr(
                         Uint64, dst_base + Uint64(SIGNAL_OFFSETS['expert_recv_count']) +
+                        Uint64(gen * Uint32(self.num_ranks * self.local_experts * 8)) +
                         Uint64((rank_idx * Uint32(self.local_experts) + dst_local) *
                                Uint32(8)), cute.AddressSpace.gmem,
                         assumed_align=8)
                     st_global_u64(remote_count, status & Uint64(0xffffffff))
                     remote_sum = cute.make_ptr(
                         Uint64, dst_base + Uint64(SIGNAL_OFFSETS['expert_recv_count_sum']) +
+                        Uint64(gen * Uint32(self.local_experts * 8)) +
                         Uint64(dst_local * Uint32(8)),
                         cute.AddressSpace.gmem, assumed_align=8)
                     atom_sys_add_u64(remote_sum, status)
@@ -1012,7 +824,7 @@ class GCMoERoleKernel:
             rank_waves = (self.num_ranks + 31) // 32
             stored_rank_count = cute.make_rmem_tensor((rank_waves,), Uint32)
             current_expert, expert_start, expert_end, pool_block_offset = \
-                _role1_advance_expert(
+                advance_expert(
                     expert_counts, token_idx, current_expert, expert_start,
                     expert_end, pool_block_offset, lane, self.local_experts,
                     self.block_m)
@@ -1025,6 +837,7 @@ class GCMoERoleKernel:
                         if source_rank < Uint32(self.num_ranks):
                             count_ptr = signals.iterator + \
                                 SIGNAL_OFFSETS['expert_recv_count'] // 4 + \
+                                gen * Uint32(self.num_ranks * self.local_experts * 2) + \
                                 (source_rank * Uint32(self.local_experts) +
                                  Uint32(current_expert)) * Uint32(2)
                             stored_rank_count[wave] = Uint32(
@@ -1065,7 +878,7 @@ class GCMoERoleKernel:
                                 remaining[wave] > Uint32(0)))
                             wave_active = Uint32(cute.arch.popc(mask))
                             if position >= seen and position < seen + wave_active:
-                                src_rank = Uint32(wave * 32) + _warp_nth_set_bit(
+                                src_rank = Uint32(wave * 32) + warp_nth_set_bit(
                                     mask, position - seen + Uint32(1))
                             seen += wave_active
                         src_slot = peel_offset + peel_slot // active
@@ -1131,7 +944,7 @@ class GCMoERoleKernel:
                             remote_vec = cute.make_ptr(
                                 Uint32, remote_sf_base + Uint64(q * Uint32(16)),
                                 cute.AddressSpace.gmem, assumed_align=16)
-                            values = _load_global_u32x4(remote_vec)
+                            values = ld_global_u32x4(remote_vec)
                             for component in cutlass.range_constexpr(4):
                                 sf_col = q * 4 + component
                                 if cutlass.const_expr(self.wide_l1_sf):
@@ -1192,7 +1005,7 @@ class GCMoERoleKernel:
                 cute.arch.sync_warp()
                 token_idx += Uint32(self.dispatch_sms * self.dispatch_warps)
                 current_expert, expert_start, expert_end, pool_block_offset = \
-                    _role1_advance_expert(
+                    advance_expert(
                         expert_counts, token_idx, current_expert, expert_start,
                         expert_end, pool_block_offset, lane, self.local_experts,
                         self.block_m)
@@ -1247,7 +1060,12 @@ class GCMoERoleKernel:
                 else:
                     warpgroup_reg_alloc(self.epi_registers)
             iteration = Uint32(0)
-            recv_ptr = signals.iterator + SIGNAL_OFFSETS['expert_recv_count_sum'] // 4
+            # Dual-buffered receive sums: poll the generation selected by
+            # the persistent parity word (volatile read, fresh from L2).
+            gen = ld_volatile_u32(
+                signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4) & Uint32(1)
+            recv_ptr = signals.iterator + SIGNAL_OFFSETS['expert_recv_count_sum'] // 4 + \
+                gen * Uint32(self.local_experts * 2)
             l1_count_ptr = signals.iterator + SIGNAL_OFFSETS['l1_task_count'] // 4
             l2_count_ptr = signals.iterator + SIGNAL_OFFSETS['l2_task_count'] // 4
             shared_l1_count_ptr = signals.iterator + SIGNAL_OFFSETS['shared_l1_task_count'] // 4
@@ -1333,7 +1151,7 @@ class GCMoERoleKernel:
                                 pool_block = task_idx // l1_clusters
                                 n_cluster = task_idx % l1_clusters
                                 local_expert, m_block, valid_m = \
-                                    _locate_routed_pool_block_register(
+                                    locate_routed_pool_block(
                                         expert_counts, pool_block, Uint32(lane),
                                         self.local_experts, self.block_m)
                                 publish_iteration(task, full, iteration, Int32(lane),
@@ -1353,7 +1171,7 @@ class GCMoERoleKernel:
                                 pool_block = task_idx // l2_clusters
                                 n_cluster = task_idx % l2_clusters
                                 local_expert, m_block, valid_m = \
-                                    _locate_routed_pool_block_register(
+                                    locate_routed_pool_block(
                                         expert_counts, pool_block, Uint32(lane),
                                         self.local_experts, self.block_m)
                                 required_l1 = (pool_block + 1) * l1_clusters
@@ -1585,7 +1403,7 @@ class GCMoERoleKernel:
                             num_k_blocks = shape_k // Uint32(128)
                             weight_format = Uint32(5)
                             if cutlass.const_expr(self.shared_experts > 0):
-                                weight_format = _select_weight_format(is_shared)
+                                weight_format = select_weight_format(is_shared)
                             aligned_n = (valid_m + Uint32(15)) & Uint32(~15)
                             instr_desc_base = blockscaled_instr_desc_hi(
                                 aligned_n, weight_format, Uint32(0), Uint32(0))
@@ -1807,13 +1625,13 @@ class GCMoERoleKernel:
                                             activation_values[atom, 1] = value1
                                             activation_values[atom, 2] = value2
                                             activation_values[atom, 3] = value3
-                                            amax0 = _w1_group4_max(
-                                                _w1_fmax(
-                                                    _w1_fmax(Float32(0), abs_f32(value0)),
+                                            amax0 = warp_group4_max(
+                                                fmax_f32(
+                                                    fmax_f32(Float32(0), abs_f32(value0)),
                                                     abs_f32(value2)))
-                                            amax1 = _w1_group4_max(
-                                                _w1_fmax(
-                                                    _w1_fmax(Float32(0), abs_f32(value1)),
+                                            amax1 = warp_group4_max(
+                                                fmax_f32(
+                                                    fmax_f32(Float32(0), abs_f32(value1)),
                                                     abs_f32(value3)))
                                             reduced_amax[atom, 0] = amax0
                                             reduced_amax[atom, 1] = amax1
@@ -1835,10 +1653,10 @@ class GCMoERoleKernel:
                                                 Uint32(self.store_m_l1) + \
                                                 Uint32(atom * 8) + \
                                                 (Uint32(lane) % Uint32(4)) * Uint32(2)
-                                            sf_amax0 = _w1_fmax(
+                                            sf_amax0 = fmax_f32(
                                                 reduced_amax[atom, 0],
                                                 epi_amax[partner_offset])
-                                            sf_amax1 = _w1_fmax(
+                                            sf_amax1 = fmax_f32(
                                                 reduced_amax[atom, 1],
                                                 epi_amax[partner_offset + 1])
                                             sf_exp0 = ue8m0_fp8_scale_exp(sf_amax0)
@@ -1874,7 +1692,7 @@ class GCMoERoleKernel:
                                                     warp_in_wg // Uint32(2)
                                                 token_base = wg_start_m + Uint32(
                                                     store * self.store_m_l1 + atom * 8)
-                                                _assume_u32_lt(
+                                                assume_u32_lt(
                                                     token_base, Uint32(self.block_m))
                                                 sf_token = output_block * Uint32(self.sf_block_m) + \
                                                     (token_base & Uint32(~127)) + \
@@ -2006,13 +1824,13 @@ class GCMoERoleKernel:
                                             buffer = store % 2 if self.block_m == 240 else 0
                                             stmatrix_bf16x8_trans(
                                                 cd_wg + smem_store_offset,
-                                                _pack_bf16_pair(raw_values[buffer, atom, 0],
+                                                pack_bf16_pair(raw_values[buffer, atom, 0],
                                                                 raw_values[buffer, atom, 1]),
-                                                _pack_bf16_pair(raw_values[buffer, atom, 2],
+                                                pack_bf16_pair(raw_values[buffer, atom, 2],
                                                                 raw_values[buffer, atom, 3]),
-                                                _pack_bf16_pair(raw_values[buffer, atom, 4],
+                                                pack_bf16_pair(raw_values[buffer, atom, 4],
                                                                 raw_values[buffer, atom, 5]),
-                                                _pack_bf16_pair(raw_values[buffer, atom, 6],
+                                                pack_bf16_pair(raw_values[buffer, atom, 6],
                                                                 raw_values[buffer, atom, 7]))
                                         sync_epilogue_warpgroup(warpgroup)
                                         for atom in cutlass.range_constexpr(
@@ -2049,7 +1867,7 @@ class GCMoERoleKernel:
                                                 st_global_u32x4(
                                                     dst, words[0], words[1],
                                                     words[2], words[3])
-                            sync_epilogue_threads()
+                            sync_aligned(256, 2)
                     is_w1_release = task_phase == Uint32(GCBlockPhase.Linear1)
                     if cutlass.const_expr(self.shared_experts > 0):
                         is_w1_release = is_w1_release or \
@@ -2099,7 +1917,7 @@ class GCMoERoleKernel:
                     combine_smem + self.shared_layout.combine_bars, dtype=Uint64)
                 self._initialize_shared_storage(
                     combine_smem, Uint32(physical_warp), Uint32(lane))
-            _sync_role3_entry()
+            sync_unaligned(384, 1)
             expert_counts = cute.make_rmem_tensor(
                 ((self.local_experts + 31) // 32,), Uint32)
             recv_off = SIGNAL_OFFSETS['expert_recv_count_sum'] // 4

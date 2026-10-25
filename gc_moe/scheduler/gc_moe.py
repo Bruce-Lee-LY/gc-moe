@@ -12,10 +12,16 @@ from enum import IntEnum
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Uint32
-from cutlass.cutlass_dsl import T, dsl_user_op
-from cutlass._mlir.dialects import llvm
 
-from ..comm.gc_barrier import atom_add_u32, elect_one_sync
+from ..common.math import warp_inclusive_sum
+from ..ptx.ld_st import (
+    atom_add_u32,
+    st_async_cluster_u32x4,
+)
+from ..ptx.utils import (
+    elect_one_sync,
+    warp_first_set_bit,
+)
 
 
 class GCBlockPhase(IntEnum):
@@ -32,35 +38,6 @@ SCHEDULE_STAGES = 2
 TASK_EMPTY_CONSUMERS = 512
 
 
-@dsl_user_op
-def mapa_shared(ptr: cute.Pointer, peer_cta: Int32, *, loc=None, ip=None) -> Int32:
-    address = ptr.toint(loc=loc, ip=ip).ir_value()
-    mapped = llvm.inline_asm(
-        T.i32(), [address, peer_cta.ir_value(loc=loc, ip=ip)],
-        'mapa.shared::cluster.u32 $0, $1, $2;', '=r,r,r',
-        has_side_effects=False, asm_dialect=llvm.AsmDialect.AD_ATT)
-    return Int32(mapped)
-
-
-@dsl_user_op
-def store_task_v4(task_ptr: cute.Pointer, mbar_ptr: cute.Pointer,
-                  peer_cta: Int32, word_offset: Int32,
-                  a: Uint32, b: Uint32, c: Uint32, d: Uint32,
-                  *, loc=None, ip=None) -> None:
-    task_address = mapa_shared(task_ptr + word_offset, peer_cta, loc=loc, ip=ip)
-    mbar_address = mapa_shared(mbar_ptr, peer_cta, loc=loc, ip=ip)
-    llvm.inline_asm(
-        None,
-        [task_address.ir_value(loc=loc, ip=ip),
-         a.ir_value(loc=loc, ip=ip), b.ir_value(loc=loc, ip=ip),
-         c.ir_value(loc=loc, ip=ip), d.ir_value(loc=loc, ip=ip),
-         mbar_address.ir_value(loc=loc, ip=ip)],
-        'st.async.shared::cluster.mbarrier::complete_tx::bytes.u32.v4 '
-        '[$0], {$1, $2, $3, $4}, [$5];',
-        'r,r,r,r,r,r', has_side_effects=True,
-        asm_dialect=llvm.AsmDialect.AD_ATT)
-
-
 @cute.jit
 def publish_task32(task_ptr: cute.Pointer, full_ptr: cute.Pointer,
                    stage: Int32, peer_cta: Int32,
@@ -70,9 +47,9 @@ def publish_task32(task_ptr: cute.Pointer, full_ptr: cute.Pointer,
                    shape_n: Uint32, shape_k: Uint32) -> None:
     cute.arch.mbarrier_arrive_and_expect_tx(full_ptr + stage, TASK_BYTES, peer_cta)
     base = stage * TASK_WORDS
-    store_task_v4(task_ptr, full_ptr + stage, peer_cta, base,
+    st_async_cluster_u32x4(task_ptr, full_ptr + stage, peer_cta, base,
                   block_phase, local_expert, m_block, n_cluster)
-    store_task_v4(task_ptr, full_ptr + stage, peer_cta, base + 4,
+    st_async_cluster_u32x4(task_ptr, full_ptr + stage, peer_cta, base + 4,
                   pool_block, valid_m, shape_n, shape_k)
 
 
@@ -156,3 +133,64 @@ def publish_shared_phase(task_ptr: cute.Pointer, full_ptr: cute.Pointer,
                                   valid_m, Uint32(shape_n), Uint32(shape_k))
                 iteration += Uint32(1)
     return iteration
+
+
+@cute.jit
+def locate_routed_pool_block(counts: cute.Tensor,
+                             pool_block: Uint32, lane: Uint32,
+                             local_experts: cutlass.Constexpr,
+                             block_m: cutlass.Constexpr):
+    """Reference GCMoEScheduler::create_task from per-lane count registers."""
+    expert = Uint32(0)
+    m_block = Uint32(0)
+    valid_m = Uint32(0)
+    block_offset = Uint32(0)
+    for wave in cutlass.range_constexpr((local_experts + 31) // 32):
+        expert_idx = Uint32(wave * 32) + lane
+        received = counts[wave]
+        blocks = (received + Uint32(block_m - 1)) // Uint32(block_m)
+        inclusive = warp_inclusive_sum(blocks, lane)
+        lane_offset = block_offset + inclusive - blocks
+        is_owner = expert_idx < Uint32(local_experts) and \
+            pool_block >= lane_offset and pool_block < lane_offset + blocks
+        owner_mask = Uint32(cute.arch.vote_ballot_sync(is_owner))
+        if owner_mask != Uint32(0):
+            owner_lane = warp_first_set_bit(owner_mask)
+            local_m = pool_block - lane_offset
+            local_valid = min(Uint32(block_m),
+                              received - local_m * Uint32(block_m))
+            expert = cute.arch.shuffle_sync(expert_idx, owner_lane)
+            m_block = cute.arch.shuffle_sync(local_m, owner_lane)
+            valid_m = cute.arch.shuffle_sync(local_valid, owner_lane)
+        block_offset += cute.arch.shuffle_sync(inclusive, 31)
+    return expert, m_block, valid_m
+
+
+@cute.jit
+def cached_num_tokens(counts: cute.Tensor, expert: Int32,
+                      lane: Uint32,
+                      local_experts: cutlass.Constexpr) -> Uint32:
+    """GCMoEScheduler::get_num_tokens from expert wave*32+lane registers."""
+    selected = Uint32(0)
+    for wave in cutlass.range_constexpr((local_experts + 31) // 32):
+        if Uint32(expert) == Uint32(wave * 32) + lane:
+            selected = counts[wave]
+    return cute.arch.shuffle_sync(selected, Uint32(expert) % Uint32(32))
+
+
+@cute.jit
+def advance_expert(counts: cute.Tensor, token_idx: Uint32,
+                   current_expert: Int32, expert_start: Uint32,
+                   expert_end: Uint32, pool_block_offset: Uint32,
+                   lane: Uint32, local_experts: cutlass.Constexpr,
+                   block_m: cutlass.Constexpr):
+    """Advance the unpadded token interval and its padded pool prefix."""
+    while token_idx >= expert_end and current_expert < Int32(local_experts):
+        current_expert += Int32(1)
+        if current_expert < Int32(local_experts):
+            pool_block_offset += (expert_end - expert_start +
+                                  Uint32(block_m - 1)) // Uint32(block_m)
+            expert_start = expert_end
+            expert_end += cached_num_tokens(
+                counts, current_expert, lane, local_experts)
+    return current_expert, expert_start, expert_end, pool_block_offset

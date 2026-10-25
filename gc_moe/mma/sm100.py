@@ -1,9 +1,4 @@
-"""Compile-time geometry for the single persistent 2CTA GC math worker.
-
-The worker consumes `GCTaskInfo` for routed W1/W2 and shared W1/W2 in one
-cluster. These values size its SMEM/TMEM stages and encode per-K-block L2
-dependencies; they are not a separate dense-kernel launch configuration.
-"""
+"""SM100 mixed-MMA tile geometry, descriptors and K128 issue sequence."""
 
 from __future__ import annotations
 
@@ -12,8 +7,8 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 from cutlass import Uint16, Uint32, Uint64
-from cutlass.cutlass_dsl import dsl_user_op
-from cutlass._mlir.dialects import arith
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import arith, llvm
 
 from ..ptx.tcgen05 import (
     mma_mxf8f6f4_2cta,
@@ -21,7 +16,45 @@ from ..ptx.tcgen05 import (
     tcgen05_commit_2cta,
     utccp_sf_4x32_2cta,
 )
-from ..ptx.tma import EVICT_FIRST, tile_g2s_2cta_2d, tile_g2s_2cta_4d
+
+
+@cute.jit
+def blockscaled_instr_desc_hi(umma_n: Uint32, weight_format: Uint32,
+                              weight_sf_byte: Uint32,
+                              activation_sf_byte: Uint32) -> Uint32:
+    """Encode the reference swapped-operand MXF8F6F4 instruction descriptor.
+
+    The descriptor's A operand is the *weight* (E2M1=5 or E4M3=0) and B is
+    the FP8 activation. `umma_n` is align(valid_m, 16), not BLOCK_M. SF byte
+    selectors map to bits 29:30 for weight A and 4:5 for activation B.
+    See the CUTLASS InstrDescriptorBlockScaled bitfield definition.
+    """
+    return (Uint32(16) << 24) | (Uint32(1) << 23) | \
+        ((umma_n >> 3) << 17) | (weight_format << 7) | \
+        (weight_sf_byte << 29) | (activation_sf_byte << 4)
+
+
+@cute.jit
+def kmajor_smem_desc(smem_ptr: cute.Pointer, stride_bytes: Uint32,
+                     swizzle_128: cutlass.Constexpr,
+                     byte_offset: Uint32) -> Uint64:
+    """SM100 descriptor for reference K-major 128B data or UTCCP SF tile."""
+    address = Uint64(smem_ptr.toint()) + Uint64(byte_offset)
+    layout = Uint64(2) if cutlass.const_expr(swizzle_128) else Uint64(0)
+    return ((address >> 4) & Uint64(0x3fff)) | \
+        (Uint64(stride_bytes >> 4) << 32) | (Uint64(1) << 46) | \
+        (layout << 61)
+
+
+@cute.jit
+def kmajor_smem_desc_from_start(start_address_16b: Uint32,
+                                stride_bytes: Uint32,
+                                swizzle_128: cutlass.Constexpr) -> Uint64:
+    """Keep descriptor flags fixed and replace only the reference low address."""
+    layout = Uint64(2) if cutlass.const_expr(swizzle_128) else Uint64(0)
+    return Uint64(start_address_16b & Uint32(0x3fff)) | \
+        (Uint64(stride_bytes >> 4) << 32) | (Uint64(1) << 46) | \
+        (layout << 61)
 
 
 @dataclass(frozen=True)
@@ -105,92 +138,6 @@ class MixedMmaTile:
         if k_block < 0 or (k_block + 1) * width > self.l1_n_blocks:
             raise ValueError('invalid L2 K block')
         return ((1 << width) - 1) << (k_block * width)
-
-
-@cute.jit
-def load_mixed_k128_tma(activation_map: cute.Pointer,
-                        activation_sf_map: cute.Pointer,
-                        weight_map: cute.Pointer,
-                        weight_sf_map: cute.Pointer,
-                        activation_smem: cute.Pointer,
-                        activation_sf_smem: cute.Pointer,
-                        weight_smem: cute.Pointer,
-                        weight_sf_smem: cute.Pointer,
-                        full_bar: cute.Pointer, empty_bar: cute.Pointer,
-                        k_block: Uint32, stage_phase: Uint32,
-                        block_idx: Uint32, n_block: Uint32,
-                        local_expert: Uint32, valid_m: Uint32,
-                        shape_n: Uint32, shape_k: Uint32,
-                        is_shared: Uint32, cta_rank: Uint32,
-                        loader_warp: cutlass.Constexpr,
-                        block_m: cutlass.Constexpr,
-                        sf_block_m: cutlass.Constexpr,
-                        shared_weight_gran_k: cutlass.Constexpr,
-                        has_shared: cutlass.Constexpr) -> None:
-    """Warp 0/1 stage the same K128 task through 2CTA TensorMaps.
-
-    Both CTAs issue their own TMA transfers into local SMEM. The leader's
-    full barrier counts two arrivals per CTA and source-byte transaction
-    counts for both CTAs. The caller waits it before issuing mixed MMA.
-    """
-    cute.arch.mbarrier_wait(empty_bar, stage_phase ^ Uint32(1))
-    k_idx = k_block * Uint32(128)
-    cache_hint = Uint64(0x1000000000000000)
-    if cutlass.const_expr(loader_warp == 0):
-        aligned_m = (valid_m + Uint32(15)) & Uint32(~15)
-        m_idx = block_idx * Uint32(block_m)
-        if cta_rank != Uint32(0):
-            m_idx += aligned_m // Uint32(2)
-        with cute.arch.elect_one():
-            tile_g2s_2cta_2d(activation_smem, activation_map, full_bar,
-                             k_idx, m_idx, cache_hint)
-            tile_g2s_2cta_2d(activation_sf_smem, activation_sf_map, full_bar,
-                             block_idx * Uint32(sf_block_m), k_block,
-                             cache_hint)
-            if cta_rank == Uint32(0):
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    full_bar, 2 * ((block_m // 2) * 128 + sf_block_m * 4))
-            else:
-                cute.arch.mbarrier_arrive(full_bar, peer_cta_rank_in_cluster=0)
-    else:
-        n_idx = n_block * Uint32(128)
-        half_n = shape_n // Uint32(2)
-        domain = Uint32(1) if n_idx >= half_n else Uint32(0)
-        half_n_idx = n_idx - domain * half_n
-        # Evict routed FP4 weights first. Shared FP8 weights and
-        # both scale-factor maps retain the normal cache hint.
-        weight_cache_hint = Uint64(EVICT_FIRST)
-        gran = Uint32(32)
-        if cutlass.const_expr(has_shared):
-            weight_cache_hint = (Uint64(EVICT_FIRST) if is_shared == Uint32(0)
-                                 else cache_hint)
-            if cutlass.const_expr(shared_weight_gran_k == 128):
-                if is_shared != Uint32(0):
-                    gran = Uint32(128)
-        sf_stages = gran // Uint32(32)
-        sf_index = k_block // sf_stages
-        sf_packs_per_expert = (shape_k + gran * Uint32(4) - Uint32(1)) // \
-            (gran * Uint32(4))
-        load_sf = k_block % sf_stages == Uint32(0)
-        weight_bytes = Uint32(128 * 128 // 2)
-        if cutlass.const_expr(has_shared):
-            if is_shared != Uint32(0):
-                weight_bytes = Uint32(128 * 128)
-        sf_bytes = Uint32(128 * 4) if load_sf else Uint32(0)
-        with cute.arch.elect_one():
-            tile_g2s_2cta_4d(weight_smem, weight_map, full_bar,
-                             k_idx, half_n_idx, domain, local_expert,
-                             weight_cache_hint)
-            if load_sf:
-                tile_g2s_2cta_2d(weight_sf_smem, weight_sf_map, full_bar,
-                                 n_idx, local_expert * sf_packs_per_expert + sf_index,
-                                 cache_hint)
-            if cta_rank == Uint32(0):
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    full_bar, (weight_bytes + sf_bytes) * Uint32(2))
-            else:
-                cute.arch.mbarrier_arrive(full_bar, peer_cta_rank_in_cluster=0)
-    cute.arch.sync_warp()
 
 
 @dsl_user_op
@@ -280,3 +227,13 @@ def issue_mixed_k128(weight_desc_start: Uint32, activation_desc_start: Uint32,
         if last_k_block != Uint32(0):
             tcgen05_commit_2cta(accum_full_bar, Uint16(3))
     cute.arch.sync_warp()
+
+
+@dsl_user_op
+def select_weight_format(is_shared: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Keep the reference's shared/routed descriptor choice in one MMA path."""
+    return Uint32(llvm.inline_asm(
+        T.i32(), [is_shared.ir_value(loc=loc, ip=ip)],
+        '{ .reg .pred p; setp.ne.u32 p, $1, 0; '
+        'selp.b32 $0, 0, 5, p; }', '=r,r', has_side_effects=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT))

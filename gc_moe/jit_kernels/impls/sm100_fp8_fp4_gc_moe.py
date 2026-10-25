@@ -19,28 +19,48 @@ import shlex
 import subprocess
 import tempfile
 import threading
-from typing import Optional
 
 from cutlass import Float32, Uint32
 import cutlass.cute as cute
 from cutlass.base_dsl.dsl import BaseDSL
 from cutlass._mlir._mlir_libs import _cutlass_ir
-from cutlass.base_dsl.compiler import (
-    CompileOptions, DeviceTarget, ExtraCompilerOpts, GPUArch, LinkLibraries,
-    OptLevel, PtxasOptions, RDC,
-)
+from cutlass.base_dsl.compiler import CompileOptions, DeviceTarget, ExtraCompilerOpts, GPUArch, LinkLibraries, OptLevel, PtxasOptions, RDC
 from cutlass.cute.runtime import from_dlpack
 import torch
 from cuda.bindings import driver as cu
 
-from ..heuristics.gc_moe import get_role_config, num_max_live_pool_blocks
-from ...layout.gc_moe import MAX_RANKS, align, ceil_div, get_role_shared_layout
-from ...kernels.sm100_fp8_fp4_gc_moe import (
-    GCMoERoleKernel,
-    _role3_combine_geometry,
+from ...comm.gc_barrier import DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS
+from ...kernels.sm100_fp8_fp4_gc_moe import GCMoERoleKernel
+from ...layout.gc_moe import (
+    MAX_RANKS,
+    align,
+    ceil_div,
+    get_role_shared_layout,
 )
 from ...runtime.gc_moe import RoleBinary
+from ..heuristics.gc_moe import (
+    get_combine_geometry,
+    get_role_config,
+    num_max_live_pool_blocks,
+)
 from .tma_descriptors import build_gc_tma_plan
+
+
+def _get_gc_moe_nvlink_barrier_timeout_secs() -> int:
+    """Read the positive signed-decimal int32 barrier timeout."""
+    name = 'GC_MOE_NVLINK_BARRIER_TIMEOUT_SECS'
+    value = os.getenv(name)
+    if value is None or value == '':
+        return DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS
+    if re.fullmatch(r"[ \t\n\v\f\r]*[+-]?[0-9]+", value, re.ASCII) is None:
+        raise ValueError(f"Invalid {name}: {value}")
+    try:
+        seconds = int(value, 10)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {name}: {value}") from exc
+    if not 0 < seconds <= 2_147_483_647:
+        raise ValueError(f"Invalid {name}: {value}")
+    return seconds
 
 
 _SYSTEM_PTXAS = '/usr/local/cuda/bin/ptxas'
@@ -429,23 +449,6 @@ def _assemble_role_value_params(ptx: str, role: int,
                                 target=target, ptxas_options=ptxas_options)
 
 
-def _get_gc_moe_nvlink_barrier_timeout_secs() -> int:
-    """Match the reference JIT's positive decimal strtoll/INT_MAX contract."""
-    name = 'GC_MOE_NVLINK_BARRIER_TIMEOUT_SECS'
-    value = os.getenv(name)
-    if value is None or value == '':
-        return 3600
-    if re.fullmatch(r"[ \t\n\v\f\r]*[+-]?[0-9]+", value, re.ASCII) is None:
-        raise ValueError(f"Invalid {name}: {value}")
-    try:
-        seconds = int(value, 10)
-    except ValueError as exc:
-        raise ValueError(f"Invalid {name}: {value}") from exc
-    if not 0 < seconds <= 2_147_483_647:
-        raise ValueError(f"Invalid {name}: {value}")
-    return seconds
-
-
 def _capture_key(config, sym_buffer, green_context, l1_weights, l2_weights,
                  shared_l1_weights, shared_l2_weights, stats,
                  nvlink_timeout_secs: int, role_resources: tuple,
@@ -545,7 +548,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
     combine_reusable_bytes = role3_layout.reusable_bytes
     if role3_layout.field_end > role3_config.dynamic_smem:
         raise ValueError('role3 shared storage exceeds its launch allocation')
-    combine_chunks, combine_chunk_bytes, _, _ = _role3_combine_geometry(
+    combine_chunks, combine_chunk_bytes, _, _ = get_combine_geometry(
         config.hidden, combine_reusable_bytes, role3_config.dynamic_smem)
     combine_resources = (combine_reusable_bytes, combine_chunks,
                          combine_chunk_bytes)

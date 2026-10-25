@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from math import ceil, sqrt
 from struct import pack, unpack
 
-from ...layout.gc_moe import CANDIDATE_BLOCK_M, align, ceil_div
+from ...layout.gc_moe import (
+    CANDIDATE_BLOCK_M,
+    align,
+    ceil_div,
+)
 
 
 SMEM_CAPACITY = 232448
@@ -128,3 +132,26 @@ def get_role_config(role: int, block_m: int, num_experts: int,
     return RoleConfig(role, block_m, 128, 128, store1, store2,
                       dispatch_threads, threads, stages, dynamic_smem,
                       stage, fixed)
+
+
+def get_combine_geometry(hidden: int, reusable_bytes: int,
+                         launch_bytes: int) -> tuple[int, int, int, int]:
+    """Reusable-prefix and per-warp combine scratch geometry."""
+    if hidden <= 0 or reusable_bytes <= 0 or launch_bytes <= 0:
+        raise ValueError('invalid role3 combine resources')
+    chunks = 1 if 48 * hidden <= reusable_bytes and hidden <= 4096 else 2
+    if hidden % chunks:
+        raise ValueError('role3 hidden must divide into whole chunks')
+    chunk_bytes = 2 * hidden // chunks
+    scratch_bytes = 3 * 8 * chunk_bytes
+    if scratch_bytes > reusable_bytes:
+        raise ValueError('role3 combine scratch exceeds reusable shared memory')
+    if chunk_bytes % 512:
+        raise ValueError('role3 combine chunk needs one 16-byte value per lane')
+    if scratch_bytes + 16 * 8 > launch_bytes:
+        raise ValueError('role3 compact combine allocation exceeds launch shared memory')
+    if chunks == 2 and hidden > 4096 and hidden % 1024 == 0:
+        chunks = 4
+        chunk_bytes //= 2
+        scratch_bytes //= 2
+    return chunks, chunk_bytes, scratch_bytes, chunk_bytes // 512

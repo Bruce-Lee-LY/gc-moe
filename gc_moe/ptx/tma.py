@@ -12,11 +12,10 @@ from cutlass import Uint8, Uint32, Uint64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-
-# SM100 TMA cache hints: raw 1D pulls
-# are evicted first; the immediately-consumed 1D store uses normal eviction.
-EVICT_NORMAL = 0x1000000000000000
-EVICT_FIRST = 0x12F0000000000000
+from .ld_st import (
+    EVICT_FIRST,
+    EVICT_NORMAL,
+)
 
 
 @dsl_user_op
@@ -43,18 +42,6 @@ def prefetch_tensormap(desc: cute.Pointer, *, loc=None, ip=None) -> None:
                     'prefetch.tensormap [$0];', 'l',
                     has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT,
                     loc=loc, ip=ip)
-
-
-@dsl_user_op
-def bulk_zero_shared(dst_smem: cute.Pointer, num_bytes: Uint32,
-                      *, loc=None, ip=None) -> None:
-    """Zero an eight-byte-aligned shared-memory region from one issuer."""
-    llvm.inline_asm(
-        None, [Uint64(dst_smem.toint(loc=loc, ip=ip)).ir_value(loc=loc, ip=ip),
-               Uint64(num_bytes).ir_value(loc=loc, ip=ip)],
-        'st.bulk.weak.shared::cta [$0], $1, 0;',
-        'l,l,~{memory}', has_side_effects=True,
-        asm_dialect=llvm.AsmDialect.AD_ATT)
 
 
 @dsl_user_op

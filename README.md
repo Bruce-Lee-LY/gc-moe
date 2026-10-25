@@ -12,20 +12,24 @@ it does not compile CUDA kernels. The current package version is `0.1.0`.
 
 ## Performance
 
-GLM5.2 decode latency on eight NVIDIA B300 GPUs, comparing GC MoE with
+GLM5.2 and DSV4.1-Flash decode latency on eight NVIDIA B300 GPUs, comparing GC MoE with
 Mega MoE using CUDA Graph replay. Each point uses 1–256 tokens per rank;
 total tokens equal eight times the per-rank count. The figures use the
 measurements recorded in the linked reports.
 
 ### Routed experts (non-SE)
 
-![GLM5.2 non-SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/glm52_gc_moe.png)
+![GLM5.2 non-SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/b300_glm52_gc_moe.png)
+
+![DSV4.1-Flash non-SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/b300_dsv41_flash_gc_moe.png)
 
 [Full non-SE accuracy and performance data](docs/b300_gc_moe.md).
 
 ### Fused shared experts (SE)
 
-![GLM5.2 fused SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/glm52_gc_moe_se.png)
+![GLM5.2 fused SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/b300_glm52_gc_moe_se.png)
+
+![DSV4.1-Flash fused SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/b300_dsv41_flash_gc_moe_se.png)
 
 [Full SE accuracy and performance data](docs/b300_gc_moe_se.md).
 

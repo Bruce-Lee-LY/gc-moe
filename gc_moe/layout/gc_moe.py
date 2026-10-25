@@ -103,11 +103,17 @@ def _signal_offsets() -> dict[str, int]:
         ('l2_task_count', 2, 4),
         ('shared_l1_task_count', 2, 4),
         ('shared_l2_task_count', 2, 4),
+        # Persistent receive-generation parity: replay N reads/writes
+        # generation parity & 1 of expert_recv_count/expert_recv_count_sum
+        # (slot range [gen * count, (gen + 1) * count) inside each field's
+        # dual-generation region); role 3 flips this word once per replay
+        # after the finalize grid sync.  Lives in the header padding.
+        ('recv_parity', 1, 4),
         ('combine_ready_grid_idx', MAX_RANKS, 8),
         ('peer_grid_idx', MAX_RANKS, 8),
         ('expert_send_count', MAX_EXPERTS, 8),
-        ('expert_recv_count', MAX_EXPERTS, 8),
-        ('expert_recv_count_sum', MAX_EXPERTS_PER_RANK, 8),
+        ('expert_recv_count', 2 * MAX_EXPERTS, 8),
+        ('expert_recv_count_sum', 2 * MAX_EXPERTS_PER_RANK, 8),
         ('l1_full_count', MAX_RING_BLOCKS, 4),
         ('l1_empty_count', MAX_RING_BLOCKS, 4),
         ('l2_full_mask', MAX_RING_BLOCKS, 8),
