@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Uint32, Uint64
+from cutlass import Float32, Int32, Uint32, Uint64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
@@ -362,3 +363,114 @@ def bulk_zero_shared(dst_smem: cute.Pointer, num_bytes: Uint32,
         'st.bulk.weak.shared::cta [$0], $1, 0;',
         'l,l,~{memory}', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def st_release_u32(ptr: cute.Pointer, value: Uint32, system: cutlass.Constexpr,
+                   *, loc=None, ip=None):
+    scope = 'sys' if system else 'gpu'
+    llvm.inline_asm(None, [ptr.toint().ir_value(), value.ir_value()],
+                    f'st.release.{scope}.global.u32 [$0], $1;', 'l,r,~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def copy_global_16(dst: Uint64, src: Uint64, *, loc=None, ip=None):
+    llvm.inline_asm(None, [dst.ir_value(), src.ir_value()],
+                    '{ .reg .b32 a,b,c,d; '
+                    'ld.global.v4.u32 {a,b,c,d}, [$1]; '
+                    'st.global.v4.u32 [$0], {a,b,c,d}; }',
+                    'l,l,~{memory}', has_side_effects=True,
+                    asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def load_shared_8(ptr: cute.Pointer, paired: cutlass.Constexpr,
+                   *, loc=None, ip=None):
+    offset = 512 if paired else 16
+    result = llvm.inline_asm(
+        ir.Type.parse('!llvm.struct<(' + ','.join(['f32'] * 8) + ')>'),
+        [ptr.toint().ir_value()],
+        f'ld.shared.v4.f32 {{$0,$1,$2,$3}}, [$8]; '
+        f'ld.shared.v4.f32 {{$4,$5,$6,$7}}, [$8+{offset}];',
+        ','.join(['=f'] * 8 + ['r','~{memory}']), has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+    return tuple(Float32(llvm.extractvalue(T.f32(), result, [i])) for i in range(8))
+
+
+@dsl_user_op
+def load_bf16_8(ptr: Uint64, *, loc=None, ip=None):
+    body = '{ .reg .b32 w<4>; .reg .b16 b<8>; '
+    body += 'ld.global.v4.u32 {w0,w1,w2,w3}, [$8]; '
+    for i in range(4):
+        body += f'mov.b32 {{b{2*i},b{2*i+1}}}, w{i}; '
+        body += f'cvt.f32.bf16 ${2*i}, b{2*i}; cvt.f32.bf16 ${2*i+1}, b{2*i+1}; '
+    body += '}'
+    result = llvm.inline_asm(
+        ir.Type.parse('!llvm.struct<(' + ','.join(['f32'] * 8) + ')>'),
+        [ptr.ir_value()], body, ','.join(['=f'] * 8 + ['l','~{memory}']),
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+    return tuple(Float32(llvm.extractvalue(T.f32(), result, [i])) for i in range(8))
+
+
+@dsl_user_op
+def store_bf16_8(ptr: Uint64, values: tuple, *, loc=None, ip=None):
+    body = '{ .reg .b32 w<4>; '
+    for i in range(4):
+        body += f'cvt.rn.bf16x2.f32 w{i}, ${2*i+2}, ${2*i+1}; '
+    body += 'st.global.v4.u32 [$0], {w0,w1,w2,w3}; }'
+    llvm.inline_asm(None, [ptr.ir_value()] + [x.ir_value() for x in values], body,
+                    ','.join(['l'] + ['f'] * 8 + ['~{memory}']),
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def atom_acq_rel_add_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None):
+    result = llvm.inline_asm(T.i32(), [ptr.toint().ir_value(), value.ir_value()],
+                             'atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;',
+                             '=r,l,r,~{memory}', has_side_effects=True,
+                             asm_dialect=llvm.AsmDialect.AD_ATT)
+    return Uint32(result)
+
+
+@dsl_user_op
+def load_scale_pair(ptr: cute.Pointer, *, loc=None, ip=None):
+    result = llvm.inline_asm(ir.Type.parse('!llvm.struct<(f32,f32)>'),
+                              [ptr.toint().ir_value()],
+                              'ld.shared.v2.f32 {$0,$1}, [$2];',
+                              '=f,=f,r,~{memory}', has_side_effects=True,
+                              asm_dialect=llvm.AsmDialect.AD_ATT)
+    return (Float32(llvm.extractvalue(T.f32(), result, [0])),
+            Float32(llvm.extractvalue(T.f32(), result, [1])))
+
+
+@dsl_user_op
+def load_shared_4(ptr: cute.Pointer, *, loc=None, ip=None):
+    result = llvm.inline_asm(
+        ir.Type.parse('!llvm.struct<(f32,f32,f32,f32)>'),
+        [ptr.toint().ir_value()],
+        'ld.shared.v4.f32 {$0,$1,$2,$3}, [$4];',
+        '=f,=f,=f,=f,r,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+    return tuple(Float32(llvm.extractvalue(T.f32(), result, [i])) for i in range(4))
+
+
+# Preserve the original SM90 compiler memory-ordering contract.
+@dsl_user_op
+def ld_acquire_sys_u32_sm90(ptr: cute.Pointer, *, loc=None, ip=None):
+    value = llvm.inline_asm(T.i32(), [ptr.toint().ir_value()],
+                            'ld.acquire.sys.global.u32 $0, [$1];',
+                            '=r,l,~{memory}', has_side_effects=True,
+                            asm_dialect=llvm.AsmDialect.AD_ATT)
+    return Uint32(value)
+
+
+# Preserve the original SM90 compiler memory-ordering contract.
+@dsl_user_op
+def ld_shared_u32x4_sm90(ptr: cute.Pointer, *, loc=None, ip=None):
+    result = llvm.inline_asm(
+        ir.Type.parse('!llvm.struct<(i32,i32,i32,i32)>'), [ptr.toint().ir_value()],
+        'ld.shared.v4.u32 {$0,$1,$2,$3}, [$4];',
+        '=r,=r,=r,=r,r,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i])) for i in range(4))

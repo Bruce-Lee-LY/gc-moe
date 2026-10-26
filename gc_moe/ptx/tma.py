@@ -167,3 +167,41 @@ def tma_store_wait_0(*, loc=None, ip=None) -> None:
     """Drain committed S2G stores before publishing the L2 ready signal."""
     llvm.inline_asm(None, [], 'cp.async.bulk.wait_group 0;', '~{memory}',
                     has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def copy_async_16(dst: cute.Pointer, src: cute.Pointer, size: Uint32,
+                  *, loc=None, ip=None):
+    llvm.inline_asm(None, [dst.toint().ir_value(), src.toint().ir_value(), size.ir_value()],
+                    'cp.async.cg.shared.global [$0], [$1], 16, $2;',
+                    'r,l,r,~{memory}', has_side_effects=True,
+                    asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def copy_commit(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], 'cp.async.commit_group;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def copy_wait(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], 'cp.async.wait_group 0;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def copy_async_4(dst: cute.Pointer, src: cute.Pointer, size: Uint32,
+                 *, loc=None, ip=None):
+    llvm.inline_asm(None, [dst.toint().ir_value(), src.toint().ir_value(), size.ir_value()],
+                    'cp.async.ca.shared.global [$0], [$1], 4, $2;',
+                    'r,l,r,~{memory}', has_side_effects=True,
+                    asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def copy_arrive(bar: cute.Pointer, *, loc=None, ip=None):
+    llvm.inline_asm(None, [bar.toint().ir_value()],
+                    'cp.async.mbarrier.arrive.noinc.shared.b64 [$0];',
+                    'r,~{memory}', has_side_effects=True,
+                    asm_dialect=llvm.AsmDialect.AD_ATT)

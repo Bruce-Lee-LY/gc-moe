@@ -1,44 +1,66 @@
 # GC MoE
 
 GC MoE is a CuTe DSL implementation of FP8/FP4 mixture-of-experts inference
-with CUDA Green Contexts. It overlaps expert-parallel token dispatch with
-Tensor Core computation, then combines the expert outputs through a three-role
-CUDA Graph. The operator supports routed experts and optional fused shared
+with CUDA Green Contexts for NVIDIA Hopper and Blackwell GPUs. It overlaps
+expert-parallel token dispatch with
+Tensor Core computation, then combines the expert outputs through a CUDA Graph
+with three kernel nodes (four for SM90 fused SE).
+The operator supports routed experts and optional fused shared
 experts (SE), with FP8 activations, packed FP4 routed weights, FP8 shared
 weights and BF16 outputs.
 
 GPU kernels are JIT compiled on first use. Installation builds a Python wheel;
-it does not compile CUDA kernels. The current package version is `0.1.0`.
+it does not compile CUDA kernels. The current package version is `0.2.0`.
 
 ## Performance
 
-GLM5.2 and DSV4.1-Flash decode latency on eight NVIDIA B300 GPUs, comparing GC MoE with
-Mega MoE using CUDA Graph replay. Each point uses 1–256 tokens per rank;
-total tokens equal eight times the per-rank count. The figures use the
-measurements recorded in the linked reports.
+Decode latency comparing GC MoE with Mega MoE using CUDA Graph replay on eight
+GPUs. Each point uses 1–256 tokens per rank; total tokens equal eight times the
+per-rank count. The figures use the measurements recorded in the linked reports.
 
-### Routed experts (non-SE)
+### Hopper
+
+DSV4.1-Flash on eight NVIDIA H20 GPUs.
+
+#### Routed experts (non-SE)
+
+![DSV4.1-Flash non-SE: GC MoE versus Mega MoE latency and speedup on eight H20 GPUs](docs/h20_dsv41_flash_gc_moe.png)
+
+[Full H20 non-SE accuracy and performance data](docs/h20_gc_moe.md).
+
+#### Fused shared experts (SE)
+
+![DSV4.1-Flash fused SE: gc_se versus gc_unfused and mega_unfused on eight H20 GPUs](docs/h20_dsv41_flash_gc_moe_se.png)
+
+[Full H20 SE accuracy and performance data](docs/h20_gc_moe_se.md).
+
+### Blackwell
+
+GLM5.2 and DSV4.1-Flash on eight NVIDIA B300 GPUs.
+
+#### Routed experts (non-SE)
 
 ![GLM5.2 non-SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/b300_glm52_gc_moe.png)
 
 ![DSV4.1-Flash non-SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/b300_dsv41_flash_gc_moe.png)
 
-[Full non-SE accuracy and performance data](docs/b300_gc_moe.md).
+[Full B300 non-SE accuracy and performance data](docs/b300_gc_moe.md).
 
-### Fused shared experts (SE)
+#### Fused shared experts (SE)
 
 ![GLM5.2 fused SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/b300_glm52_gc_moe_se.png)
 
 ![DSV4.1-Flash fused SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/b300_dsv41_flash_gc_moe_se.png)
 
-[Full SE accuracy and performance data](docs/b300_gc_moe_se.md).
+[Full B300 SE accuracy and performance data](docs/b300_gc_moe_se.md).
 
 ## Quick start
 
 ### Requirements
 
-- Linux and an NVIDIA B300 GPU with compute capability 10.3. The current device
-  path selects `sm_103f`; other GPU architectures are not supported.
+- Linux and an NVIDIA Hopper or Blackwell GPU. The Hopper SM90 path uses
+  `sm_90a` kernels and is validated on H20; the Blackwell path is validated
+  on B300 (compute capability 10.3) and selects `sm_103f`.
 - A CUDA driver supporting Green Contexts. Multi-GPU execution also requires
   peer-accessible GPUs and PyTorch symmetric memory, with one process per GPU.
 - Python 3.10 or later.
@@ -58,7 +80,8 @@ Runtime dependencies are constrained by [setup.py](setup.py):
 [requirements.txt](requirements.txt) records the exact versions used for the
 runtime, build, tests and benchmarks. It also includes `deep-gemm==2.8.2`, which
 is used by the comparison scripts. Use a reference build exposing
-`deep_gemm.fp8_fp4_mega_moe` when running comparisons.
+`deep_gemm.fp8_fp4_mega_moe` for Blackwell comparisons or
+`deep_gemm.sm90_fp8_fp4_mega_moe` for Hopper comparisons.
 
 ### Installation
 
@@ -82,11 +105,12 @@ PTX.
 For editable development, use `python -m pip install -e .` instead of installing
 the wheel. Wheel versions include the Git revision for a clean tree, or
 `+local` for a dirty tree or a source copy without Git metadata. Set
-`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.1.0` version.
+`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.2.0` version.
 
 ## Interfaces
 
-The public entry points are exported from `gc_moe`:
+The public entry points are exported from `gc_moe`. The following interfaces
+target Blackwell:
 
 | Interface | Purpose |
 | --- | --- |
@@ -95,6 +119,24 @@ The public entry points are exported from `gc_moe`:
 | `fp8_fp4_gc_moe` | Write routed-expert output, optionally including shared experts, into `y`. |
 | `get_block_m_for_gc_moe` | Query the token block size, including for shared-input scale staging. |
 | `GCSymmBuffer` | Own input views, peer addresses and workspace storage. |
+
+Hopper uses separate SM90 interfaces, also exported from `gc_moe`:
+
+| Interface | Purpose |
+| --- | --- |
+| `get_symm_buffer_for_gc_moe_sm90` | Allocate and rendezvous the Hopper input and workspace buffers. |
+| `transform_weights_for_gc_moe_sm90` | Convert routed MXFP4 or shared FP8 weights to the SM90 layout. |
+| `sm90_fp8_fp4_gc_moe` | Write Hopper routed-expert output, optionally including fused shared experts, into `y`. |
+| `SM90GCSymmBuffer` | Own the independent SM90 input views, peer addresses and workspace storage. |
+
+SM90 uses its own buffers and transformed weight layout. Routed activations
+use E4M3FN with contiguous FP32 K128 scales. Pass `shared_l1_weights` and
+`shared_l2_weights` to `sm90_fp8_fp4_gc_moe` to fuse shared experts. See the
+[SM90 interfaces](gc_moe/sm90_gc/__init__.py),
+[routed-expert test](tests/test_sm90_gc_moe.py) and
+[shared-expert test](tests/test_sm90_gc_moe_se.py) for complete preparation.
+
+The input contract and examples below describe the Blackwell interfaces.
 
 ### Input contract
 

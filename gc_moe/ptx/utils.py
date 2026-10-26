@@ -112,3 +112,45 @@ def warpgroup_reg_dealloc(reg_count: cutlass.Constexpr) -> None:
 def warpgroup_reg_alloc(reg_count: cutlass.Constexpr) -> None:
     """Reference warpgroup_reg_alloc<N>, with a compile-time register count."""
     cute.arch.setmaxregister_increase(reg_count)
+
+
+@dsl_user_op
+def fence_gpu(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], 'membar.gl;', '~{memory}', has_side_effects=True,
+                    asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def fence_sys(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], 'membar.sys;', '~{memory}', has_side_effects=True,
+                    asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def sync_loader(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], 'bar.sync 2, 128;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def sync_math(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], 'bar.sync 1, 256;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def sync_tile(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], 'bar.sync 0, 384;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def sync_activation(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], 'bar.sync 3, 64;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def sync_weight(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], 'bar.sync 4, 64;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
