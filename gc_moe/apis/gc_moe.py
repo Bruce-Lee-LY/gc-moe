@@ -159,7 +159,7 @@ def fp8_fp4_gc_moe(y: torch.Tensor,
                            activation_clamp, fast_math, shared_recipe,
                            activation_alpha)
     call_buffer = sym_buffer._for_call(config.shared_experts)
-    from ..runtime.gc_moe import launch_gc_moe
+    from ..jit_kernels.impls.sm100_fp8_fp4_gc_moe import launch_gc_moe
     launch_gc_moe(config, y, l1_weights, l2_weights, call_buffer,
                   shared_l1_weights, shared_l2_weights,
                   cumulative_local_expert_recv_stats)

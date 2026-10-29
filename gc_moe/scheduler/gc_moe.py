@@ -11,10 +11,12 @@ from enum import IntEnum
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Uint32
+from cutlass import Int32, Uint32, Uint64
 
 from ..common.math import warp_inclusive_sum
 from ..ptx.ld_st import (
+    ld_volatile_u32,
+    ld_volatile_u64,
     atom_add_u32,
     st_async_cluster_u32x4,
 )
@@ -194,3 +196,145 @@ def advance_expert(counts: cute.Tensor, token_idx: Uint32,
             expert_end += cached_num_tokens(
                 counts, current_expert, lane, local_experts)
     return current_expert, expert_start, expert_end, pool_block_offset
+
+
+@cute.jit
+def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
+                   recv_ptr: cute.Pointer, l1_count_ptr: cute.Pointer,
+                   l2_count_ptr: cute.Pointer, shared_l1_count_ptr: cute.Pointer,
+                   shared_l2_count_ptr: cute.Pointer, expert_counts: cute.Tensor,
+                   iteration: Uint32, lane: Int32, block: Int32, num_tokens: Uint32,
+                   block_m: cutlass.Constexpr,
+                   compute_sms: cutlass.Constexpr,
+                   dispatch_sms: cutlass.Constexpr,
+                   hidden: cutlass.Constexpr,
+                   intermediate: cutlass.Constexpr,
+                   l1_clusters: cutlass.Constexpr,
+                   l2_clusters: cutlass.Constexpr,
+                   local_experts: cutlass.Constexpr,
+                   num_ranks: cutlass.Constexpr,
+                   shared_experts: cutlass.Constexpr,
+) -> None:
+    """Publish shared and interleaved routed tasks, then the end sentinel."""
+    shared_m_blocks = (num_tokens + Uint32(block_m - 1)) // \
+        Uint32(block_m)
+    shared_l2_early = (shared_m_blocks * Uint32(l2_clusters) <=
+                       Uint32(compute_sms))
+    if cutlass.const_expr(shared_experts > 0):
+        shared_l1_clusters = l1_clusters * shared_experts
+        iteration = publish_shared_phase(
+            task, full, empty, shared_l1_count_ptr, iteration,
+            Int32(lane), Uint32(block // 2),
+            Uint32(GCBlockPhase.SharedLinear1),
+            num_tokens, block_m, shared_l1_clusters,
+            compute_sms, 2 * intermediate * shared_experts,
+            hidden)
+        if shared_l2_early:
+            iteration = publish_shared_phase(
+                task, full, empty, shared_l2_count_ptr, iteration,
+                Int32(lane), Uint32(block // 2),
+                Uint32(GCBlockPhase.SharedLinear2),
+                num_tokens, block_m, l2_clusters,
+                compute_sms, hidden,
+                intermediate * shared_experts)
+    # Each lane owns experts wave*32+lane in registers, as in
+    # GCMoEScheduler. The count cache survives routed L1/L2 task
+    # claims, without an E-dependent shared prefix allocation.
+    for wave in cutlass.range_constexpr(
+            (local_experts + 31) // 32):
+        local_expert = Uint32(wave * 32 + lane)
+        count = Uint64(0)
+        if local_expert < Uint32(local_experts):
+            while Uint32(count >> 32) != Uint32(
+                    dispatch_sms * num_ranks):
+                count = ld_volatile_u64(recv_ptr + local_expert * 2)
+        expert_counts[wave] = Uint32(count)
+    cute.arch.sync_warp()
+    lane_m_blocks = Uint32(0)
+    for wave in cutlass.range_constexpr(
+            (local_experts + 31) // 32):
+        received = expert_counts[wave]
+        own_blocks = (received + Uint32(block_m - 1)) // \
+            Uint32(block_m)
+        lane_m_blocks += own_blocks
+    routed_m_blocks = cute.arch.warp_redux_sync(
+        lane_m_blocks, 'add')
+    # Match GCMoEScheduler::get_gc_num_l1_warmup_waves and
+    # get_next_task for one locality domain: enough L1 work is
+    # issued before the first L2 wave, then one L1 follows each
+    # successful L2 claim until the L1 queue is exhausted.
+    num_clusters = compute_sms // 2
+    first_l2_m_blocks = (num_clusters + l2_clusters - 1) // l2_clusters
+    first_l2_warmup = (first_l2_m_blocks * l1_clusters +
+                       num_clusters - 1) // num_clusters
+    interleave_diff = max(l1_clusters - l2_clusters, 0)
+    l1_warmup = Uint32(0)
+    if routed_m_blocks > 0:
+        interleave_warmup = (l1_clusters +
+                             (routed_m_blocks - 1) * interleave_diff +
+                             num_clusters - 1) // num_clusters + 1
+        total_l1_waves = (routed_m_blocks * l1_clusters +
+                          num_clusters - 1) // num_clusters
+        l1_warmup = min(total_l1_waves,
+                        max(Uint32(first_l2_warmup), interleave_warmup))
+    l1_done = Uint32(0xffffffff)
+    scheduling = True
+    while scheduling:
+        wait_task_slot(empty, iteration)
+        fetching = True
+        while fetching:
+            if l1_warmup != l1_done and l1_warmup > 0:
+                l1_warmup -= Uint32(1)
+                task_idx = claim_task(l1_count_ptr, Int32(lane))
+                if task_idx >= routed_m_blocks * l1_clusters:
+                    l1_warmup = l1_done
+                else:
+                    pool_block = task_idx // l1_clusters
+                    n_cluster = task_idx % l1_clusters
+                    local_expert, m_block, valid_m = \
+                        locate_routed_pool_block(
+                            expert_counts, pool_block, Uint32(lane),
+                            local_experts, block_m)
+                    publish_iteration(task, full, iteration, Int32(lane),
+                                      Uint32(GCBlockPhase.Linear1), local_expert,
+                                      m_block, n_cluster, pool_block, valid_m,
+                                      Uint32(2 * intermediate), Uint32(hidden))
+                    iteration = Uint32(iteration + Uint32(1))
+                    fetching = False
+            else:
+                task_idx = claim_task(l2_count_ptr, Int32(lane))
+                if task_idx >= routed_m_blocks * l2_clusters:
+                    scheduling = False
+                    fetching = False
+                else:
+                    if l1_warmup != l1_done:
+                        l1_warmup = Uint32(1)
+                    pool_block = task_idx // l2_clusters
+                    n_cluster = task_idx % l2_clusters
+                    local_expert, m_block, valid_m = \
+                        locate_routed_pool_block(
+                            expert_counts, pool_block, Uint32(lane),
+                            local_experts, block_m)
+                    required_l1 = (pool_block + 1) * l1_clusters
+                    while ld_volatile_u32(l1_count_ptr) < required_l1:
+                        pass
+                    publish_iteration(task, full, iteration, Int32(lane),
+                                      Uint32(GCBlockPhase.Linear2), local_expert,
+                                      m_block, n_cluster, pool_block, valid_m,
+                                      Uint32(hidden), Uint32(intermediate))
+                    iteration = Uint32(iteration + Uint32(1))
+                    fetching = False
+    if cutlass.const_expr(shared_experts > 0):
+        if not shared_l2_early:
+            iteration = publish_shared_phase(
+                task, full, empty, shared_l2_count_ptr, iteration,
+                Int32(lane), Uint32(block // 2),
+                Uint32(GCBlockPhase.SharedLinear2),
+                num_tokens, block_m, l2_clusters,
+                compute_sms, hidden,
+                intermediate * shared_experts)
+    wait_task_slot(empty, iteration)
+    publish_iteration(task, full, iteration, Int32(lane),
+                      Uint32(GCBlockPhase.None_), Uint32(0),
+                      Uint32(0), Uint32(0),
+                      Uint32(0), Uint32(0), Uint32(0), Uint32(0))

@@ -51,13 +51,13 @@ class SharedStorageLayout:
 
 
 def get_role_shared_layout(role: int, block_m: int, num_experts: int,
-                           pull_bytes: int, stages: int) -> SharedStorageLayout:
+                           pull_bytes: int, stages: int, *,
+                           store_m_l1: int, store_m_l2: int, dispatch_warps: int,
+                           block_n: int, block_k: int,
+                           sf_block_m: int) -> SharedStorageLayout:
     """Lay out one role's shared data and control fields in byte order."""
     if role not in (1, 2, 3) or block_m % 16 or block_m < 16 or stages < 2:
         raise ValueError('invalid shared-storage role geometry')
-    dispatch_warps = (12 if block_m >= 96 else 8) if role == 1 else 4
-    store1 = 8 if block_m <= 16 else 16 if block_m <= 96 else 32 if block_m <= 192 else 24
-    store2 = 8 if block_m == 240 else store1
     values = {}
     cursor = 0
 
@@ -74,12 +74,13 @@ def get_role_shared_layout(role: int, block_m: int, num_experts: int,
     else:
         reserve('expert_counts', num_experts * 4, 1024)
         reserve('pull', dispatch_warps * pull_bytes, 1024)
-    reserve('cd', max(2 * 2 * store1 * 64, 2 * store2 * 128 * 2), 1024)
-    reserve('data_a', stages * (block_m // 2) * 128, 1024)
-    reserve('data_b', stages * 128 * 128, 1024)
-    reserve('data_sfa', stages * align(block_m, 128) * 4, 4)
-    reserve('data_sfb', stages * 128 * 4, 4)
-    reserve('amax', 8 * store1 * 4, 8)
+    reserve('cd', max(2 * 2 * store_m_l1 * (block_n // 2),
+                      2 * store_m_l2 * block_n * 2), 1024)
+    reserve('data_a', stages * (block_m // 2) * block_k, 1024)
+    reserve('data_b', stages * block_n * block_k, 1024)
+    reserve('data_sfa', stages * sf_block_m * 4, 4)
+    reserve('data_sfb', stages * block_n * 4, 4)
+    reserve('amax', 8 * store_m_l1 * 4, 8)
     reserve('tasks', 2 * 32, 16)
     reserve('dispatch_bars', dispatch_warps * 8, 8)
     reserve('data_full', stages * 8, 8)

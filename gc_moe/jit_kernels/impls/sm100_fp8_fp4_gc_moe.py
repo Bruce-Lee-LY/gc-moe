@@ -8,43 +8,138 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
-from functools import lru_cache
-import hashlib
-import inspect
 from math import inf
 import os
 from pathlib import Path
 import re
-import shlex
-import subprocess
-import tempfile
-import threading
 
 from cutlass import Float32, Uint32
-import cutlass.cute as cute
-from cutlass.base_dsl.dsl import BaseDSL
-from cutlass._mlir._mlir_libs import _cutlass_ir
-from cutlass.base_dsl.compiler import CompileOptions, DeviceTarget, ExtraCompilerOpts, GPUArch, LinkLibraries, OptLevel, PtxasOptions, RDC
 from cutlass.cute.runtime import from_dlpack
 import torch
 from cuda.bindings import driver as cu
 
 from ...comm.gc_barrier import DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS
-from ...kernels.sm100_fp8_fp4_gc_moe import GCMoERoleKernel
+from ...impls.sm100_fp8_fp4_gc_moe import GCMoERoleKernel
 from ...layout.gc_moe import (
     MAX_RANKS,
     align,
     ceil_div,
-    get_role_shared_layout,
 )
-from ...runtime.gc_moe import RoleBinary
+from ...runtime.gc_moe import RoleBinary, get_context
+from ...runtime.jit import (
+    COMPILE_LOCK,
+    PTXAS_OPTIONS,
+    CompilerIdentity,
+    assemble_ptx,
+    compile_kernel,
+    compiler_identity,
+    device_compile_target,
+    ptx_target,
+)
 from ..heuristics.gc_moe import (
     get_combine_geometry,
     get_role_config,
     num_max_live_pool_blocks,
 )
-from .tma_descriptors import build_gc_tma_plan
+from .runtime_utils import (
+    TmaDescriptorSpec,
+    make_tma_2d_desc,
+    make_tma_sf_desc,
+    make_tma_weights_2d_desc,
+    make_tma_weights_3d_desc,
+)
 
+
+@dataclass(frozen=True)
+class GCTmaPlan:
+    """The 18 ordered tensor maps passed by value to role2."""
+
+    l1_acts: TmaDescriptorSpec
+    l1_acts_sf: TmaDescriptorSpec
+    l1_weights: TmaDescriptorSpec
+    l1_weights_sf: TmaDescriptorSpec
+    l1_output: TmaDescriptorSpec
+    l2_acts: TmaDescriptorSpec
+    l2_acts_sf: TmaDescriptorSpec
+    l2_weights: TmaDescriptorSpec
+    l2_weights_sf: TmaDescriptorSpec
+    shared_l1_acts: TmaDescriptorSpec
+    shared_l1_acts_sf: TmaDescriptorSpec
+    shared_l1_weights: TmaDescriptorSpec
+    shared_l1_weights_sf: TmaDescriptorSpec
+    shared_l1_output: TmaDescriptorSpec
+    shared_l2_acts: TmaDescriptorSpec
+    shared_l2_acts_sf: TmaDescriptorSpec
+    shared_l2_weights: TmaDescriptorSpec
+    shared_l2_weights_sf: TmaDescriptorSpec
+
+    def ordered(self) -> tuple[TmaDescriptorSpec, ...]:
+        return tuple(getattr(self, name) for name in self.__dataclass_fields__)
+
+
+def build_gc_tma_plan(config, sym_buffer, l1_weights, l2_weights,
+                      shared_l1_weights=None, shared_l2_weights=None,
+                      shared_weight_gran_k: int = 32) -> GCTmaPlan:
+    """Describe routed/shared tensors; encode with live pointers at launch."""
+    bk, bn = config.block_k, config.block_n
+    h, i = sym_buffer.hidden, sym_buffer.intermediate_hidden
+    sf_m = config.sf_block_m
+    ring, sf_ring = sym_buffer.layout.ring_tokens, sym_buffer.layout.sf_ring_tokens
+    shared_count = sym_buffer.num_shared_experts
+    shared_i = shared_count * i
+    if shared_weight_gran_k not in (32, 128):
+        raise ValueError('shared UE8M0 K granularity must be 32 or 128')
+    if bool(shared_l1_weights) != bool(shared_l2_weights) or \
+            bool(shared_l1_weights) != bool(shared_count):
+        raise ValueError('shared tensors and expert count disagree')
+    def acts(t, inner, outer, block_inner, block_outer, swizzle):
+        return make_tma_2d_desc(t, inner, outer, block_inner, block_outer,
+                         t.stride(-2), swizzle)
+
+    def scales(t, mn, k, block_mn, gran, groups):
+        return make_tma_sf_desc(t, mn, k, block_mn, gran, groups,
+                     (bk + gran * 4 - 1) // (gran * 4), t.stride(-1))
+
+    routed = (
+        acts(sym_buffer.l1_acts, h, ring, bk, config.load_m, config.swizzle_acts),
+        scales(sym_buffer.l1_acts_sf, sf_ring, h, sf_m, 32, 1),
+        make_tma_weights_3d_desc(l1_weights[0], bk, bn, swizzle=config.swizzle_weights),
+        scales(l1_weights[1], 2 * i, h, bn, 32,
+               sym_buffer.num_experts // sym_buffer.group.size()),
+        acts(sym_buffer.l2_acts, i, ring, bn // 2,
+             config.store_m_l1, config.swizzle_output),
+        acts(sym_buffer.l2_acts, i, ring, bk, config.load_m, config.swizzle_acts),
+        scales(sym_buffer.l2_acts_sf, sf_ring, i, sf_m, 32, 1),
+        make_tma_weights_3d_desc(l2_weights[0], bk, bn, swizzle=config.swizzle_weights),
+        scales(l2_weights[1], h, i, bn, 32,
+               sym_buffer.num_experts // sym_buffer.group.size()),
+    )
+    if shared_count:
+        shared_sf_tokens = sym_buffer.shared_l1_acts_sf.shape[0]
+        shared = (
+            acts(sym_buffer.shared_l1_acts, h,
+                 sym_buffer.num_max_tokens_per_rank, bk, config.load_m, config.swizzle_acts),
+            scales(sym_buffer.shared_l1_acts_sf, shared_sf_tokens,
+                   h, sf_m, 32, 1),
+            make_tma_weights_2d_desc(shared_l1_weights[0], bk, bn, swizzle=config.swizzle_weights),
+            scales(shared_l1_weights[1], 2 * shared_i, h, bn,
+                   shared_weight_gran_k, 1),
+            acts(sym_buffer.shared_l2_acts, shared_i,
+                 sym_buffer.num_max_tokens_per_rank, bn // 2,
+                 config.store_m_l1, config.swizzle_output),
+            acts(sym_buffer.shared_l2_acts, shared_i,
+                 sym_buffer.num_max_tokens_per_rank, bk, config.load_m, config.swizzle_acts),
+            scales(sym_buffer.shared_l2_acts_sf,
+                   sym_buffer.shared_l2_acts_sf.shape[0],
+                   shared_i, sf_m, 32, 1),
+            make_tma_weights_2d_desc(shared_l2_weights[0], bk, bn, swizzle=config.swizzle_weights),
+            scales(shared_l2_weights[1], h, shared_i, bn,
+                   shared_weight_gran_k, 1),
+        )
+    else:
+        # Supply routed maps in unused shared positions.
+        shared = routed
+    return GCTmaPlan(*routed, *shared)
 
 def _get_gc_moe_nvlink_barrier_timeout_secs() -> int:
     """Read the positive signed-decimal int32 barrier timeout."""
@@ -63,105 +158,9 @@ def _get_gc_moe_nvlink_barrier_timeout_secs() -> int:
     return seconds
 
 
-_SYSTEM_PTXAS = '/usr/local/cuda/bin/ptxas'
-_PTXAS_OPTIONS = ('-O3', '--register-usage-level=10', '--fmad=true')
-_COMPILE_LOCK = threading.RLock()
-
-
-@dataclass(frozen=True)
-class _CompilerIdentity:
-    target: str
-    compile_options: str
-    ptxas_options: tuple[str, ...]
-    tool_realpath: str
-    tool_stamp: tuple[int, ...]
-    tool_version: str
-    tool_sha256: str
-    environment: str
-    effective_options: str
-    frontend_sha256: str
-    source_sha256: str
-    native_library: tuple
-    bridge_revision: int = 2
-
-
-@lru_cache(maxsize=16)
-def _tool_identity(realpath: str, stamp: tuple[int, ...]) -> tuple[str, str]:
-    result = subprocess.run([_SYSTEM_PTXAS, '--version'], check=False,
-                            capture_output=True, text=True)
-    if result.returncode:
-        raise RuntimeError('cannot query the system PTX assembler')
-    return ((result.stdout + result.stderr).strip(),
-            hashlib.sha256(Path(realpath).read_bytes()).hexdigest())
-
-
-@lru_cache(maxsize=16)
-def _binary_identity(realpath: str, stamp: tuple[int, ...]) -> str:
-    return hashlib.sha256(Path(realpath).read_bytes()).hexdigest()
-
-
-@lru_cache(maxsize=16)
-def _source_identity(stamps: tuple) -> str:
-    digest = hashlib.sha256()
-    for name, *_ in stamps:
-        path = Path(name)
-        digest.update(str(path.relative_to(Path(__file__).resolve().parents[2])).encode())
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
-def _compiler_identity(target: str) -> _CompilerIdentity:
-    tool = Path(_SYSTEM_PTXAS)
-    if not tool.is_file() or not os.access(tool, os.X_OK):
-        raise RuntimeError(f"an executable system PTX assembler is required at {tool}")
-    info = tool.stat()
-    stamp = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
-    realpath = str(tool.resolve())
-    version, digest = _tool_identity(realpath, stamp)
-    assembly_options = ' '.join(_PTXAS_OPTIONS)
-    options = (f"--gpu-arch {target} --opt-level 3 "
-               f"--ptxas-options {shlex.quote(assembly_options)}")
-    function = inspect.unwrap(GCMoERoleKernel.__call__)
-    with _COMPILE_LOCK:
-        BaseDSL._lazy_initialize_dsl(function)
-        settings = function._dsl_object.envar
-    effective = CompileOptions((GPUArch(target), OptLevel(3),
-                                PtxasOptions(assembly_options)))
-    effective.apply_envar_settings(settings, 'gc_moe_role')
-    if (effective.options[GPUArch].value != target or
-            effective.options[OptLevel].value != 3):
-        raise RuntimeError('compiler environment overrides the required target or optimization level')
-    if (effective.options[RDC].value or effective.options[DeviceTarget].value or
-            effective.options[LinkLibraries].value):
-        raise RuntimeError('GC roles require standalone kernel compilation without device linking')
-    extra = effective.options[ExtraCompilerOpts].value
-    if re.search(r'cubin-chip|gpu-arch|opt-level|ptx-options|fast.?math|unsafe.?fp|'
-                 r'ftz|fmad|contract|prec.?div|prec.?sqrt|device-debug', extra, re.IGNORECASE):
-        raise RuntimeError('raw compiler overrides conflict with the role compilation policy')
-    normalized = effective.to_str()
-    assembly = tuple(shlex.split(effective.options[PtxasOptions].value.strip("'")))
-    allowed = {*_PTXAS_OPTIONS, '-v', '--verbose', '--warn-on-spills',
-               '--warn-on-local-memory-usage', '--generate-line-info'}
-    if (any(assembly.count(option) != 1 for option in _PTXAS_OPTIONS) or
-            any(option not in allowed for option in assembly)):
-        raise RuntimeError('assembler options conflict with the role compilation policy')
-    if effective.generate_line_info and '--generate-line-info' not in assembly:
-        assembly += ('--generate-line-info',)
-    source_root = Path(__file__).resolve().parents[2]
-    stamps = []
-    for path in sorted(source_root.rglob('*.py')):
-        stat = path.stat()
-        stamps.append((str(path), stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
-    native = Path(_cutlass_ir.__file__).resolve()
-    native_stat = native.stat()
-    native_stamp = (native_stat.st_dev, native_stat.st_ino, native_stat.st_size,
-                    native_stat.st_mtime_ns)
-    native_identity = (str(native), native_stamp, _binary_identity(str(native), native_stamp))
-    return _CompilerIdentity(
-        target, options, assembly, realpath, stamp, version, digest,
-        settings.cache_key_str(), normalized,
-        function._dsl_object.get_version().hexdigest(), _source_identity(tuple(stamps)),
-        native_identity)
+def _compiler_identity(target: str) -> CompilerIdentity:
+    return compiler_identity(target, GCMoERoleKernel.__call__,
+                             Path(__file__).resolve().parents[2], 'gc_moe_role')
 
 
 @dataclass
@@ -171,6 +170,22 @@ class _Prepared:
 
 
 _CACHE: dict[tuple, _Prepared] = {}
+_BINARY_CACHE: dict[tuple, tuple[RoleBinary, RoleBinary, RoleBinary]] = {}
+
+
+def _get_or_compile_binaries(key: tuple, identity: CompilerIdentity,
+                             target: str, compile_roles) -> tuple[RoleBinary, RoleBinary, RoleBinary]:
+    """Publish a complete cubin set once, after compiler identity is stable."""
+    with COMPILE_LOCK:
+        binaries = _BINARY_CACHE.get(key)
+        if binaries is None:
+            binaries = tuple(compile_roles())
+            if len(binaries) != 3 or tuple(item.role for item in binaries) != (1, 2, 3):
+                raise RuntimeError('GC role compilation did not produce all three roles')
+            if _compiler_identity(target) != identity:
+                raise RuntimeError('compiler identity changed while compiling role binaries')
+            _BINARY_CACHE[key] = binaries
+        return binaries
 
 
 class _SymBufferValue(ctypes.Structure):
@@ -258,7 +273,7 @@ def _convert_role2_map_uses(ptx: str) -> str:
     Fail closed on changes to CuTe's generated descriptor instruction forms.
     This bridge deliberately does not depend on PTX register IDs or labels.
     """
-    map_ordinals = (4, *range(8, 25))
+    map_ordinals = (4, *range(7, 24))
     raw_map_regs = []
     for ordinal in map_ordinals:
         raw = re.findall(
@@ -331,52 +346,7 @@ def _device_compile_target(device: torch.device) -> str:
     major, minor = torch.cuda.get_device_capability(device)
     if (major, minor) != (10, 3):
         raise NotImplementedError('current three-role device path requires compute capability 10.3')
-    suffix = 'f' if major > 9 else 'a' if major == 9 else ''
-    return f"sm_{major * 10 + minor}{suffix}"
-
-
-def _ptx_target(ptx: str) -> str:
-    targets = re.findall(r"(?m)^\.target[ \t]+(sm_[0-9]+[af]?)(?:[ \t]*,.*)?[ \t]*$", ptx)
-    if len(targets) != 1:
-        raise RuntimeError('PTX target header is missing or ambiguous')
-    return targets[0]
-
-
-def _assemble_value_ptx(ptx: str, dump_dir: str,
-                        basename: str, *, target: str,
-                        ptxas_options: tuple[str, ...] = _PTXAS_OPTIONS) -> tuple[str, bytes, str]:
-    if _ptx_target(ptx) != target:
-        raise RuntimeError('PTX target differs from the selected device target')
-    ptx_version = re.search(r"(?m)^\.version[ \t]+([0-9]+)\.([0-9]+)[ \t]*$",
-                            ptx)
-    if ptx_version is None:
-        raise RuntimeError('PTX version header is missing')
-    minimum_release = ((13, 2) if
-                       (int(ptx_version.group(1)), int(ptx_version.group(2)))
-                       >= (9, 1) else (13, 0))
-    # Assemble every role with the system CUDA toolchain.
-    tool = _SYSTEM_PTXAS
-    required = (f"CUDA {minimum_release[0]}.{minimum_release[1]} or newer "
-                f"ptxas is required at {tool} for these by-value PTX parameters")
-    if not Path(tool).is_file() or not os.access(tool, os.X_OK):
-        raise RuntimeError(required)
-    result = subprocess.run([tool, '--version'], check=False,
-                            capture_output=True, text=True)
-    version = (result.stdout + result.stderr).strip()
-    release = re.search(r"release[ \t]+([0-9]+)\.([0-9]+)", version)
-    if (result.returncode != 0 or release is None or
-            (int(release.group(1)), int(release.group(2))) < minimum_release):
-        raise RuntimeError(required)
-    source = Path(dump_dir) / f"{basename}.ptx"
-    output = Path(dump_dir) / f"{basename}.cubin"
-    source.write_text(ptx)
-    assembled = subprocess.run([tool, f'-arch={target}', *ptxas_options,
-                                '-o', str(output), str(source)],
-                               capture_output=True, text=True)
-    if assembled.returncode:
-        raise RuntimeError(f"{basename} assembly failed: " +
-                           assembled.stderr)
-    return ptx, output.read_bytes(), version
+    return device_compile_target((major, minor))
 
 
 def _entry_formals(ptx: str) -> list[str]:
@@ -401,13 +371,13 @@ def _entry_formals(ptx: str) -> list[str]:
 def _order_role2_value_formals(ptx: str) -> str:
     """Keep ordinary scalars ahead of the eighteen contiguous value maps."""
     formals = _entry_formals(ptx)
-    if len(formals) != 25:
+    if len(formals) != 24:
         raise RuntimeError('role2 value-formal count changed')
     for index, line in enumerate(formals):
         if re.search(r"\b[A-Za-z0-9_.$]+_param_" + str(index) +
                      r"(?:\[[0-9]+\])?,?[ \t]*$", line) is None:
             raise RuntimeError('role2 value-formal order changed')
-    order = (0, 1, 2, 3, 5, 6, 7, 4, *range(8, 25))
+    order = (0, 1, 2, 3, 5, 6, 4, *range(7, 24))
     ordered = [formals[i].rstrip().rstrip(',') for i in order]
     original = '\n'.join(formals)
     if ptx.count(original) != 1:
@@ -417,15 +387,15 @@ def _order_role2_value_formals(ptx: str) -> str:
 
 def _assemble_role_value_params(ptx: str, role: int,
                                 dump_dir: str, *, target: str,
-                                ptxas_options: tuple[str, ...] = _PTXAS_OPTIONS) -> tuple[str, bytes, str]:
+                                ptxas_options: tuple[str, ...] = PTXAS_OPTIONS) -> tuple[str, bytes, str]:
     """Build each role with relative peer value, plus role2's value maps."""
     ptx = _clean_cute_ptx(ptx)
-    if _ptx_target(ptx) != target:
+    if ptx_target(ptx) != target:
         raise RuntimeError('CuTe generated a different device target')
     expected = {1: ('ptr', 'ptr', 'u32', 'u32', 'f32', 'f32'),
-                2: (('ptr', 'ptr', 'u32', 'u32', 'ptr', 'ptr', 'f32', 'f32') +
+                2: (('ptr', 'ptr', 'u32', 'u32', 'ptr', 'f32', 'f32') +
                     ('ptr',) * 17),
-                3: ('ptr', 'ptr', 'u32', 'u32', 'ptr', 'ptr', 'ptr', 'ptr',
+                3: ('ptr', 'ptr', 'u32', 'u32', 'ptr', 'ptr', 'ptr',
                     'f32', 'f32')}[role]
     formals = _entry_formals(ptx)
     if len(formals) != len(expected):
@@ -440,19 +410,19 @@ def _assemble_role_value_params(ptx: str, role: int,
         raise RuntimeError(f"role{role} peer parameter load path is missing")
     ptx = _rewrite_value_formal(ptx, 1, 592, 8)
     if role == 2:
-        for map_ordinal in (4, *range(8, 25)):
+        for map_ordinal in (4, *range(7, 24)):
             ptx = _rewrite_value_formal(
                 ptx, map_ordinal, 128, 128, raw_param_address=True)
         ptx = _convert_role2_map_uses(ptx)
         ptx = _order_role2_value_formals(ptx)
-    return _assemble_value_ptx(ptx, dump_dir, f"role{role}_value_params",
+    return assemble_ptx(ptx, dump_dir, f"role{role}_value_params",
                                 target=target, ptxas_options=ptxas_options)
 
 
-def _capture_key(config, sym_buffer, green_context, l1_weights, l2_weights,
+def _capture_key(config, sym_buffer, green_context, y, l1_weights, l2_weights,
                  shared_l1_weights, shared_l2_weights, stats,
                  nvlink_timeout_secs: int, role_resources: tuple,
-                 combine_resources: tuple, compiler_identity: _CompilerIdentity) -> tuple:
+                 combine_resources: tuple, compiler_identity: CompilerIdentity) -> tuple:
     status, cuda_context = cu.cuCtxGetCurrent()
     if status != cu.CUresult.CUDA_SUCCESS:
         raise RuntimeError(f"cannot query CUDA context: {status}")
@@ -473,9 +443,35 @@ def _capture_key(config, sym_buffer, green_context, l1_weights, l2_weights,
             stats is not None,
             role_resources, combine_resources,
             layout.nbytes, layout.ring_tokens, layout.sf_ring_tokens,
+            _tensor_metadata(y),
+            _tensor_metadata(stats) if stats is not None else None,
             *(item for tensor in weights
               for item in (tensor.data_ptr(), tuple(tensor.shape),
                            tuple(tensor.stride()), str(tensor.dtype))))
+
+
+def _tensor_metadata(tensor: torch.Tensor) -> tuple:
+    return (tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype))
+
+
+def _binary_key(compiler_identity: CompilerIdentity, role_kernels: tuple,
+                role_resources: tuple, combine_resources: tuple,
+                sym_buffer, y: torch.Tensor, weights: tuple,
+                stats: torch.Tensor | None) -> tuple:
+    """Identify code generation without retaining any live CUDA address.
+
+    Every role kernel attribute is included so new constexpr or derived layout
+    fields cannot silently reuse an older cubin. Tensor metadata covers the
+    CuTe compile argument types; actual addresses remain in _capture_key.
+    """
+    key = (compiler_identity,
+           tuple(tuple(sorted(vars(kernel).items())) for kernel in role_kernels),
+           role_resources, combine_resources,
+           sym_buffer.layout.nbytes,
+           _tensor_metadata(sym_buffer.buffer), _tensor_metadata(y),
+           tuple(_tensor_metadata(tensor) for tensor in weights),
+           _tensor_metadata(stats) if stats is not None else None)
+    return key
 
 
 def _check_supported(config, sym_buffer) -> None:
@@ -521,7 +517,6 @@ def prepare_role_binaries(config, y: torch.Tensor,
     """Encode live maps once per pointer set and compile each role once/shape."""
     _check_supported(config, sym_buffer)
     if context is None:
-        from ...runtime.gc_moe import get_context
         context = get_context()
     device = sym_buffer.buffer.device
     tensors = (y, *l1_weights, *l2_weights, *(shared_l1_weights or ()),
@@ -533,32 +528,29 @@ def prepare_role_binaries(config, y: torch.Tensor,
     compiler_target = _device_compile_target(sym_buffer.buffer.device)
     compiler_identity = _compiler_identity(compiler_target)
     nvlink_timeout_secs = _get_gc_moe_nvlink_barrier_timeout_secs()
-    pull_bytes = config.hidden
-    while pull_bytes > 8192:
-        pull_bytes //= 2
     role_configs = tuple(get_role_config(role, config.block_m,
                                          sym_buffer.num_experts,
-                                         config.hidden, pull_bytes)
+                                         config.hidden)
                          for role in (1, 2, 3))
     role_resources = tuple((item.num_stages, item.dynamic_smem, item.threads)
                            for item in role_configs)
     role3_config = role_configs[2]
-    role3_layout = get_role_shared_layout(
-        3, config.block_m, sym_buffer.num_experts, pull_bytes, role3_config.num_stages)
+    role3_layout = role3_config.shared_layout
     combine_reusable_bytes = role3_layout.reusable_bytes
     if role3_layout.field_end > role3_config.dynamic_smem:
         raise ValueError('role3 shared storage exceeds its launch allocation')
-    combine_chunks, combine_chunk_bytes, _, _ = get_combine_geometry(
+    combine_geometry = get_combine_geometry(
         config.hidden, combine_reusable_bytes, role3_config.dynamic_smem)
+    combine_chunks, combine_chunk_bytes, _, _ = combine_geometry
     combine_resources = (combine_reusable_bytes, combine_chunks,
                          combine_chunk_bytes)
-    key = _capture_key(config, sym_buffer, context, l1_weights, l2_weights,
+    key = _capture_key(config, sym_buffer, context, y, l1_weights, l2_weights,
                        shared_l1_weights, shared_l2_weights, stats,
                        nvlink_timeout_secs, role_resources, combine_resources,
                        compiler_identity)
     prepared = _CACHE.get(key)
     if prepared is None:
-        with _COMPILE_LOCK:
+        with COMPILE_LOCK:
             prepared = _CACHE.get(key)
             if prepared is None:
                 layout = sym_buffer.layout
@@ -576,18 +568,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                 if len(payloads) != 18:
                     raise RuntimeError('GC role2 needs exactly 18 ordered TensorMaps')
                 maps = b"".join(payloads)
-                signal_view = from_dlpack(sym_buffer.buffer.view(torch.int32))
-                peer_view = from_dlpack(sym_buffer.buffer.view(torch.int64).flatten()[:74])
-                # These distinct views supply CuTe's pointer type/shape at compile
-                # time only. Every pointer load is rewritten to its own 128B
-                # host-supplied TensorMap value parameter.
-                map_storage = sym_buffer.buffer.view(torch.uint8).flatten()
-                map_views = tuple(from_dlpack(map_storage[i * 128:(i + 1) * 128])
-                                  for i in range(18))
-                role3_map_view = from_dlpack(map_storage[:2304])
-                y_view = from_dlpack(y)
-                stats_view = from_dlpack(stats) if stats is not None else signal_view
-                binaries = []
+                role_kernels = []
                 for index, role in enumerate((1, 2, 3)):
                     role_kernel = GCMoERoleKernel(
                         role, context.dispatch_sms, context.compute_sms,
@@ -595,7 +576,6 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         config.tokens, sym_buffer.group.size(), config.local_experts,
                         config.shared_experts,
                         sym_buffer.num_max_tokens_per_rank,
-                        math_debug=role == 2,
                         finalize_output=role == 3,
                         ring_tokens=layout.ring_tokens,
                         sf_ring_tokens=layout.sf_ring_tokens,
@@ -607,49 +587,57 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         fast_math=config.fast_math,
                         has_stats=stats is not None,
                         nvlink_timeout_secs=nvlink_timeout_secs,
-                        math_stages=role_configs[index].num_stages,
-                        combine_reusable_bytes=(combine_reusable_bytes if role == 3
-                                                else None),
-                        combine_launch_bytes=(role3_config.dynamic_smem if role == 3
-                                              else None))
-                    rank_view = Uint32(0)
-                    token_view = Uint32(0)
-                    clamp_view = Float32(0.0)
-                    alpha_view = Float32(1.0)
-                    compile_args = ((signal_view, peer_view, rank_view, token_view,
-                                     map_views[0], signal_view, None, None,
-                                     clamp_view, alpha_view, *map_views[1:])
-                                    if role == 2 else
-                                    (signal_view, peer_view, rank_view, token_view,
-                                     role3_map_view, signal_view, y_view, stats_view,
-                                     clamp_view, alpha_view)
-                                    if role == 3 else
-                                    (signal_view, peer_view, rank_view, token_view,
-                                     None, None, None, None,
-                                     clamp_view, alpha_view))
-                    # JitFunctionArtifacts reads named PTX/cubin files after compile.
-                    # Its basename does not encode all of this object's constexpr
-                    # fields, so concurrent ranks with different shapes can overwrite
-                    # each other's files. Own the files per role compile; the CuTe JIT
-                    # cache and the compiled bytes retained below are unaffected.
-                    with tempfile.TemporaryDirectory(prefix='gc_moe_cute_role_') as dump_dir:
-                        compiled = cute.compile(
-                            role_kernel, *compile_args,
-                            options=(compiler_identity.compile_options +
-                                     f" --keep-cubin --keep-ptx --dump-dir {dump_dir}"))
-                        ptx = compiled.artifacts.PTX
-                        cubin = compiled.artifacts.CUBIN
-                        _, cubin, _ = _assemble_role_value_params(
-                            ptx, role, dump_dir, target=compiler_target,
-                            ptxas_options=compiler_identity.ptxas_options)
-                    role_config = role_configs[index]
-                    binaries.append(RoleBinary(
-                        role, cubin, role_config.dynamic_smem,
-                        role_config.threads,
-                        context.dispatch_sms if role == 1 else
-                        context.compute_sms if role == 2 else
-                        role_kernel.finalize_sms))
-                prepared = _Prepared(maps, tuple(binaries))
+                        role_config=role_configs[index],
+                        combine_geometry=combine_geometry if role == 3 else None)
+                    role_kernels.append(role_kernel)
+                weights = (*l1_weights, *l2_weights,
+                           *(shared_l1_weights or ()), *(shared_l2_weights or ()))
+                binary_key = _binary_key(
+                    compiler_identity, tuple(role_kernels), role_resources,
+                    combine_resources, sym_buffer, y, weights, stats)
+                def compile_roles():
+                    signal_view = from_dlpack(sym_buffer.buffer.view(torch.int32))
+                    peer_view = from_dlpack(sym_buffer.buffer.view(torch.int64).flatten()[:74])
+                    # These views supply CuTe's pointer type/shape only. Every
+                    # TensorMap pointer load becomes a host-supplied value param.
+                    map_storage = sym_buffer.buffer.view(torch.uint8).flatten()
+                    map_views = tuple(from_dlpack(map_storage[i * 128:(i + 1) * 128])
+                                      for i in range(18))
+                    role3_map_view = from_dlpack(map_storage[:2304])
+                    y_view = from_dlpack(y)
+                    stats_view = from_dlpack(stats) if stats is not None else signal_view
+                    rank_view, token_view = Uint32(0), Uint32(0)
+                    clamp_view, alpha_view = Float32(0.0), Float32(1.0)
+                    compiled_binaries = []
+                    for index, (role, role_kernel) in enumerate(zip((1, 2, 3), role_kernels)):
+                        compile_args = ((signal_view, peer_view, rank_view, token_view,
+                                         map_views[0], None, None,
+                                         clamp_view, alpha_view, *map_views[1:])
+                                        if role == 2 else
+                                        (signal_view, peer_view, rank_view, token_view,
+                                         role3_map_view, y_view, stats_view,
+                                         clamp_view, alpha_view)
+                                        if role == 3 else
+                                        (signal_view, peer_view, rank_view, token_view,
+                                         None, None, None,
+                                         clamp_view, alpha_view))
+                        cubin = compile_kernel(
+                            role_kernel, compile_args, compiler_identity,
+                            lambda ptx, dump_dir: _assemble_role_value_params(
+                                ptx, role, dump_dir, target=compiler_target,
+                                ptxas_options=compiler_identity.ptxas_options))
+                        role_config = role_configs[index]
+                        compiled_binaries.append(RoleBinary(
+                            role, cubin, role_config.dynamic_smem,
+                            role_config.threads,
+                            context.dispatch_sms if role == 1 else
+                            context.compute_sms if role == 2 else
+                            role_kernel.finalize_sms))
+                    return compiled_binaries
+
+                binaries = _get_or_compile_binaries(
+                    binary_key, compiler_identity, compiler_target, compile_roles)
+                prepared = _Prepared(maps, binaries)
                 if _compiler_identity(compiler_target) != compiler_identity:
                     raise RuntimeError('compiler identity changed while preparing role binaries')
                 _CACHE[key] = prepared
@@ -669,8 +657,16 @@ def prepare_role_binaries(config, y: torch.Tensor,
                                sym_buffer.buffer.data_ptr())
     arguments = ((signal_arg, peer_arg, rank_arg, token_arg,
                   clamp_arg, alpha_arg),
-                 (signal_arg, peer_arg, rank_arg, token_arg, signal_arg,
+                 (signal_arg, peer_arg, rank_arg, token_arg,
                   clamp_arg, alpha_arg, *map_args),
-                 (signal_arg, peer_arg, rank_arg, token_arg, role3_map_arg, signal_arg,
+                 (signal_arg, peer_arg, rank_arg, token_arg, role3_map_arg,
                   y_arg, stats_arg, clamp_arg, alpha_arg))
     return list(prepared.binaries), arguments
+
+def launch_gc_moe(config, y, l1_weights, l2_weights, sym_buffer,
+                  shared_l1_weights, shared_l2_weights, stats) -> None:
+    context = get_context()
+    binaries, arguments = prepare_role_binaries(
+        config, y, l1_weights, l2_weights, sym_buffer,
+        shared_l1_weights, shared_l2_weights, stats, context)
+    context.launch(binaries, arguments)

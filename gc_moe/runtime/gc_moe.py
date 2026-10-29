@@ -509,13 +509,3 @@ def get_context() -> GreenContextPair:
     elif contexts[key]._state != 'open':
         raise RuntimeError(f"cached Green context pair is {contexts[key]._state}")
     return contexts[key]
-
-
-def launch_gc_moe(config, y, l1_weights, l2_weights, sym_buffer,
-                  shared_l1_weights, shared_l2_weights, stats) -> None:
-    from ..jit_kernels.impls.sm100_fp8_fp4_gc_moe import prepare_role_binaries
-    context = get_context()
-    binaries, arguments = prepare_role_binaries(
-        config, y, l1_weights, l2_weights, sym_buffer,
-        shared_l1_weights, shared_l2_weights, stats, context)
-    context.launch(binaries, arguments)

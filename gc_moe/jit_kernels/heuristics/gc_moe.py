@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from math import ceil, sqrt
 from struct import pack, unpack
 
 from ...layout.gc_moe import (
     CANDIDATE_BLOCK_M,
+    SharedStorageLayout,
     align,
     ceil_div,
+    get_role_shared_layout,
 )
 
 
@@ -96,15 +99,30 @@ class RoleConfig:
     dynamic_smem: int
     stage_bytes: int
     fixed_bytes: int
+    load_m: int
+    sf_block_m: int
+    swizzle_acts: int
+    swizzle_weights: int
+    swizzle_output: int
+    routing_warps: int
+    pull_bytes: int
+    shared_layout: SharedStorageLayout
 
 
+@lru_cache(maxsize=256)
 def get_role_config(role: int, block_m: int, num_experts: int,
-                    hidden: int, pull_bytes: int) -> RoleConfig:
+                    hidden: int) -> RoleConfig:
     if role not in (1, 2, 3) or block_m not in CANDIDATE_BLOCK_M or block_m % 16:
         raise ValueError('invalid GC role/block M')
+    pull_bytes = hidden
+    while pull_bytes > 8192:
+        if pull_bytes % 2:
+            raise ValueError('raw-address pull must divide hidden bytes')
+        pull_bytes //= 2
     store1 = 8 if block_m <= 16 else 16 if block_m <= 96 else 32 if block_m <= 192 else 24
     store2 = 8 if block_m == 240 else store1
-    dispatch_threads = (384 if block_m >= 96 else 256) if role == 1 else 128
+    routing_warps = 12 if block_m >= 96 else 8
+    dispatch_threads = routing_warps * 32 if role == 1 else 128
     dispatch_warps = dispatch_threads // 32
     smem_cd = align(max(2 * store1 * 64 * 2, 2 * store2 * 128 * 2), 1024)
     smem_amax = store1 * 8 * 4
@@ -129,9 +147,16 @@ def get_role_config(role: int, block_m: int, num_experts: int,
     if fixed + stages * stage > dynamic_smem:
         raise ValueError('role shared-storage footprint exceeds launch allocation')
     threads = dispatch_threads if role == 1 else 384
-    return RoleConfig(role, block_m, 128, 128, store1, store2,
+    shared_layout = get_role_shared_layout(
+        role, block_m, num_experts, pull_bytes, stages,
+        store_m_l1=store1, store_m_l2=store2, dispatch_warps=dispatch_warps,
+        block_n=BLOCK_N, block_k=BLOCK_K, sf_block_m=align(block_m, 128))
+    if shared_layout.field_end > dynamic_smem:
+        raise ValueError('role shared storage exceeds its launch allocation')
+    return RoleConfig(role, block_m, BLOCK_N, BLOCK_K, store1, store2,
                       dispatch_threads, threads, stages, dynamic_smem,
-                      stage, fixed)
+                      stage, fixed, block_m // 2, align(block_m, 128),
+                      128, 128, 64, routing_warps, pull_bytes, shared_layout)
 
 
 def get_combine_geometry(hidden: int, reusable_bytes: int,
