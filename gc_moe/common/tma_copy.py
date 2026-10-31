@@ -63,8 +63,8 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
                 cute.arch.mbarrier_arrive(full_bar, peer_cta_rank_in_cluster=0)
     else:
         n_idx = n_block * Uint32(128)
-        # Evict routed FP4 weights first. Shared FP8 weights and
-        # both scale-factor maps retain the normal cache hint.
+        # Evict routed FP4 weights and their scale factors first. Shared FP8
+        # weights and their scale factors retain the normal cache hint.
         weight_cache_hint = Uint64(EVICT_FIRST)
         gran = Uint32(32)
         if cutlass.const_expr(has_shared):
@@ -92,7 +92,7 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
             if load_sf:
                 tile_g2s_2cta_2d(weight_sf_smem, weight_sf_map, full_bar,
                                  n_idx, local_expert * sf_packs_per_expert + sf_index,
-                                 cache_hint)
+                                 weight_cache_hint)
             if cta_rank == Uint32(0):
                 cute.arch.mbarrier_arrive_and_expect_tx(
                     full_bar, (weight_bytes + sf_bytes) * Uint32(2))

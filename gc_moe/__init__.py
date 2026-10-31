@@ -9,8 +9,10 @@ from .gc import (
 )
 
 from .sm90_gc import (
-    SM90GCSymmBuffer, get_symm_buffer_for_gc_moe_sm90,
-    transform_weights_for_gc_moe_sm90, sm90_fp8_fp4_gc_moe,
+    SM90GCSymmBuffer,
+    get_symm_buffer_for_gc_moe_sm90,
+    transform_weights_for_gc_moe_sm90,
+    sm90_fp8_fp4_gc_moe,
 )
 
 __all__ = [
@@ -25,4 +27,4 @@ __all__ = [
     'transform_weights_for_gc_moe',
 ]
 
-__version__ = '0.3.0'
+__version__ = '0.3.1'

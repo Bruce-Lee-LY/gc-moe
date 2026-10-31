@@ -1,4 +1,9 @@
-"""Multi-rank Mega MoE and GC MoE timing with fused shared experts."""
+"""Multi-rank Mega MoE and GC MoE timing with fused shared experts.
+
+Throughput uses the common helpers in benchmark_gc_moe. HBM is a weight+scale
+working-set MODEL; NVLink is useful routed payload (shared experts are local).
+All rates use each operator's original slowest-rank median. See JSON metadata.
+"""
 from __future__ import annotations
 import argparse
 import gc
@@ -20,9 +25,29 @@ import deep_gemm
 import gc_moe
 assert Path(gc_moe.__file__).resolve().is_relative_to(_ROOT), gc_moe.__file__
 from test_gc_moe_se import (
-    DEFAULT_TOKENS_PER_RANK, ROUTED_RECIPE, allocate_buffer, build_tokens, build_weights,
-    per_token_cast_to_fp8, prepare_shared_sf, stage_inputs,
+    DEFAULT_TOKENS_PER_RANK,
+    ROUTED_RECIPE,
+    allocate_buffer,
+    build_tokens,
+    build_weights,
+    per_token_cast_to_fp8,
+    prepare_shared_sf,
+    stage_inputs,
 )
+
+# Support both direct script execution and `python -m benchmarks...`.
+if __package__:
+    from .benchmark_gc_moe import (
+        _collect_throughput_workload, _collect_weight_storage, _common_weight_storage,
+        _print_throughput_metrics,
+        _throughput_definitions, _throughput_rates, _weight_storage,
+    )
+else:
+    from benchmark_gc_moe import (
+        _collect_throughput_workload, _collect_weight_storage, _common_weight_storage,
+        _print_throughput_metrics,
+        _throughput_definitions, _throughput_rates, _weight_storage,
+    )
 
 _L2_FLUSH_BUF: Optional[torch.Tensor] = None
 
@@ -186,11 +211,20 @@ def main():
     rank, world = dist.get_rank(), dist.get_world_size()
     assert torch.cuda.get_device_capability(device) in [(10, 0), (10, 3)]
     assert args.num_experts % world == 0, 'num_experts must be divisible by world_size'
-    mr, gr, original_shared, ms, gs, recipe = build_weights(args, rank, world, device)
-    del original_shared
+    mr, gr, original_shared, ms, gs, recipe, original_routed = build_weights(
+        args, rank, world, device, reference=True)
+    # Metadata only, outside timing; retain no additional quantized tensors.
+    local_experts = args.num_experts // world
+    routed_storage = _common_weight_storage(_weight_storage(mr, local_experts),
+                                            _weight_storage(gr, local_experts),
+                                            _weight_storage(original_routed, local_experts))
+    shared_storage = _common_weight_storage(_weight_storage(ms), _weight_storage(gs),
+                                            _weight_storage(original_shared))
+    del original_shared, original_routed
     mb = allocate_buffer(args, capacity, 'base')
     gb = allocate_buffer(args, capacity, 'gc')
     torch.cuda.empty_cache()
+    weight_storage_by_rank = _collect_weight_storage(routed_storage, shared_storage)
     results = []
     for tokens in sweep:
         x, indices, weights = build_tokens(tokens, args.hidden, args.num_experts, args.num_topk, rank, device)
@@ -229,15 +263,22 @@ def main():
             operator_stats[name] = dict(operator='deep_gemm.fp8_fp4_mega_moe' if name == 'baseline'
                                        else 'gc_moe.fp8_fp4_gc_moe', ranks=all_ranks,
                                        per_rank_median_us=medians, slowest_rank_median_us=max(medians))
+        workload = _collect_throughput_workload(
+            indices, args.num_experts, args.hidden, args.intermediate_hidden,
+            weight_storage_by_rank, args.intermediate_hidden * args.num_shared_experts,
+        )
+        throughput = {name: _throughput_rates(workload, measured['slowest_rank_median_us'])
+                      for name, measured in operator_stats.items()}
         base = operator_stats['baseline']['slowest_rank_median_us']
         candidate = operator_stats['gc']['slowest_rank_median_us']
         results.append(dict(num_tokens_per_rank=tokens, num_tokens_global=tokens * world,
                             mode='cuda_graph' if graph_mode else 'eager', baseline_us=base, gc_us=candidate,
                             speedup=base / candidate, gc_block_m=gbm, mega_block_m=mbm,
-                            operator_stats=operator_stats))
+                            operator_stats=operator_stats, workload=workload, throughput=throughput))
         if rank == 0:
             print(f'COMPARE tokens_per_rank={tokens} total_tokens={tokens * world} mode={results[-1]["mode"]} Mega_SE={base:.6f}us '
                   f'CuTe_GC_SE={candidate:.6f}us speedup={base / candidate:.6f}', flush=True)
+            _print_throughput_metrics(tokens, throughput)
         del base_y, gc_y, x, x8, xs, indices, weights, msf, gsf
         gc.collect()
         torch.cuda.empty_cache()
@@ -255,6 +296,8 @@ def main():
                                       latency='maximum of per-rank medians over CUDA-event windows',
                                       operators={'baseline': 'deep_gemm.fp8_fp4_mega_moe', 'candidate': 'gc_moe.fp8_fp4_gc_moe'},
                                       modules={'baseline': deep_gemm.__file__, 'candidate': gc_moe.__file__},
+                                      throughput_metrics=_throughput_definitions(),
+                                      weight_storage_by_rank=weight_storage_by_rank,
                                       results=results), indent=2) + '\n')
         print('Wrote', str(out), flush=True)
     torch.cuda.synchronize(device)

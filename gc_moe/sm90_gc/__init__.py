@@ -143,23 +143,58 @@ def _transform(raw, scale_2=None, paired=False):
     return data, offsets, secondary
 
 
+@torch.no_grad()
 def transform_weights_for_gc_moe_sm90(l1_weights, l2_weights,
                                       l1_weight_scale_2=None, l2_weight_scale_2=None,
                                       shared_recipe=(1, 1, 32)):
-    """Convert raw MXFP4 to independent register-A tiles, retaining natural gate/up rows."""
+    """Convert checkpoint weights to newly allocated SM90 tiles on the current stream.
+
+    Call outside CUDA Graph capture after ordering source writes on the current
+    stream. Returns after the current stream's copies finish; raw inputs may
+    then be released.
+    The caller must keep the returned tensors alive and address-stable until all
+    launches and captured CUDA Graphs that reference them have retired.
+    """
+    pairs = (l1_weights, l2_weights)
+    if any(not isinstance(pair, (tuple, list)) or len(pair) != 2 or
+           any(not isinstance(tensor, torch.Tensor) for tensor in pair)
+           for pair in pairs):
+        raise ValueError('SM90 transform needs two original (payload, scale) pairs')
     if l1_weights[0].dtype == torch.float8_e4m3fn:
         if l1_weight_scale_2 is not None or l2_weight_scale_2 is not None:
             raise ValueError('dense shared weights do not have secondary scales')
-        return (_transform_shared(l1_weights, shared_recipe, True),
-                _transform_shared(l2_weights, shared_recipe, False))
-    if (l1_weight_scale_2 is None) != (l2_weight_scale_2 is None):
+    elif (l1_weight_scale_2 is None) != (l2_weight_scale_2 is None):
         raise ValueError('both checkpoint secondary scales must be supplied together')
+    inputs = tuple(tensor for pair in pairs for tensor in pair)
+    if l1_weight_scale_2 is not None:
+        if not isinstance(l1_weight_scale_2, torch.Tensor) or \
+                not isinstance(l2_weight_scale_2, torch.Tensor):
+            raise ValueError('secondary checkpoint scales must be tensors')
+        inputs += (l1_weight_scale_2, l2_weight_scale_2)
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError('transform SM90 weights outside CUDA Graph capture')
+    if any(not tensor.is_cuda for tensor in inputs):
+        raise ValueError('SM90 transform inputs must use CUDA storage')
+    current_device = torch.cuda.current_device()
+    if any(tensor.device.index != current_device for tensor in inputs):
+        raise ValueError('SM90 transform inputs must use the current CUDA device')
+    stream = torch.cuda.current_stream(current_device)
+    for tensor in inputs:
+        tensor.record_stream(stream)
+    if l1_weights[0].dtype == torch.float8_e4m3fn:
+        result = (_transform_shared(l1_weights, shared_recipe, True),
+                  _transform_shared(l2_weights, shared_recipe, False))
+        stream.synchronize()
+        return result
     if (l1_weights[0].ndim != 3 or l2_weights[0].ndim != 3
             or l1_weights[0].shape[0] != l2_weights[0].shape[0]
             or l1_weights[0].shape[1] != 4 * l2_weights[0].shape[2]
             or l2_weights[0].shape[1] != 2 * l1_weights[0].shape[2]):
         raise ValueError('W1/W2 geometry mismatch')
-    return _transform(l1_weights, l1_weight_scale_2, paired=True), _transform(l2_weights, l2_weight_scale_2)
+    result = (_transform(l1_weights, l1_weight_scale_2, paired=True),
+              _transform(l2_weights, l2_weight_scale_2))
+    stream.synchronize()
+    return result
 
 
 def _transform_shared(pair, recipe, paired):

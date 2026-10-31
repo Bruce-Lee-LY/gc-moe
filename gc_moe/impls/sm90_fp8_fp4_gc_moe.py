@@ -6,26 +6,55 @@ import cutlass.cute as cute
 from cutlass import Boolean, Float32, Int64, Uint8, Uint32, Uint64
 
 from ..common.math import (
-    abs_f32, bits_float, f32x2_to_e4m3x2_bits, round_bf16_f32,
-    ue8m0_fp8_inv, ue8m0_fp8_scale_exp,
+    abs_f32,
+    bits_float,
+    f32x2_to_e4m3x2_bits,
+    round_bf16_f32,
+    ue8m0_fp8_inv,
+    ue8m0_fp8_scale_exp,
 )
 from ..mma.sm90 import (
-    canonical_offset, decode_fragment, smem_descriptor,
-    wgmma_rs_issue, wgmma_rs_k128, wgmma_rs_k32_pair, wgmma_rs_wait,
+    canonical_offset,
+    decode_fragment,
+    smem_descriptor,
+    wgmma_rs_issue,
+    wgmma_rs_k128,
+    wgmma_rs_k32_pair,
+    wgmma_rs_wait,
 )
 from ..ptx.ld_st import (
-    atom_acq_rel_add_u32, atom_add_u32, atom_release_gpu_add_u32,
-    atom_shared_add_u32, copy_global_16, ld_acquire_gpu_u32,
-    ld_acquire_sys_u32_sm90 as ld_acquire_sys_u32, ld_shared_u32x4_sm90 as load_shared_u32x4, load_bf16_8, load_scale_pair,
-    load_shared_4, load_shared_8, st_release_u32, store_bf16_8,
+    atom_acq_rel_add_u32,
+    atom_add_u32,
+    atom_release_gpu_add_u32,
+    atom_shared_add_u32,
+    copy_global_16,
+    ld_acquire_gpu_u32,
+    ld_acquire_sys_u32_sm90 as ld_acquire_sys_u32,
+    ld_shared_u32x4_sm90 as load_shared_u32x4,
+    load_bf16_8,
+    load_scale_pair,
+    load_shared_4,
+    load_shared_8,
+    st_release_u32,
+    store_bf16_8,
 )
 from ..ptx.tma import (
-    bulk_g2s_1d, copy_arrive, copy_async_4, copy_async_16,
-    copy_commit, copy_wait, tma_store_fence,
+    bulk_g2s_1d,
+    copy_arrive,
+    copy_async_4,
+    copy_async_16,
+    copy_commit,
+    copy_wait,
+    tma_store_fence,
 )
 from ..ptx.utils import (
-    fence_gpu, fence_sys, sync_loader, sync_math, sync_tile,
-    sync_activation, sync_weight,
+    fence_gpu,
+    fence_sys,
+    sync_loader,
+    sync_math,
+    sync_tile,
+    sync_activation,
+    sync_weight,
 )
 from ..scheduler.sm90_gc_moe import claim_sm90_task
 from ..layout.sm90_gc_moe import get_role_shared_layout

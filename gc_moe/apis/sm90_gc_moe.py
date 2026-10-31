@@ -40,16 +40,18 @@ def validate_call(y, w1, w2, buffer, stats, recipe, activation, clamp,
     if bound < 0 or bound > buffer.num_max_tokens_per_rank or (bound and bound < y.shape[0]):
         raise ValueError('num_tokens_bound must cover every rank and fit capacity')
     local = buffer.num_experts // buffer.group.size()
-    for weight, n, k in ((w1, 2 * buffer.intermediate_hidden, buffer.hidden),
-                         (w2, buffer.hidden, buffer.intermediate_hidden)):
+    for name, weight, n, k in (('routed W1', w1, 2 * buffer.intermediate_hidden, buffer.hidden),
+                               ('routed W2', w2, buffer.hidden, buffer.intermediate_hidden)):
         shapes = ((local, n // 256, k // 128, 4, 256, 16), (local, n // 256, k // 128, 256, 4), (local,))
         if not isinstance(weight, (tuple, list)) or len(weight) != 3:
-            raise ValueError('SM90 weights must contain independent data/scales/secondary')
+            raise ValueError(f'{name} needs the data/offset/secondary tuple from '
+                             'transform_weights_for_gc_moe_sm90')
         for tensor, shape, dtype in zip(weight, shapes, (torch.int8, torch.uint8, torch.float32)):
             if (not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != shape
                     or tensor.dtype != dtype or tensor.device != device
                     or not tensor.is_contiguous() or tensor.data_ptr() % 16):
-                raise ValueError('invalid SM90 weight tile layout, dtype or device')
+                raise ValueError(f'invalid {name} SM90 tile layout, dtype or device; '
+                                 'call transform_weights_for_gc_moe_sm90 first')
     if stats is not None and (stats.device != device or stats.dtype != torch.int32
                               or stats.shape != (local,) or not stats.is_contiguous()):
         raise ValueError('stats must be contiguous int32 [local_experts]')
@@ -57,26 +59,32 @@ def validate_call(y, w1, w2, buffer, stats, recipe, activation, clamp,
         raise ValueError('both shared weight pairs must be supplied together')
     shared_experts = 0
     if shared_l1_weights is not None:
-        for weight in (shared_l1_weights, shared_l2_weights):
+        for name, weight in (('shared W1', shared_l1_weights),
+                             ('shared W2', shared_l2_weights)):
             if (not isinstance(weight, (tuple, list)) or len(weight) != 2
                     or not all(isinstance(tensor, torch.Tensor) for tensor in weight)):
-                raise ValueError('shared weights must be two-tensor data/scales pairs')
+                raise ValueError(f'{name} needs the data/scale pair from '
+                                 'transform_weights_for_gc_moe_sm90')
         if shared_recipe is not None and tuple(shared_recipe) not in ((1, 1, 32), (1, 128, 128)):
             raise ValueError('unsupported shared recipe')
+        if shared_l2_weights[0].ndim != 6:
+            raise ValueError('shared W2 needs the tiled payload from '
+                             'transform_weights_for_gc_moe_sm90')
         shared_i = shared_l2_weights[0].shape[1] * 128
         if shared_i <= 0 or shared_i % buffer.intermediate_hidden:
             raise ValueError('shared intermediate must contain whole shared experts')
         shared_experts = shared_i // buffer.intermediate_hidden
         if shared_experts > buffer.num_shared_experts:
             raise ValueError('workspace does not cover shared experts')
-        for weight, n, k in ((shared_l1_weights, 2 * shared_i, buffer.hidden),
-                             (shared_l2_weights, buffer.hidden, shared_i)):
+        for name, weight, n, k in (('shared W1', shared_l1_weights, 2 * shared_i, buffer.hidden),
+                                   ('shared W2', shared_l2_weights, buffer.hidden, shared_i)):
             for tensor, shape, dtype in zip(weight,
                     ((n // 256, k // 128, 4, 4, 128, 16), (n // 256, k // 128, 4, 64, 4)),
                     (torch.uint8, torch.float32)):
                 if (tuple(tensor.shape) != shape or tensor.dtype != dtype or tensor.device != device
                         or not tensor.is_contiguous() or tensor.data_ptr() % 16):
-                    raise ValueError('invalid shared FP8 tile/scales layout')
+                    raise ValueError(f'invalid {name} FP8 tile/scale layout; '
+                                     'call transform_weights_for_gc_moe_sm90 first')
     return ValidatedCall(buffer.group.size(), buffer.num_experts,
                           buffer.num_max_tokens_per_rank, buffer.num_topk,
                           buffer.hidden, buffer.intermediate_hidden,

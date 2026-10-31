@@ -14,10 +14,16 @@ from cutlass.cute.runtime import make_ptr
 from ...impls.sm90_fp8_fp4_gc_moe import SM90GCMoERoleKernel
 from ...runtime.sm90_gc_moe import RoleBinary, get_context
 from ...runtime.jit import (
-    COMPILE_LOCK, CompilerIdentity, assemble_ptx, compile_kernel, compiler_identity,
+    COMPILE_LOCK,
+    CompilerIdentity,
+    assemble_ptx,
+    compile_kernel,
+    compiler_identity,
 )
 from ..heuristics.sm90_gc_moe import (
-    get_sm90_role_config, get_routed_role_config, get_shared_role_config,
+    get_sm90_role_config,
+    get_routed_role_config,
+    get_shared_role_config,
 )
 
 

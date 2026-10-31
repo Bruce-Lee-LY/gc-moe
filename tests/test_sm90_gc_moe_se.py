@@ -24,9 +24,15 @@ import gc_moe
 assert Path(gc_moe.__file__).resolve().is_relative_to(_ROOT), gc_moe.__file__
 from deep_gemm.utils import per_token_cast_to_fp8, per_block_cast_to_fp8
 from test_sm90_gc_moe import (
-    DEFAULT_TOKENS_PER_RANK, build_tokens, cast_tokens_to_fp8,
-    cast_grouped_weights_to_fp4, dequantize_humming_expert, cosine, diff,
-    error_metrics, package_audit,
+    DEFAULT_TOKENS_PER_RANK,
+    build_tokens,
+    cast_tokens_to_fp8,
+    cast_grouped_weights_to_fp4,
+    dequantize_humming_expert,
+    cosine,
+    diff,
+    error_metrics,
+    package_audit,
 )
 from test_gc_moe_se import build_local_weights, build_shared_weights, parse_per_rank_vectors
 
