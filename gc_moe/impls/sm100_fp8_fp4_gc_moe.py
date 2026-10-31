@@ -1145,7 +1145,6 @@ class GCMoERoleKernel:
                     if running:
                         pool_block = Uint32(task_words[task_stage * 8 + 4])
                         valid_m = Uint32(task_words[task_stage * 8 + 5])
-                        shape_n = Uint32(task_words[task_stage * 8 + 6])
                         shape_k = Uint32(task_words[task_stage * 8 + 7])
                         n_cluster = Uint32(task_words[task_stage * 8 + 3])
                         local_expert = Uint32(task_words[task_stage * 8 + 1])
@@ -1221,7 +1220,7 @@ class GCMoERoleKernel:
                                 data_full + data_stage, data_empty + data_stage,
                                 k_block, data_phase, block_idx,
                                 n_cluster * Uint32(2) + cta_rank,
-                                local_expert, valid_m, shape_n, shape_k,
+                                local_expert, valid_m, shape_k,
                                 is_shared, cta_rank, 0,
                                 self.block_m, self.sf_block_m,
                                 self.shared_weight_gran_k,
@@ -1246,7 +1245,6 @@ class GCMoERoleKernel:
                     if running:
                         pool_block = Uint32(task_words[task_stage * 8 + 4])
                         valid_m = Uint32(task_words[task_stage * 8 + 5])
-                        shape_n = Uint32(task_words[task_stage * 8 + 6])
                         shape_k = Uint32(task_words[task_stage * 8 + 7])
                         n_cluster = Uint32(task_words[task_stage * 8 + 3])
                         local_expert = Uint32(task_words[task_stage * 8 + 1])
@@ -1292,7 +1290,7 @@ class GCMoERoleKernel:
                                 data_full + data_stage, data_empty + data_stage,
                                 k_block, data_phase, block_idx,
                                 n_cluster * Uint32(2) + cta_rank,
-                                local_expert, valid_m, shape_n, shape_k,
+                                local_expert, valid_m, shape_k,
                                 is_shared, cta_rank, 1,
                                 self.block_m, self.sf_block_m,
                                 self.shared_weight_gran_k,

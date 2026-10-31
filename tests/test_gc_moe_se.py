@@ -253,12 +253,6 @@ def build_weights(args, rank, world, device, reference=False):
     shared = tuple(cast_shared_weight_to_fp8(w, weight_recipe) for w in raw)
     base_shared = deep_gemm.transform_weights_for_mega_moe(*shared, activation=args.activation)
     gc_shared = gc_moe.transform_weights_for_gc_moe(*shared, activation=args.activation)
-    for left, right in [(base_routed, gc_routed), (base_shared, gc_shared)]:
-        for lp, rp in zip(left, right):
-            for a, b in zip(lp, rp):
-                assert a.shape == b.shape and a.stride() == b.stride()
-                assert torch.equal(a.view(torch.uint8) if a.dtype == torch.float8_e4m3fn else a,
-                                   b.view(torch.uint8) if b.dtype == torch.float8_e4m3fn else b)
     del raw
     result = base_routed, gc_routed, shared, base_shared, gc_shared, recipe
     return (*result, quantized) if reference else result

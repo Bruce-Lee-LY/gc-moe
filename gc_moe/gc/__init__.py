@@ -179,21 +179,43 @@ def _gc_transpose_sf(sf: torch.Tensor) -> torch.Tensor:
     return result if sf.ndim == 3 else result.squeeze(0)
 
 
+@torch.no_grad()
 def transform_weights_for_gc_moe(
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor], activation: str = 'swiglu',
 ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
-    """Interleave W1 gate/up rows and transpose packed UE8M0 scale rows.
+    """Convert original quantized weights to owned K128 (payload, SF) pairs.
 
-    Accept routed 3D FP4 or shared 2D FP8 weights before localization.
-    Expand shared K128 weight scales to one packed scale row per N before
-    calling this transform.
+    Shared K128 SF must already be expanded to one packed row per N, as for
+    the original transform. Call outside capture with ordered source writes.
+    Returns after the current stream's copies finish; raw inputs may then die.
     """
+    from ..jit_kernels.impls.runtime_utils import repack_fp4_weights, repack_fp8_weights
     if activation != 'swiglu':
         raise ValueError('GC MoE supports swiglu')
-    return ((_gc_interleave_rows(l1_weights[0]),
-             _gc_transpose_sf(_gc_interleave_rows(l1_weights[1]))),
-            (l2_weights[0], _gc_transpose_sf(l2_weights[1])))
+    pairs = (l1_weights, l2_weights)
+    if any(not isinstance(pair, (tuple, list)) or len(pair) != 2 or
+           any(not isinstance(t, torch.Tensor) for t in pair) for pair in pairs):
+        raise ValueError('transform needs two original quantized (payload, SF) pairs')
+    if any(not t.is_cuda or t.device.index != torch.cuda.current_device()
+           for pair in pairs for t in pair):
+        raise ValueError('transform inputs must use the current CUDA device')
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError('transform weights outside CUDA Graph capture')
+    stream = torch.cuda.current_stream()
+    for pair in pairs:
+        for tensor in pair:
+            tensor.record_stream(stream)
+    source_storage = {pair[0].untyped_storage().data_ptr() for pair in pairs}
+    repack = repack_fp4_weights if l1_weights[0].dtype == torch.int8 else repack_fp8_weights
+    packed = [repack(_gc_interleave_rows(l1_weights[0])), repack(l2_weights[0])]
+    # A degenerate K128 permutation may return a view of its input.
+    packed = [t.clone() if t.untyped_storage().data_ptr() in source_storage else t
+              for t in packed]
+    sf1 = _gc_transpose_sf(_gc_interleave_rows(l1_weights[1]))
+    sf2 = _gc_transpose_sf(l2_weights[1])
+    stream.synchronize()
+    return (packed[0], sf1), (packed[1], sf2)
 
 
 def fp8_fp4_gc_moe(y: torch.Tensor,

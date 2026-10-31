@@ -80,7 +80,11 @@ class GCTmaPlan:
 def build_gc_tma_plan(config, sym_buffer, l1_weights, l2_weights,
                       shared_l1_weights=None, shared_l2_weights=None,
                       shared_weight_gran_k: int = 32) -> GCTmaPlan:
-    """Describe routed/shared tensors; encode with live pointers at launch."""
+    """Describe routed/shared tensors; encode with live pointers at launch.
+
+    Each weight tuple's [0] tensor is the tile-repacked payload prepared by
+    the caller; scale factors and activations use their original storage.
+    """
     bk, bn = config.block_k, config.block_n
     h, i = sym_buffer.hidden, sym_buffer.intermediate_hidden
     sf_m = config.sf_block_m
@@ -167,8 +171,12 @@ def _compiler_identity(target: str) -> CompilerIdentity:
 class _Prepared:
     maps: bytes
     binaries: tuple[RoleBinary, RoleBinary, RoleBinary]
+    # Hold both payload and SF storage for every graph using these maps.
+    keepalive: tuple = ()
 
 
+# Lifetime owner of loaded weights used by TensorMaps and child/outer graphs.
+# Entries remain alive; no cache clear may release in-flight graph resources.
 _CACHE: dict[tuple, _Prepared] = {}
 _BINARY_CACHE: dict[tuple, tuple[RoleBinary, RoleBinary, RoleBinary]] = {}
 
@@ -519,8 +527,12 @@ def prepare_role_binaries(config, y: torch.Tensor,
     if context is None:
         context = get_context()
     device = sym_buffer.buffer.device
-    tensors = (y, *l1_weights, *l2_weights, *(shared_l1_weights or ()),
-               *(shared_l2_weights or ()), *((stats,) if stats is not None else ()))
+    weight_pairs = (l1_weights, l2_weights)
+    if shared_l1_weights is not None:
+        weight_pairs += (shared_l1_weights, shared_l2_weights)
+    weights = tuple(tensor for pair in weight_pairs for tensor in pair)
+    tensors = (y, *weights,
+               *((stats,) if stats is not None else ()))
     if (device.type != 'cuda' or torch.cuda.current_device() != device.index or
             int(context.device) != device.index or any(tensor.device != device for tensor in tensors)):
         raise ValueError('role tensors and Green contexts must use the current CUDA device')
@@ -590,8 +602,6 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         role_config=role_configs[index],
                         combine_geometry=combine_geometry if role == 3 else None)
                     role_kernels.append(role_kernel)
-                weights = (*l1_weights, *l2_weights,
-                           *(shared_l1_weights or ()), *(shared_l2_weights or ()))
                 binary_key = _binary_key(
                     compiler_identity, tuple(role_kernels), role_resources,
                     combine_resources, sym_buffer, y, weights, stats)
@@ -637,7 +647,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
 
                 binaries = _get_or_compile_binaries(
                     binary_key, compiler_identity, compiler_target, compile_roles)
-                prepared = _Prepared(maps, binaries)
+                prepared = _Prepared(maps, binaries, weights)
                 if _compiler_identity(compiler_target) != compiler_identity:
                     raise RuntimeError('compiler identity changed while preparing role binaries')
                 _CACHE[key] = prepared

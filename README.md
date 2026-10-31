@@ -10,7 +10,7 @@ experts (SE), with FP8 activations, packed FP4 routed weights, FP8 shared
 weights and BF16 outputs.
 
 GPU kernels are JIT compiled on first use. Installation builds a Python wheel;
-it does not compile CUDA kernels. The current package version is `0.2.0`.
+it does not compile CUDA kernels. The current package version is `0.3.0`.
 
 ## Performance
 
@@ -105,7 +105,7 @@ PTX.
 For editable development, use `python -m pip install -e .` instead of installing
 the wheel. Wheel versions include the Git revision for a clean tree, or
 `+local` for a dirty tree or a source copy without Git metadata. Set
-`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.2.0` version.
+`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.3.0` version.
 
 ## Interfaces
 
@@ -159,15 +159,26 @@ into each `int32`. Quantization is the caller's responsibility. Weight
 transformation only rearranges already quantized data and packed scales; it
 does not quantize floating-point weights.
 
-Routed weights are `(data, scales)` pairs. W1 data has shape
+Routed inputs to `transform_weights_for_gc_moe` are `(data, scales)` pairs.
+W1 data has shape
 `[E / P, 2 * I, H / 2]` and W2 data has shape `[E / P, H, I / 2]`, both stored
 as contiguous `torch.int8` with two FP4 values per byte. Before transformation,
-W1 contains the gate rows followed by the up rows. After transformation, the
+W1 contains the gate rows followed by the up rows. The returned W1/W2 payloads
+have contiguous K128 shapes `[E / P, H / 128, 2 * I, 64]` and
+`[E / P, I / 128, H, 64]`, respectively. After transformation, the
 packed scale shapes are `[E / P, 2 * I, H / 128]` and
 `[E / P, H, I / 128]`, respectively, with the required MN-major TMA strides.
 Input weight scales must already have
 MN-major storage (`stride(-2) == 1`) and TMA-aligned strides; the transform
 preserves that storage order while permuting scale rows.
+
+Run the transform once per weight set, outside CUDA Graph capture, with source
+writes ordered before it on the current CUDA stream. It returns independent
+pairs; after the call returns, the original data and scales may be released.
+Reuse the returned pairs across token counts and workspaces; the operator only
+accepts transformed pairs. Keep their storage and layout fixed while graphs use
+them. Order in-place value updates after previous readers and before replay;
+replacing storage or layout requires preparing and capturing new graphs.
 
 The current operator requires:
 
@@ -229,9 +240,12 @@ initialization and Eager/CUDA Graph execution.
 ### Fused shared experts
 
 Allocate with `num_shared_experts > 0` and supply both shared weight pairs.
-Shared W1/W2 use contiguous 2D FP8 data with shapes `[2 * S * I, H]` and
+Shared inputs to the transform use contiguous 2D FP8 data with shapes `[2 * S * I, H]` and
 `[H, S * I]`, where `S` is the number of shared experts. Transform these pairs
 separately from the routed weights.
+
+The returned shared W1/W2 payloads have contiguous K128 shapes
+`[H / 128, 2 * S * I, 128]` and `[S * I / 128, H, 128]`, respectively.
 
 Supported shared recipes are `(1, 1, 32)` and `(1, 128, 128)`. For K128 weights,
 expand block-row scales to one packed scale row per output row before weight

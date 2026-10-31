@@ -83,39 +83,79 @@ def make_tma_2d_desc(tensor: torch.Tensor, inner: int, outer: int,
                  (block_inner, block_outer), swizzle)
 
 
-def make_tma_weights_3d_desc(tensor: torch.Tensor, block_k: int, load_n: int,
-                     num_domains: int = 2, swizzle: int = 128) -> TmaDescriptorSpec:
-    """Map a dense 3D weight tensor to a 4D (K,N/domain,domain,expert) map."""
+def repack_fp4_weights(tensor: torch.Tensor, block_k: int = 128) -> torch.Tensor:
+    """Repack routed FP4 weights into tile-contiguous 64-byte-row segments.
+
+    Input (experts, rows, K/2) int8 becomes (experts, kb, rows, block_k/2):
+    every 64-byte K segment of every row stays byte-identical, but segments
+    of the same K block across all rows of an expert become contiguous. The
+    weight TensorMap then bursts one 8KB contiguous global range per op
+    instead of 128 segments spaced a full weight row apart.
+    """
     if tensor.ndim != 3 or tensor.dtype != torch.int8:
         raise ValueError('routed FP4 weights must be packed int8 3D')
     if not tensor.is_contiguous():
         raise ValueError('routed FP4 weight dense storage must be contiguous')
-    experts = tensor.shape[0]
-    n_per_domain = tensor.shape[1] // num_domains
-    k = tensor.shape[-1] * 2
-    if tensor.shape[1] % num_domains:
-        raise ValueError('N must divide descriptor slices')
-    slice_stride = n_per_domain * tensor.stride(-2)
-    batch_stride = tensor.stride(0)
-    return _base(tensor, (k, n_per_domain, num_domains, experts),
-                 (tensor.stride(-2), slice_stride, batch_stride),
+    segment = block_k // 2
+    experts, rows, cols = tensor.shape
+    if cols % segment:
+        raise ValueError('FP4 weight K axis must contain whole tile segments')
+    return (tensor.view(experts, rows, cols // segment, segment)
+                 .permute(0, 2, 1, 3).contiguous())
+
+
+def repack_fp8_weights(tensor: torch.Tensor, block_k: int = 128) -> torch.Tensor:
+    """Repack shared FP8 weights into tile-contiguous 128-byte-row segments."""
+    if tensor.ndim != 2 or tensor.dtype != torch.float8_e4m3fn:
+        raise ValueError('shared FP8 weights must be 2D FP8')
+    if not tensor.is_contiguous():
+        raise ValueError('shared FP8 weight dense storage must be contiguous')
+    segment = block_k
+    rows, cols = tensor.shape
+    if cols % segment:
+        raise ValueError('FP8 weight K axis must contain whole tile segments')
+    return (tensor.view(rows, cols // segment, segment)
+                 .permute(1, 0, 2).contiguous())
+
+
+def make_tma_weights_3d_desc(tensor: torch.Tensor, block_k: int, load_n: int,
+                     swizzle: int = 128) -> TmaDescriptorSpec:
+    """Map a tile-repacked FP4 weight tensor to a 4D (K-tile,rows,kb,expert) map.
+
+    The tensor is (experts, kb, rows, block_k/2) int8 from repack_fp4_weights.
+    One box (block_k, load_n, 1, 1) then reads a single contiguous global
+    range: row stride is block_k/2 bytes and rows are adjacent.
+    """
+    if tensor.ndim != 4 or tensor.dtype != torch.int8:
+        raise ValueError('routed FP4 weights must be tile-repacked int8 4D')
+    if not tensor.is_contiguous():
+        raise ValueError('routed FP4 repacked storage must be contiguous')
+    experts, kb, rows, segment = tensor.shape
+    if segment * 2 != block_k or rows % load_n or kb <= 0:
+        raise ValueError('FP4 weight tiles must match the descriptor K block')
+    return _base(tensor, (block_k, rows, kb, experts),
+                 (tensor.stride(2), tensor.stride(1), tensor.stride(0)),
                  (block_k, load_n, 1, 1), swizzle)
 
 
 def make_tma_weights_2d_desc(tensor: torch.Tensor, block_k: int, load_n: int,
-                     num_domains: int = 2, swizzle: int = 128) -> TmaDescriptorSpec:
-    """Map a dense 2D FP8 weight tensor to a 4D (K,N/domain,domain,1) map."""
-    if tensor.ndim != 2 or tensor.dtype != torch.float8_e4m3fn:
-        raise ValueError('shared FP8 weights must be 2D')
+                     swizzle: int = 128) -> TmaDescriptorSpec:
+    """Map a tile-repacked FP8 weight tensor to a 4D (K-tile,rows,kb,1) map.
+
+    The tensor is (kb, rows, block_k) FP8 from repack_fp8_weights; one box
+    (block_k, load_n, 1, 1) reads a contiguous 16KB global range.
+    """
+    if tensor.ndim != 3 or tensor.dtype != torch.float8_e4m3fn:
+        raise ValueError('shared FP8 weights must be tile-repacked FP8 3D')
     if not tensor.is_contiguous():
-        raise ValueError('shared FP8 weight dense storage must be contiguous')
-    n_per_domain = tensor.shape[0] // num_domains
-    if tensor.shape[0] % num_domains:
-        raise ValueError('shared N must divide descriptor slices')
-    k = tensor.shape[-1]
-    slice_stride = n_per_domain * tensor.stride(-2)
-    return _base(tensor, (k, n_per_domain, num_domains, 1),
-                 (tensor.stride(-2), slice_stride, slice_stride * num_domains),
+        raise ValueError('shared FP8 repacked storage must be contiguous')
+    kb, rows, segment = tensor.shape
+    if segment != block_k or rows % load_n or kb <= 0:
+        raise ValueError('FP8 weight tiles must match the descriptor K block')
+    # The trailing size-1 expert axis takes the full-tensor byte stride,
+    # mirroring the dense-2D map it replaces.
+    return _base(tensor, (block_k, rows, kb, 1),
+                 (tensor.stride(1), tensor.stride(0), rows * segment * kb),
                  (block_k, load_n, 1, 1), swizzle)
 
 

@@ -29,8 +29,8 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
                         k_block: Uint32, stage_phase: Uint32,
                         block_idx: Uint32, n_block: Uint32,
                         local_expert: Uint32, valid_m: Uint32,
-                        shape_n: Uint32, shape_k: Uint32,
-                        is_shared: Uint32, cta_rank: Uint32,
+                        shape_k: Uint32, is_shared: Uint32,
+                        cta_rank: Uint32,
                         loader_warp: cutlass.Constexpr,
                         block_m: cutlass.Constexpr,
                         sf_block_m: cutlass.Constexpr,
@@ -63,9 +63,6 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
                 cute.arch.mbarrier_arrive(full_bar, peer_cta_rank_in_cluster=0)
     else:
         n_idx = n_block * Uint32(128)
-        half_n = shape_n // Uint32(2)
-        domain = Uint32(1) if n_idx >= half_n else Uint32(0)
-        half_n_idx = n_idx - domain * half_n
         # Evict routed FP4 weights first. Shared FP8 weights and
         # both scale-factor maps retain the normal cache hint.
         weight_cache_hint = Uint64(EVICT_FIRST)
@@ -87,8 +84,10 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
                 weight_bytes = Uint32(128 * 128)
         sf_bytes = Uint32(128 * 4) if load_sf else Uint32(0)
         with cute.arch.elect_one():
+            # Tile-repacked weight maps: (K-tile, rows, kb, expert), so the
+            # op reads one contiguous 8KB (FP4) / 16KB (FP8) global range.
             tile_g2s_2cta_4d(weight_smem, weight_map, full_bar,
-                             k_idx, half_n_idx, domain, local_expert,
+                             Uint32(0), n_idx, k_block, local_expert,
                              weight_cache_hint)
             if load_sf:
                 tile_g2s_2cta_2d(weight_sf_smem, weight_sf_map, full_bar,

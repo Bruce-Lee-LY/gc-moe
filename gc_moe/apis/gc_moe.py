@@ -45,9 +45,9 @@ def _check_weight(w: torch.Tensor, expected: tuple[int, ...], dtype: torch.dtype
     if w.dtype != dtype or not w.is_cuda:
         raise ValueError(f"{name} needs dtype {dtype} and CUDA storage")
     if tuple(w.shape) != expected:
-        raise ValueError(f"{name} needs dense shape {expected}")
+        raise ValueError(f'{name} needs K128 packed shape {expected}; call transform_weights_for_gc_moe first')
     if not w.is_contiguous():
-        raise ValueError(f"{name} dense storage must be contiguous")
+        raise ValueError(f'{name} packed storage must be contiguous')
     if w.data_ptr() % 16:
         raise ValueError(f"{name} must be 16-byte aligned for TMA")
     if any(w.stride(axis) * w.element_size() % 16 for axis in range(w.ndim - 1)):
@@ -75,6 +75,11 @@ def validate_call(y: torch.Tensor, l1_weights: tuple[torch.Tensor, torch.Tensor]
                   activation_clamp: Optional[float], fast_math: bool,
                   shared_recipe: Optional[tuple[int, int, int]],
                   activation_alpha: Optional[float]) -> ValidatedCall:
+    weights = (l1_weights, l2_weights, *(weight for weight in
+               (shared_l1_weights, shared_l2_weights) if weight is not None))
+    if any(not isinstance(pair, (tuple, list)) or len(pair) != 2 or
+           any(not isinstance(t, torch.Tensor) for t in pair) for pair in weights):
+        raise ValueError('gc_moe needs (packed payload, SF) pairs from transform_weights_for_gc_moe')
     if sym_buffer.buffer is None or sym_buffer.handle is None:
         raise ValueError('symmetric buffer has been destroyed')
     if recipe != (1, 1, 32) or activation != 'swiglu':
@@ -95,33 +100,24 @@ def validate_call(y: torch.Tensor, l1_weights: tuple[torch.Tensor, torch.Tensor]
     if sym_buffer.num_experts % ranks:
         raise ValueError('expert count must divide rank count')
     local_e = sym_buffer.num_experts // ranks
-    _check_weight(
-        l1_weights[0], (local_e, 2 * i, h // 2), torch.int8, 'routed W1')
-    _check_weight(
-        l2_weights[0], (local_e, h, i // 2), torch.int8, 'routed W2')
-    _check_sf(l1_weights[1], (local_e, 2 * i, h // 128), 'routed W1 SF')
-    _check_sf(l2_weights[1], (local_e, h, i // 128), 'routed W2 SF')
+    _check_weight(l1_weights[0], (local_e,h//128,2*i,64), torch.int8, 'routed W1')
+    _check_weight(l2_weights[0], (local_e,i//128,h,64), torch.int8, 'routed W2')
+    _check_sf(l1_weights[1], (local_e,2*i,h//128), 'routed W1 SF')
+    _check_sf(l2_weights[1], (local_e,h,i//128), 'routed W2 SF')
     shared_experts = 0
     if shared_l1_weights is not None:
-        if len(shared_l1_weights) != 2 or len(shared_l2_weights) != 2 or \
-                shared_l2_weights[0].ndim != 2:
-            raise ValueError('shared weights must be dense two-tensor pairs')
-        shared_i = shared_l2_weights[0].shape[1]
+        if shared_l2_weights[0].ndim != 3:
+            raise ValueError('shared W2 needs K128 packed shape; call transform_weights_for_gc_moe first')
+        shared_i = shared_l2_weights[0].shape[0]*128
         if shared_i <= 0 or shared_i % i:
             raise ValueError('shared W2 K must contain whole shared experts')
         shared_experts = shared_i // i
-        _check_weight(
-            shared_l1_weights[0], (2 * shared_i, h), torch.float8_e4m3fn, 'shared W1')
-        _check_weight(
-            shared_l2_weights[0], (h, shared_i), torch.float8_e4m3fn, 'shared W2')
         gran_k = shared_recipe[2]
         packed_gran_k = gran_k * 4
-        _check_sf(shared_l1_weights[1],
-                  (2 * shared_i, (h + packed_gran_k - 1) // packed_gran_k),
-                  'shared W1 SF')
-        _check_sf(shared_l2_weights[1],
-                  (h, (shared_i + packed_gran_k - 1) // packed_gran_k),
-                  'shared W2 SF')
+        _check_weight(shared_l1_weights[0], (h//128,2*shared_i,128), torch.float8_e4m3fn, 'shared W1')
+        _check_weight(shared_l2_weights[0], (shared_i//128,h,128), torch.float8_e4m3fn, 'shared W2')
+        _check_sf(shared_l1_weights[1], (2*shared_i,(h+packed_gran_k-1)//packed_gran_k), 'shared W1 SF')
+        _check_sf(shared_l2_weights[1], (h,(shared_i+packed_gran_k-1)//packed_gran_k), 'shared W2 SF')
     if cumulative_local_expert_recv_stats is not None:
         stats = cumulative_local_expert_recv_stats
         if stats.dtype != torch.int32 or stats.numel() != local_e or \
