@@ -73,16 +73,10 @@ _DOWNSCALE = (
 
 def _scale_codes(scales):
     if scales.dtype in (torch.uint8, torch.float8_e8m0fnu):
-        codes = scales.view(torch.uint8).to(torch.int32)
-        if bool((codes == 255).any()):
-            raise ValueError('NaN UE8M0 weight scale')
-        return codes
+        return scales.view(torch.uint8).to(torch.int32)
     if scales.dtype != torch.float32:
         raise ValueError('scales must be UE8M0 bytes or FP32 powers of two')
     bits = scales.contiguous().view(torch.int32)
-    valid = ((bits > 0) & (bits < 0x7f800000) & ((bits & 0x7fffff) == 0)) | (bits == 0x00400000)
-    if not bool(valid.all()):
-        raise ValueError('weight scales must be finite positive powers of two')
     return ((bits >> 23) & 255).to(torch.int32)
 
 
@@ -96,26 +90,25 @@ def _transform(raw, scale_2=None, paired=False):
         raise ValueError('invalid SM90 weight or scale shape')
     codes = _scale_codes(scales)
     if scale_2 is not None and (scale_2.shape != (e,) or scale_2.dtype != torch.float32
-                               or scale_2.device != packed.device or not bool((torch.isfinite(scale_2) & (scale_2 > 0)).all())):
-        raise ValueError('secondary checkpoint scale must be positive finite FP32 [E]')
+                               or scale_2.device != packed.device):
+        raise ValueError('secondary checkpoint scale must be FP32 [E] on the weight device')
     data = torch.empty((e, n // 256, k // 128, 4, 256, 16), device=packed.device, dtype=torch.int8)
     offsets = torch.empty((e, n // 256, k // 128, 256, 4), device=packed.device, dtype=torch.uint8)
     secondary = torch.empty(e, device=packed.device, dtype=torch.float32)
-    lut = torch.tensor(_DOWNSCALE, dtype=torch.uint8, device=packed.device)
+    lut = torch.tensor(_DOWNSCALE, dtype=torch.uint8, device='cpu',
+                       pin_memory=True).to(packed.device, non_blocking=True)
+    order = torch.tensor([0,1,8,9,2,3,10,11,4,5,12,13,6,7,14,15],
+                         device='cpu', pin_memory=True).to(packed.device, non_blocking=True)
     for expert in range(e):
         sf = codes[expert]
         base = torch.maximum(sf.min(), sf.max() - 11)
         target = torch.maximum(sf, base)
         delta = target - sf
-        if bool((delta >= 128).any()):
-            raise ValueError('weight exponent span exceeds Humming finite range')
         source = packed[expert].contiguous().view(torch.uint8).reshape(n, k // 32, 16)
         d = delta.clamp_max(5).long().unsqueeze(-1)
         converted = (lut[d, (source & 15).long()] | (lut[d, (source >> 4).long()] << 4)).reshape(n, half_k)
         # Each lane owns four consecutive K values and four at K+16.
         # Move bytes, then interleave only the sign bits for two PRMT outputs.
-        order = torch.tensor([0,1,8,9,2,3,10,11,4,5,12,13,6,7,14,15],
-                             device=packed.device)
         relative = (target - base + 1).to(torch.uint8)
         if paired:
             converted = converted.reshape(2, n // 256, 128, half_k).permute(1, 0, 2, 3).contiguous().reshape(n, half_k)
@@ -138,20 +131,16 @@ def _transform(raw, scale_2=None, paired=False):
         sf_vectors = sf_vectors.permute(0, 5, 1, 2, 4, 3, 6).contiguous()
         offsets[expert].copy_(sf_vectors.reshape(offsets[expert].shape))
         secondary[expert] = torch.exp2(base.float() - 128) * (1 if scale_2 is None else scale_2[expert])
-    if not bool((torch.isfinite(secondary) & (secondary > 0)).all()):
-        raise ValueError('secondary scale overflow or underflow')
     return data, offsets, secondary
 
 
-@torch.no_grad()
 def transform_weights_for_gc_moe_sm90(l1_weights, l2_weights,
                                       l1_weight_scale_2=None, l2_weight_scale_2=None,
                                       shared_recipe=(1, 1, 32)):
-    """Convert checkpoint weights to newly allocated SM90 tiles on the current stream.
+    """Convert checkpoint weights to SM90 tiles asynchronously on the current stream.
 
-    Call outside CUDA Graph capture after ordering source writes on the current
-    stream. Returns after the current stream's copies finish; raw inputs may
-    then be released.
+    Call outside CUDA Graph capture with valid quantized scales and source writes
+    ordered on the current stream. Raw input references may be released on return.
     The caller must keep the returned tensors alive and address-stable until all
     launches and captured CUDA Graphs that reference them have retired.
     """
@@ -182,19 +171,15 @@ def transform_weights_for_gc_moe_sm90(l1_weights, l2_weights,
     for tensor in inputs:
         tensor.record_stream(stream)
     if l1_weights[0].dtype == torch.float8_e4m3fn:
-        result = (_transform_shared(l1_weights, shared_recipe, True),
-                  _transform_shared(l2_weights, shared_recipe, False))
-        stream.synchronize()
-        return result
+        return (_transform_shared(l1_weights, shared_recipe, True),
+                _transform_shared(l2_weights, shared_recipe, False))
     if (l1_weights[0].ndim != 3 or l2_weights[0].ndim != 3
             or l1_weights[0].shape[0] != l2_weights[0].shape[0]
             or l1_weights[0].shape[1] != 4 * l2_weights[0].shape[2]
             or l2_weights[0].shape[1] != 2 * l1_weights[0].shape[2]):
         raise ValueError('W1/W2 geometry mismatch')
-    result = (_transform(l1_weights, l1_weight_scale_2, paired=True),
-              _transform(l2_weights, l2_weight_scale_2))
-    stream.synchronize()
-    return result
+    return (_transform(l1_weights, l1_weight_scale_2, paired=True),
+            _transform(l2_weights, l2_weight_scale_2))
 
 
 def _transform_shared(pair, recipe, paired):

@@ -179,7 +179,6 @@ def _gc_transpose_sf(sf: torch.Tensor) -> torch.Tensor:
     return result if sf.ndim == 3 else result.squeeze(0)
 
 
-@torch.no_grad()
 def transform_weights_for_gc_moe(
     l1_weights: Tuple[torch.Tensor, torch.Tensor],
     l2_weights: Tuple[torch.Tensor, torch.Tensor], activation: str = 'swiglu',
@@ -188,7 +187,8 @@ def transform_weights_for_gc_moe(
 
     Shared K128 SF must already be expanded to one packed row per N, as for
     the original transform. Call outside capture with ordered source writes.
-    Returns after the current stream's copies finish; raw inputs may then die.
+    Copies run asynchronously on the current CUDA stream; raw inputs may die
+    on return.
     """
     from ..jit_kernels.impls.runtime_utils import repack_fp4_weights, repack_fp8_weights
     if activation != 'swiglu':
@@ -214,7 +214,6 @@ def transform_weights_for_gc_moe(
               for t in packed]
     sf1 = _gc_transpose_sf(_gc_interleave_rows(l1_weights[1]))
     sf2 = _gc_transpose_sf(l2_weights[1])
-    stream.synchronize()
     return (packed[0], sf1), (packed[1], sf2)
 
 

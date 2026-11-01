@@ -173,8 +173,12 @@ MN-major storage (`stride(-2) == 1`) and TMA-aligned strides; the transform
 preserves that storage order while permuting scale rows.
 
 Run the transform once per weight set, outside CUDA Graph capture, with source
-writes ordered before it on the current CUDA stream. It returns independent
-pairs; after the call returns, the original data and scales may be released.
+writes ordered before it on the current CUDA stream. It runs asynchronously
+on that stream and returns independent pairs; after the call returns, the
+original data and scales may be released. Use returned pairs directly on the
+same stream; consumers on other streams must wait for the transform stream.
+If inputs were produced on another stream, the caller must first establish a
+dependency from that stream to the transform stream.
 Reuse the returned pairs across token counts and workspaces; the operator only
 accepts transformed pairs. Keep their storage and layout fixed while graphs use
 them. Order in-place value updates after previous readers and before replay;
