@@ -857,34 +857,17 @@ class GCMoERoleKernel:
             # M-block count. Only the TMA and final L1 release elect a lane.
             token_idx = Uint32(block) * Uint32(self.dispatch_warps) + Uint32(physical_warp)
             current_expert = Int32(-1)
-            cached_rank_expert = Int32(-1)
             expert_start = Uint32(0)
             expert_end = Uint32(0)
             pool_block_offset = Uint32(0)
             pull_phase = Uint32(0)
-            # One register per 32-rank wave in each lane. The cache is
-            # refreshed only when the global warp cursor enters an expert.
             rank_waves = (self.num_ranks + 31) // 32
-            stored_rank_count = cute.make_rmem_tensor((rank_waves,), Uint32)
             current_expert, expert_start, expert_end, pool_block_offset = \
                 advance_expert(
                     expert_counts, token_idx, current_expert, expert_start,
                     expert_end, pool_block_offset, lane, self.local_experts,
                     self.block_m)
             while current_expert < Int32(self.local_experts):
-                if cached_rank_expert != current_expert:
-                    cached_rank_expert = current_expert
-                    for wave in cutlass.range_constexpr(rank_waves):
-                        source_rank = Uint32(wave * 32) + lane
-                        stored_rank_count[wave] = Uint32(0)
-                        if source_rank < Uint32(self.num_ranks):
-                            count_ptr = signals.iterator + \
-                                SIGNAL_OFFSETS['expert_recv_count'] // 4 + \
-                                gen * Uint32(self.num_ranks * self.local_experts * 2) + \
-                                (source_rank * Uint32(self.local_experts) +
-                                 Uint32(current_expert)) * Uint32(2)
-                            stored_rank_count[wave] = Uint32(
-                                ld_global_u64(count_ptr))
                 received = expert_end - expert_start
                 pull_token = token_idx - expert_start
                 pool_block = pool_block_offset + pull_token // self.block_m
@@ -895,8 +878,19 @@ class GCMoERoleKernel:
                 # Each lane owns one source rank in each 32-rank wave.
                 # Reduce across its register waves before the warp reduction.
                 remaining = cute.make_rmem_tensor((rank_waves,), Uint32)
+                # Reload per token to isolate the immutable source count from
+                # the destructively peeled loop-carried remainder.
                 for wave in cutlass.range_constexpr(rank_waves):
-                    remaining[wave] = stored_rank_count[wave]
+                    source_rank = Uint32(wave * 32) + lane
+                    remaining[wave] = Uint32(0)
+                    if source_rank < Uint32(self.num_ranks):
+                        count_ptr = signals.iterator + \
+                            SIGNAL_OFFSETS['expert_recv_count'] // 4 + \
+                            gen * Uint32(self.num_ranks * self.local_experts * 2) + \
+                            (source_rank * Uint32(self.local_experts) +
+                             Uint32(current_expert)) * Uint32(2)
+                        remaining[wave] = Uint32(
+                            ld_global_u64(count_ptr))
                 peel_slot = Uint32(pull_token)
                 peel_offset = Uint32(0)
                 selected = False
