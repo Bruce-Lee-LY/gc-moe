@@ -35,7 +35,8 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
                         block_m: cutlass.Constexpr,
                         sf_block_m: cutlass.Constexpr,
                         shared_weight_gran_k: cutlass.Constexpr,
-                        has_shared: cutlass.Constexpr) -> None:
+                        has_shared: cutlass.Constexpr,
+                        shared_weight_cache_hint: cutlass.Constexpr) -> None:
     """Warp 0/1 stage the same K128 task through 2CTA TensorMaps.
 
     Both CTAs issue their own TMA transfers into local SMEM. The leader's
@@ -63,13 +64,13 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
                 cute.arch.mbarrier_arrive(full_bar, peer_cta_rank_in_cluster=0)
     else:
         n_idx = n_block * Uint32(128)
-        # Evict routed FP4 weights and their scale factors first. Shared FP8
-        # weights and their scale factors retain the normal cache hint.
+        # Routed FP4 uses evict-first; the host selects the shared FP8
+        # weight/SF policy from the expected routed tokens per expert.
         weight_cache_hint = Uint64(EVICT_FIRST)
         gran = Uint32(32)
         if cutlass.const_expr(has_shared):
             weight_cache_hint = (Uint64(EVICT_FIRST) if is_shared == Uint32(0)
-                                 else cache_hint)
+                                 else Uint64(shared_weight_cache_hint))
             if cutlass.const_expr(shared_weight_gran_k == 128):
                 if is_shared != Uint32(0):
                     gran = Uint32(128)

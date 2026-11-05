@@ -83,15 +83,6 @@ def ld_acquire_sys_u64(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint64:
 
 
 @dsl_user_op
-def ld_acquire_sys_u32(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint32:
-    address = ptr.toint(loc=loc, ip=ip).ir_value()
-    value = llvm.inline_asm(T.i32(), [address],
-                            'ld.acquire.sys.global.u32 $0, [$1];', '=r,l',
-                            has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
-    return Uint32(value)
-
-
-@dsl_user_op
 def red_release_gpu_add_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
                     'red.release.gpu.global.add.u32 [$0], $1;', 'l,r',
@@ -127,13 +118,6 @@ def red_release_sys_add_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=No
 
 
 @dsl_user_op
-def red_release_sys_add_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
-                    'red.release.sys.global.add.u32 [$0], $1;', 'l,r',
-                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
-
-
-@dsl_user_op
 def atom_add_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> Uint32:
     previous = llvm.inline_asm(
         T.i32(), [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
@@ -155,7 +139,7 @@ def atom_add_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> Uint
 def atom_sys_add_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> Uint64:
     previous = llvm.inline_asm(
         T.i64(), [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
-        'atom.sys.global.add.u64 $0, [$1], $2;', '=l,l,l',
+        'atom.relaxed.sys.global.add.u64 $0, [$1], $2;', '=l,l,l,~{memory}',
         has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
     return Uint64(previous)
 
@@ -266,31 +250,13 @@ def ld_global_u32x3(src: cute.Pointer, *, loc=None,
 
 
 @dsl_user_op
-def stmatrix_fp8x4_trans(dst_smem: cute.Pointer, packed_fp8x4: Uint32,
-                         *, loc=None, ip=None) -> None:
-    """Reference SM100_U8x4_STSM_T: one packed E4M3x4 word per lane.
-
-    The caller supplies each lane's 16-byte-aligned shared address in the
-    reference 64B-swizzled output tile. Warp participation and the subsequent
-    shared-memory barrier/TMA fence belong to the epilogue scheduler.
-    """
-    llvm.inline_asm(
-        None, [dst_smem.toint(loc=loc, ip=ip).ir_value(),
-               packed_fp8x4.ir_value(loc=loc, ip=ip)],
-        'stmatrix.sync.aligned.m16n8.x1.trans.shared.b8 [$0], {$1};',
-        'r,r', has_side_effects=True,
-        asm_dialect=llvm.AsmDialect.AD_ATT)
-
-
-@dsl_user_op
 def stmatrix_fp8x4_trans_late(base_smem: cute.Pointer, byte_offset: Uint32,
                               packed_fp8x4: Uint32, *, loc=None, ip=None) -> None:
     """Form the W1 swizzled shared address in the STSM instruction region.
 
     The reference forms ``smem_ptr`` inside the FP8 store loop. Keeping the
     add and STSM in one PTX block keeps the summed address local to that
-    block. The base and byte offset use the same shared address
-    units as ``stmatrix_fp8x4_trans``.
+    block. The base and byte offset are shared-memory byte addresses.
     """
     llvm.inline_asm(
         None, [base_smem.toint(loc=loc, ip=ip).ir_value(),

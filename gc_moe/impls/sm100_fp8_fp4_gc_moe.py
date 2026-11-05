@@ -10,7 +10,6 @@ from cutlass import Float32, Int32, Uint8, Uint16, Uint32, Uint64
 from ..comm.gc_barrier import (
     DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS,
     grid_sync,
-    nvlink_barrier,
     sync_dispatch_threads,
     wait_sys_u64_eq,
 )
@@ -47,12 +46,15 @@ from ..mma.sm100 import (
     select_weight_format,
 )
 from ..ptx.ld_st import (
+    EVICT_FIRST,
+    EVICT_NORMAL,
     atom_add_u64,
     atom_shared_add_u32,
     atom_sys_add_u64,
     bulk_zero_shared,
     ld_acquire_gpu_u32,
     ld_acquire_gpu_u64,
+    ld_acquire_sys_u64,
     ld_global_u32x3,
     ld_global_u32x4,
     ld_global_u64,
@@ -93,6 +95,7 @@ from ..ptx.utils import (
     assume_u32_lt,
     device_trap,
     elect_one_sync,
+    fence_acq_rel_sys,
     read_clock64,
     sync_aligned,
     sync_unaligned,
@@ -288,6 +291,12 @@ class GCMoERoleKernel:
         self.capacity = capacity
         self.finalize_output = finalize_output
         self.shared_weight_gran_k = shared_weight_gran_k
+        # Use FIRST for shared weights/SFs with larger decode tiles and
+        # at most one routed block per expert on average. Keep BM16 NORMAL.
+        self.shared_weight_cache_hint = (
+            EVICT_FIRST if block_m >= 32 and
+            num_tokens * topk <= block_m * local_experts
+            else EVICT_NORMAL)
         self.math_stages = math_stages
         self.nvlink_timeout_secs = nvlink_timeout_secs
         # Block configuration and the shared C/D storage union.
@@ -463,6 +472,7 @@ class GCMoERoleKernel:
                                 rank_idx, expert_idx, gen, Uint32(observed >> 32),
                                 self.dispatch_sms * self.num_ranks)
                         device_trap()
+                observed = ld_acquire_sys_u64(recv_ptr + expert_idx * 2)
             expert_counts[wave] = Uint32(observed)
         cute.arch.sync_warp()
         # The grid barrier orders every CTA's cache completion before
@@ -473,8 +483,9 @@ class GCMoERoleKernel:
         # the persistent parity so the next replay publishes into the
         # alternate generation.  Cross-rank ordering of the retired
         # generation's clear against the next-next publish is carried by
-        # the tag 1 rank barrier and the combine-ready release/acquire
-        # chain, replacing the former tail NVLink barrier.
+        # every rank's acquire of all expert sums in the intervening call,
+        # then the role1/role2 -> role3 graph dependencies and combine-ready
+        # release/acquire. Zero-count experts must participate in this chain.
         if block == Uint32(0) and tid == Uint32(0):
             red_gpu_add_u32(
                 signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4,
@@ -551,7 +562,7 @@ class GCMoERoleKernel:
         # The former tail NVLink barrier (tag 2) is gone: the receive
         # signals are dual-buffered by recv_parity, so peers' next publish
         # targets the alternate generation and ordering is carried by the
-        # tag 1 rank barrier plus the combine-ready release/acquire chain.
+        # all-expert sum acquires plus the combine-ready release/acquire chain.
 
     @cute.jit
     def _role3_combine(self, signals: cute.Tensor, rank_idx: Uint32,
@@ -815,6 +826,21 @@ class GCMoERoleKernel:
                                Uint32(8)), cute.AddressSpace.gmem,
                         assumed_align=8)
                     st_global_u64(remote_count, status & Uint64(0xffffffff))
+                # The grid acquire carries all route writes and the ready
+                # reset. Transfer them, plus every per-rank count store,
+                # to every publisher before the system release fence.
+                cute.arch.sync_threads()
+                fence_acq_rel_sys()
+                for expert_iter in cutlass.range(
+                        Uint32(tid), Uint32(self.num_ranks * self.local_experts),
+                        self.dispatch_warps * 32, unroll_full=True):
+                    expert_idx = Uint32(expert_iter)
+                    dst_rank = expert_idx // Uint32(self.local_experts)
+                    dst_local = expert_idx % Uint32(self.local_experts)
+                    dst_base = mapped_peer_base(peer_ptrs, dst_rank, self.num_ranks)
+                    status = ld_global_u64(
+                        signals.iterator + SIGNAL_OFFSETS['expert_send_count'] // 4 +
+                        expert_idx * Uint32(2))
                     remote_sum = cute.make_ptr(
                         Uint64, dst_base + Uint64(SIGNAL_OFFSETS['expert_recv_count_sum']) +
                         Uint64(gen * Uint32(self.local_experts * 8)) +
@@ -822,11 +848,11 @@ class GCMoERoleKernel:
                         cute.AddressSpace.gmem, assumed_align=8)
                     atom_sys_add_u64(remote_sum, status)
             cute.arch.sync_threads()
-            # All source-index writes precede the first rank barrier. The
-            # signed signal and high-bit grid epoch persist between calls.
-            nvlink_barrier(signals, peer_ptrs, Uint32(block), Uint32(tid),
-                           self.num_ranks, self.dispatch_sms, False, True,
-                           rank_idx, 1, self.nvlink_timeout_secs)
+            # Each per-expert acquire below imports every rank's route/count
+            # stores and ready reset, replacing the dispatch rank barrier.
+            # Wait even for zero-token experts: role3 must not publish ready
+            # before every peer's reset in this call. Serial calls on the same
+            # buffer also order generation N's clear before N+2 can publish.
             # GCMoEScheduler::fetch_expert_recv_count: each lane caches
             # expert wave*32+lane, including zero for padded lanes.
             expert_counts = cute.make_rmem_tensor(
@@ -849,6 +875,8 @@ class GCMoERoleKernel:
                                     rank_idx, expert_idx, gen, Uint32(observed >> 32),
                                     self.dispatch_sms * self.num_ranks)
                             device_trap()
+                    observed = ld_acquire_sys_u64(
+                        recv_ptr + expert_idx * Uint32(2))
                 expert_counts[wave] = Uint32(observed)
             cute.arch.sync_warp()
 
@@ -891,40 +919,51 @@ class GCMoERoleKernel:
                              Uint32(current_expert)) * Uint32(2)
                         remaining[wave] = Uint32(
                             ld_global_u64(count_ptr))
-                peel_slot = Uint32(pull_token)
-                peel_offset = Uint32(0)
-                selected = False
                 src_rank = Uint32(0)
                 src_slot = Uint32(0)
-                while not selected:
-                    lane_active = Uint32(0)
-                    lane_minimum = Uint32(0xffffffff)
-                    for wave in cutlass.range_constexpr(rank_waves):
-                        count = remaining[wave]
-                        lane_active += Uint32(1) if count > Uint32(0) else Uint32(0)
-                        if count > Uint32(0):
-                            lane_minimum = min(lane_minimum, count)
-                    active = cute.arch.warp_redux_sync(lane_active, 'add')
-                    minimum = cute.arch.warp_redux_sync(lane_minimum, 'min')
-                    round_tokens = active * minimum
-                    if peel_slot < round_tokens:
-                        position = peel_slot % active
-                        seen = Uint32(0)
+                if cutlass.const_expr(self.num_ranks <= 8):
+                    # Concatenate source-rank intervals without changing the
+                    # source-index payload or its output metadata encoding.
+                    prefix = Uint32(0)
+                    for source_rank in cutlass.range_constexpr(self.num_ranks):
+                        count = cute.arch.shuffle_sync(remaining[0], source_rank)
+                        if pull_token >= prefix and pull_token < prefix + count:
+                            src_rank = Uint32(source_rank)
+                            src_slot = pull_token - prefix
+                        prefix += count
+                else:
+                    peel_slot = Uint32(pull_token)
+                    peel_offset = Uint32(0)
+                    selected = False
+                    while not selected:
+                        lane_active = Uint32(0)
+                        lane_minimum = Uint32(0xffffffff)
                         for wave in cutlass.range_constexpr(rank_waves):
-                            mask = Uint32(cute.arch.vote_ballot_sync(
-                                remaining[wave] > Uint32(0)))
-                            wave_active = Uint32(cute.arch.popc(mask))
-                            if position >= seen and position < seen + wave_active:
-                                src_rank = Uint32(wave * 32) + warp_nth_set_bit(
-                                    mask, position - seen + Uint32(1))
-                            seen += wave_active
-                        src_slot = peel_offset + peel_slot // active
-                        selected = True
-                    else:
-                        peel_slot -= round_tokens
-                        peel_offset += minimum
-                        for wave in cutlass.range_constexpr(rank_waves):
-                            remaining[wave] -= min(remaining[wave], minimum)
+                            count = remaining[wave]
+                            lane_active += Uint32(1) if count > Uint32(0) else Uint32(0)
+                            if count > Uint32(0):
+                                lane_minimum = min(lane_minimum, count)
+                        active = cute.arch.warp_redux_sync(lane_active, 'add')
+                        minimum = cute.arch.warp_redux_sync(lane_minimum, 'min')
+                        round_tokens = active * minimum
+                        if peel_slot < round_tokens:
+                            position = peel_slot % active
+                            seen = Uint32(0)
+                            for wave in cutlass.range_constexpr(rank_waves):
+                                mask = Uint32(cute.arch.vote_ballot_sync(
+                                    remaining[wave] > Uint32(0)))
+                                wave_active = Uint32(cute.arch.popc(mask))
+                                if position >= seen and position < seen + wave_active:
+                                    src_rank = Uint32(wave * 32) + warp_nth_set_bit(
+                                        mask, position - seen + Uint32(1))
+                                seen += wave_active
+                            src_slot = peel_offset + peel_slot // active
+                            selected = True
+                        else:
+                            peel_slot -= round_tokens
+                            peel_offset += minimum
+                            for wave in cutlass.range_constexpr(rank_waves):
+                                remaining[wave] -= min(remaining[wave], minimum)
                 token_topk = source_idx[(Uint32(current_expert) * Uint32(self.num_ranks) +
                                          src_rank) * Uint32(self.capacity) + src_slot]
                 src_token = token_topk // Uint32(self.topk)
@@ -1218,7 +1257,8 @@ class GCMoERoleKernel:
                                 is_shared, cta_rank, 0,
                                 self.block_m, self.sf_block_m,
                                 self.shared_weight_gran_k,
-                                self.shared_experts > 0)
+                                self.shared_experts > 0,
+                                self.shared_weight_cache_hint)
                             data_stage = Uint32(0) if data_stage == \
                                 Uint32(self.math_stages - 1) else data_stage + Uint32(1)
                             data_phase ^= Uint32(data_stage == Uint32(0))
@@ -1288,7 +1328,8 @@ class GCMoERoleKernel:
                                 is_shared, cta_rank, 1,
                                 self.block_m, self.sf_block_m,
                                 self.shared_weight_gran_k,
-                                self.shared_experts > 0)
+                                self.shared_experts > 0,
+                                self.shared_weight_cache_hint)
                             data_stage = Uint32(0) if data_stage == \
                                 Uint32(self.math_stages - 1) else data_stage + Uint32(1)
                             data_phase ^= Uint32(data_stage == Uint32(0))

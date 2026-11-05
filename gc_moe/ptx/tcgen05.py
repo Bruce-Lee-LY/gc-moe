@@ -86,12 +86,6 @@ def tmem_load_16dp256b4(address: Uint32, *, loc=None, ip=None) -> tuple[Float32,
 
 
 @dsl_user_op
-def tmem_wait_load(*, loc=None, ip=None) -> None:
-    llvm.inline_asm(None, [], 'tcgen05.wait::ld.sync.aligned;', '',
-                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
-
-
-@dsl_user_op
 def tmem_free_2cta(address: Uint32, columns: Uint32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(None, [address.ir_value(loc=loc, ip=ip),
                            columns.ir_value(loc=loc, ip=ip)],

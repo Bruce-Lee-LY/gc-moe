@@ -17,6 +17,7 @@ from ..common.math import warp_inclusive_sum
 from ..ptx.ld_st import (
     ld_volatile_u32,
     ld_volatile_u64,
+    ld_acquire_sys_u64,
     atom_add_u32,
     st_async_cluster_u32x4,
 )
@@ -248,6 +249,7 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
             while Uint32(count >> 32) != Uint32(
                     dispatch_sms * num_ranks):
                 count = ld_volatile_u64(recv_ptr + local_expert * 2)
+            count = ld_acquire_sys_u64(recv_ptr + local_expert * 2)
         expert_counts[wave] = Uint32(count)
     cute.arch.sync_warp()
     lane_m_blocks = Uint32(0)

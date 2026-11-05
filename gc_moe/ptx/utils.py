@@ -121,6 +121,12 @@ def fence_gpu(*, loc=None, ip=None):
 
 
 @dsl_user_op
+def fence_acq_rel_sys(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], 'fence.acq_rel.sys;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
 def fence_sys(*, loc=None, ip=None):
     llvm.inline_asm(None, [], 'membar.sys;', '~{memory}', has_side_effects=True,
                     asm_dialect=llvm.AsmDialect.AD_ATT)

@@ -258,13 +258,10 @@ def build_weights(args, rank, world, device, reference=False):
     return (*result, quantized) if reference else result
 
 
-def allocate_buffer(args, capacity, operator, shared=True, base=None):
+def allocate_buffer(args, capacity, operator, shared=True):
     factory = gc_moe.get_symm_buffer_for_gc_moe if operator == 'gc' else deep_gemm.get_symm_buffer_for_mega_moe
     kwargs = dict(num_shared_experts=args.num_shared_experts if shared else 0,
                   mma_type='fp8xfp4', activation=args.activation)
-    if base is not None:
-        return gc_moe.GCSymmBuffer(dist.group.WORLD, args.num_experts, capacity, args.num_topk,
-                                     args.hidden, args.intermediate_hidden, base=base, **kwargs)
     return factory(dist.group.WORLD, args.num_experts, capacity, args.num_topk,
                    args.hidden, args.intermediate_hidden, **kwargs)
 
@@ -295,7 +292,6 @@ def main():
                    help='Uniform minimum cosine for independent math, GC-to-Mega and omitted-vs-explicit recipe checks (0 to 1).')
     p.add_argument('--gc-replays', type=int, default=5)
     p.add_argument('--all-routes-invalid', action='store_true')
-    p.add_argument('--cross-operator-buffer', action='store_true')
     p.add_argument('--output-json', default='results/_accuracy_results_gc_se.json')
     args = p.parse_args()
     if not 0.0 <= args.cosine_threshold <= 1.0:
@@ -316,13 +312,7 @@ def main():
     assert all(len(v) == world and min(v) >= 0 and max(v) <= capacity for v in plan)
     mr, gr, original_shared, ms, gs, recipe, reference_routed = build_weights(args, rank, world, device, reference=True)
     base_buffer = allocate_buffer(args, capacity, 'base')
-    gc_buffer = allocate_buffer(args, capacity, 'gc', base=base_buffer if args.cross_operator_buffer else None)
-    if args.cross_operator_buffer:
-        for name in gc_buffer._views:
-            left, right = getattr(gc_buffer, name), getattr(base_buffer, name)
-            assert (left is None and right is None) or (left is not None and right is not None
-                    and left.data_ptr() == right.data_ptr() and left.shape == right.shape
-                    and left.stride() == right.stride()), name
+    gc_buffer = allocate_buffer(args, capacity, 'gc')
     common = dict(recipe=ROUTED_RECIPE, activation=args.activation,
                   activation_clamp=args.activation_clamp, activation_alpha=args.activation_alpha,
                   fast_math=bool(args.fast_math))
@@ -350,10 +340,6 @@ def main():
                 op, rw, sw, buffer, sf = deep_gemm.fp8_fp4_mega_moe, mr, ms, base_buffer, base_sf
             else:
                 op, rw, sw, buffer, sf = gc_moe.fp8_fp4_gc_moe, gr, gs, gc_buffer, gc_sf
-            # Supplementary same-allocation switching also tests SF restaging in
-            # a captured graph. Formal independent buffers need no copy here.
-            if args.cross_operator_buffer:
-                buffer.shared_l1_acts_sf.copy_(sf)
             kwargs = {} if args.omit_shared_recipe and not explicit else {'shared_recipe': recipe}
             op(outputs[name], *rw, buffer, shared_l1_weights=sw[0], shared_l2_weights=sw[1], **common, **kwargs)
 

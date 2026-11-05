@@ -98,8 +98,6 @@ def get_role_shared_layout(role: int, block_m: int, num_experts: int,
 def _signal_offsets() -> dict[str, int]:
     fields = (
         ('grid_sync_count', 4, 4),
-        ('nvl_barrier_counter', 1, 4),
-        ('nvl_barrier_signals', 2, 4),
         ('l1_task_count', 2, 4),
         ('l2_task_count', 2, 4),
         ('shared_l1_task_count', 2, 4),
@@ -111,7 +109,6 @@ def _signal_offsets() -> dict[str, int]:
         # after the finalize grid sync.  Lives in the header padding.
         ('recv_parity', 1, 4),
         ('combine_ready_grid_idx', MAX_RANKS, 8),
-        ('peer_grid_idx', MAX_RANKS, 8),
         ('expert_send_count', MAX_EXPERTS, 8),
         ('expert_recv_count', 2 * MAX_EXPERTS, 8),
         ('expert_recv_count_sum', 2 * MAX_EXPERTS_PER_RANK, 8),
@@ -125,7 +122,7 @@ def _signal_offsets() -> dict[str, int]:
     result = {}
     for name, count, element_bytes in fields:
         field_alignment = 128 if name in (
-            'combine_ready_grid_idx', 'peer_grid_idx', 'expert_send_count'
+            'combine_ready_grid_idx', 'expert_send_count'
         ) else element_bytes
         offset = align(offset, field_alignment)
         result[name] = offset

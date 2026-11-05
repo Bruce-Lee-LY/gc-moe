@@ -22,8 +22,10 @@ class GCSymmBuffer:
     actual token count. Shared activations always use K32 scales; ``x_sf``
     remains K-major while shared scale views are MN-major.
 
-    ``base`` reuses a compatible caller-owned symmetric allocation. Retire
-    captured graphs before destroying an allocation used by them.
+    ``base`` must be a live ``GCSymmBuffer`` with the same group and exact
+    GC layout. Foreign workspaces (including DeepGEMM) are incompatible.
+    Serialize calls across all wrappers sharing the allocation; retire captured
+    graphs before destroying an allocation used by them.
     """
 
     _views = ('x', 'x_sf', 'topk_idx', 'topk_weights', 'shared_l1_acts',
@@ -36,6 +38,8 @@ class GCSymmBuffer:
                  mma_type: str = 'fp8xfp4', activation: str = 'swiglu', base=None):
         if mma_type != 'fp8xfp4' or activation != 'swiglu':
             raise ValueError('GC MoE requires fp8xfp4/swiglu')
+        if base is not None and not isinstance(base, GCSymmBuffer):
+            raise ValueError('base must be a GC-compatible GCSymmBuffer; foreign workspaces are unsupported')
         self.group = group
         self.rank_idx = dist.get_rank(group=group)
         self.num_experts = num_experts
@@ -73,6 +77,8 @@ class GCSymmBuffer:
                          'intermediate_hidden', 'num_shared_experts', 'mma_type', 'activation'):
                 if getattr(base, name) != getattr(self, name):
                     raise ValueError(f"incompatible base: {name}")
+            if self.layout != base.layout:
+                raise ValueError('incompatible base: GC workspace layout')
             if self.layout.nbytes > base.buffer.nbytes:
                 raise ValueError('base allocation too small')
             self.buffer, self.handle = base.buffer, base.handle

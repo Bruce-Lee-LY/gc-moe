@@ -395,12 +395,20 @@ def main():
         del graph
         cos_baseline = cosine(baseline, ref)
         cos_comparison = cosine(y, baseline)
-        comparison = torch.tensor([cos_baseline, cos_comparison], dtype=torch.float64, device=device)
+        comparison = torch.tensor([
+            cos_baseline, cos_comparison,
+            float((baseline.float() - ref.float()).abs().max()) if my_T else 0.0,
+            float((y.float() - ref.float()).abs().max()) if my_T else 0.0,
+            float((y.float() - baseline.float()).abs().max()) if my_T else 0.0,
+            bool(torch.isfinite(baseline).all()), bool(torch.isfinite(ref).all()),
+        ], dtype=torch.float64, device=device)
         gathered = [torch.empty_like(comparison) for _ in range(num_ranks)]
         dist.all_gather(gathered, comparison)
         baseline_cos_per_rank = [float(v[0].item()) for v in gathered]
         comparison_cos_per_rank = [float(v[1].item()) for v in gathered]
-        finite = torch.tensor([int(torch.isfinite(y).all())], device=device)
+        finite = torch.tensor([int(torch.isfinite(y).all() and
+                                  torch.isfinite(baseline).all() and
+                                  torch.isfinite(ref).all())], device=device)
         dist.all_reduce(finite, op=dist.ReduceOp.MIN)
         cos = cosine(y, ref)
         cos_t = torch.tensor([cos], dtype=torch.float64, device=device)
@@ -435,6 +443,11 @@ def main():
             "gc_vs_baseline_cos_per_rank": comparison_cos_per_rank,
             "baseline_cos_min": min(baseline_cos_per_rank),
             "gc_vs_baseline_cos_min": min(comparison_cos_per_rank),
+            "baseline_max_abs_ref_per_rank": [float(v[2].item()) for v in gathered],
+            "gc_max_abs_ref_per_rank": [float(v[3].item()) for v in gathered],
+            "gc_max_abs_baseline_per_rank": [float(v[4].item()) for v in gathered],
+            "baseline_finite_per_rank": [bool(v[5].item()) for v in gathered],
+            "reference_finite_per_rank": [bool(v[6].item()) for v in gathered],
             "finite": bool(finite.item()),
             "num_tokens_global": int(sum(vec)) if vec is not None else my_T * num_ranks,
             "gc_replays_eager_and_graph": args.gc_replays,
