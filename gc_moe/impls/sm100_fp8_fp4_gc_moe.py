@@ -65,7 +65,6 @@ from ..ptx.ld_st import (
     red_gpu_add_u32,
     red_release_gpu_add_u32,
     red_release_gpu_xor_u64,
-    red_release_sys_add_u64,
     st_global_u32x4,
     st_global_u64,
     st_release_sys_u64,
@@ -436,21 +435,21 @@ class GCMoERoleKernel:
     def _role3_dispatch(self, signals: cute.Tensor, peer_ptrs: cute.Tensor,
                         rank_idx: Uint32, tid: Uint32, lane: Uint32,
                         block: Uint32, expert_counts: cute.Tensor,
-                        recv_ptr: cute.Pointer, stats: cute.Tensor) -> None:
-        # Each rank publishes its completed peer FC2 stores even when
-        # it owns no routed token. Ready is reset by role 1 per call.
+                        recv_ptr: cute.Pointer, stats: cute.Tensor,
+                        ready_epoch: Uint64) -> None:
+        # Publish completed peer FC2 stores even with no routed tokens.
+        # Epochs distinguish late old publications without resetting ready.
         if block == 0 and tid < self.num_ranks:
             dst = cute.make_ptr(
                 Uint64, mapped_peer_base(peer_ptrs, Uint32(tid), self.num_ranks) +
                 Uint64(SIGNAL_OFFSETS['combine_ready_grid_idx']) +
                 Uint64(rank_idx * 8), cute.AddressSpace.gmem,
                 assumed_align=8)
-            red_release_sys_add_u64(dst, Uint64(1))
+            st_release_sys_u64(dst, ready_epoch)
         # Dual-buffered receive sums: this replay consumes the generation
         # selected by the persistent parity word; the bump below flips it
         # for the next replay while this kernel clears the retired one.
-        gen = ld_volatile_u32(
-            signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4) & Uint32(1)
+        gen = Uint32(ready_epoch - Uint64(1)) & Uint32(1)
         recv_ptr = recv_ptr + gen * Uint32(self.local_experts * 2)
         # GCMoEScheduler::fetch_expert_recv_count: each lane keeps
         # experts wave*32+lane in registers while combine reuses SMEM.
@@ -484,8 +483,9 @@ class GCMoERoleKernel:
         # alternate generation.  Cross-rank ordering of the retired
         # generation's clear against the next-next publish is carried by
         # every rank's acquire of all expert sums in the intervening call,
-        # then the role1/role2 -> role3 graph dependencies and combine-ready
-        # release/acquire. Zero-count experts must participate in this chain.
+        # then the role1/role2 -> role3 graph dependencies. The all-rank
+        # count join imports every rank's prior cleanup before the retired
+        # bank can be reused. Zero-count experts must participate.
         if block == Uint32(0) and tid == Uint32(0):
             red_gpu_add_u32(
                 signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4,
@@ -562,25 +562,28 @@ class GCMoERoleKernel:
         # The former tail NVLink barrier (tag 2) is gone: the receive
         # signals are dual-buffered by recv_parity, so peers' next publish
         # targets the alternate generation and ordering is carried by the
-        # all-expert sum acquires plus the combine-ready release/acquire chain.
+        # all-expert sum acquires in the intervening call. Selected-peer
+        # ready acquires protect each source's single-buffer inputs/indices.
 
     @cute.jit
     def _role3_combine(self, signals: cute.Tensor, rank_idx: Uint32,
                        num_tokens: Uint32, y_out: cute.Tensor,
                        block, physical_warp, lane,
                        combine_smem: cute.Pointer,
-                       combine_bars: cute.Pointer) -> None:
+                       combine_bars: cute.Pointer, ready_epoch: Uint64) -> None:
         combine_chunks = self.combine_chunks
         chunk_bytes = self.combine_chunk_bytes
         u4_per_lane = self.combine_uint4_per_lane
         warpgroup_reg_alloc(self.epi_registers)
         epi_warp = Uint32(physical_warp - 4)
         ready = signals.iterator + SIGNAL_OFFSETS['combine_ready_grid_idx'] // 4
-        peer = epi_warp
-        while peer < Uint32(self.num_ranks):
-            wait_sys_u64_eq(ready + peer * 2, Uint64(1), rank_idx, peer)
-            peer += Uint32(8)
-        sync_aligned(256, 2)
+        if cutlass.const_expr(not self.finalize_output):
+            # No token reduction exists to carry selected-peer acquires.
+            peer = epi_warp
+            while peer < Uint32(self.num_ranks):
+                wait_sys_u64_eq(ready + peer * 2, ready_epoch, rank_idx, peer)
+                peer += Uint32(8)
+            sync_aligned(256, 2)
         if cutlass.const_expr(self.finalize_output):
             # One warp owns a token chunk. Each load slot has one
             # transaction-counted barrier; store has its own region.
@@ -601,9 +604,28 @@ class GCMoERoleKernel:
                 chunk = token_chunk % Uint32(combine_chunks)
                 chunk_offset = chunk * Uint32(chunk_bytes)
                 lane_valid = False
+                routed_peer = Uint32(0)
                 if lane < self.topk:
-                    lane_valid = routes[token * Uint32(self.topk) + lane] < \
+                    routed_expert = routes[token * Uint32(self.topk) + lane]
+                    lane_valid = routed_expert < \
                         Uint64(self.num_ranks * self.local_experts)
+                    if lane_valid:
+                        routed_peer = Uint32(routed_expert) // Uint32(self.local_experts)
+                # All lanes vote; invalid routes never form a peer pointer.
+                # Duplicate owners may acquire the same publication twice.
+                peer_ready = not lane_valid
+                wait_start = read_clock64()
+                while cute.arch.vote_ballot_sync(peer_ready) != Uint32(0xffffffff):
+                    if lane_valid and not peer_ready:
+                        peer_ready = ld_acquire_sys_u64(
+                            ready + routed_peer * Uint32(2)) == ready_epoch
+                    if Uint64(read_clock64() - wait_start) >= Uint64(60 * 2000000000):
+                        if not peer_ready:
+                            cute.printf('GC token readiness timeout rank={} peer={}',
+                                        rank_idx, routed_peer)
+                            device_trap()
+                # Transfer selected-lane acquires to the elected TMA loader.
+                cute.arch.sync_warp()
                 if cutlass.const_expr(self.shared_experts > 0):
                     if lane == self.topk:
                         lane_valid = True
@@ -734,11 +756,6 @@ class GCMoERoleKernel:
             pull_bar = cute.recast_ptr(slab + self.shared_layout.dispatch_bars, dtype=Uint64)
             self._initialize_shared_storage(slab, Uint32(physical_warp), Uint32(lane))
             warpgroup_reg_dealloc(48 if self.local_experts <= 64 else 96)
-            # Readiness is reset by dispatch at every invocation.
-            if block == 0 and tid < self.num_ranks:
-                ready_off = SIGNAL_OFFSETS['combine_ready_grid_idx'] // 4
-                st_release_sys_u64(
-                    signals.iterator + ready_off + tid * Uint32(2), Uint64(0))
             # Dual-buffered receive signals: replay N publishes and reads
             # generation N % 2; role 3 flips the persistent parity word
             # after consuming each replay, and clears only the retired
@@ -826,8 +843,8 @@ class GCMoERoleKernel:
                                Uint32(8)), cute.AddressSpace.gmem,
                         assumed_align=8)
                     st_global_u64(remote_count, status & Uint64(0xffffffff))
-                # The grid acquire carries all route writes and the ready
-                # reset. Transfer them, plus every per-rank count store,
+                # The grid acquire carries all route writes. Transfer
+                # them, plus every per-rank count store,
                 # to every publisher before the system release fence.
                 cute.arch.sync_threads()
                 fence_acq_rel_sys()
@@ -849,10 +866,9 @@ class GCMoERoleKernel:
                     atom_sys_add_u64(remote_sum, status)
             cute.arch.sync_threads()
             # Each per-expert acquire below imports every rank's route/count
-            # stores and ready reset, replacing the dispatch rank barrier.
-            # Wait even for zero-token experts: role3 must not publish ready
-            # before every peer's reset in this call. Serial calls on the same
-            # buffer also order generation N's clear before N+2 can publish.
+            # stores, replacing the dispatch rank barrier. Include zero-token
+            # experts: this join orders prior combine reads before new FC2
+            # stores, and generation N's clear before N+2 can publish.
             # GCMoEScheduler::fetch_expert_recv_count: each lane caches
             # expert wave*32+lane, including zero for padded lanes.
             expert_counts = cute.make_rmem_tensor(
@@ -1874,6 +1890,11 @@ class GCMoERoleKernel:
                     combine_smem + self.shared_layout.combine_bars, dtype=Uint64)
                 self._initialize_shared_storage(
                     combine_smem, Uint32(physical_warp), Uint32(lane))
+            # Cache the full call epoch in every warp before the CTA join.
+            # Dispatch's later grid join cannot flip parity until every CTA
+            # (including its combine warps) has passed this load and join.
+            ready_epoch = Uint64(ld_volatile_u32(
+                signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4)) + Uint64(1)
             sync_unaligned(384, 1)
             expert_counts = cute.make_rmem_tensor(
                 ((self.local_experts + 31) // 32,), Uint32)
@@ -1882,11 +1903,11 @@ class GCMoERoleKernel:
             if physical_warp < 4:
                 self._role3_dispatch(signals, peer_ptrs, rank_idx,
                                      Uint32(tid), Uint32(lane), Uint32(block),
-                                     expert_counts, recv_ptr, stats)
+                                     expert_counts, recv_ptr, stats, ready_epoch)
             else:
                 self._role3_combine(signals, rank_idx, num_tokens, y_out,
                                     block, physical_warp, lane,
-                                    combine_smem, combine_bars)
+                                    combine_smem, combine_bars, ready_epoch)
 
     @cute.jit
     def __call__(self, signals: cute.Tensor, peer_ptrs: cute.Tensor,

@@ -111,13 +111,6 @@ def red_release_gpu_xor_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=No
 
 
 @dsl_user_op
-def red_release_sys_add_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> None:
-    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
-                    'red.release.sys.global.add.u64 [$0], $1;', 'l,l,~{memory}',
-                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
-
-
-@dsl_user_op
 def atom_add_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> Uint32:
     previous = llvm.inline_asm(
         T.i32(), [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
