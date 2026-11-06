@@ -243,7 +243,6 @@ class _ChildGraph:
                                              len(dependencies), params))
                 nodes.append(node)
                 role_nodes[binary.role] = node
-            self.instantiate()
         except Exception:
             try:
                 self.close()

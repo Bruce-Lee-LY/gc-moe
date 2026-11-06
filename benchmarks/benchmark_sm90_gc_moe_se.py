@@ -213,6 +213,7 @@ def main():
     p.add_argument('--inner-iters', type=int, default=100)
     p.add_argument('--cuda-graph-max-tokens-per-rank', type=int, default=256)
     p.add_argument('--output-json', default='results/_performance_results_gc_se.json')
+    p.add_argument('--gc-only', action='store_true', help='Time fused GC without the DeepGEMM comparisons.')
     args = p.parse_args()
     if args.activation_alpha != 1.0:
         p.error('SM90 swiglu uses activation_alpha=1')
@@ -230,7 +231,7 @@ def main():
         args, rank, world, device, reference=True)
     local_experts = args.num_experts // world
     routed_storage = _common_weight_storage(
-        _weight_storage(mega_routed, local_experts),
+        None if args.gc_only else _weight_storage(mega_routed, local_experts),
         _weight_storage(routed, local_experts),
         _weight_storage(quantized, local_experts),
     )
@@ -240,21 +241,23 @@ def main():
         _weight_storage(shared),
     )
     del quantized
-    mb = allocate_buffer(args, capacity, False)
+    mb = None if args.gc_only else allocate_buffer(args, capacity, False)
     gb = allocate_buffer(args, capacity, True)
-    mega = allocate_buffer(args, capacity, False, mega=True)
-    assert len({b.buffer.data_ptr() for b in (mb, mega, gb)}) == 3
+    mega = None if args.gc_only else allocate_buffer(args, capacity, False, mega=True)
+    buffers = {'gc_se': gb} if args.gc_only else {
+        'gc_unfused': mb, 'mega_unfused': mega, 'gc_se': gb}
+    assert len({b.buffer.data_ptr() for b in buffers.values()}) == len(buffers)
+    operators = {name: OPERATORS[name] for name in buffers}
     torch.cuda.empty_cache()
     weight_storage_by_rank = _collect_weight_storage(routed_storage, shared_storage)
     results = []
     for tokens in sweep:
         x, indices, weights = build_tokens(tokens, args.hidden, args.num_experts, args.num_topk, rank, device)
         routed_input, shared_input = prepare_inputs(x)
-        stage_inputs(mb, routed_input, shared_input, indices, weights)
-        stage_inputs(gb, routed_input, shared_input, indices, weights)
-        stage_inputs(mega, routed_input, shared_input, indices, weights)
+        for buffer in buffers.values():
+            stage_inputs(buffer, routed_input, shared_input, indices, weights)
         outputs = {name: torch.empty((tokens, args.hidden), dtype=torch.bfloat16, device=device)
-                   for name in OPERATORS}
+                   for name in operators}
         calls, standalone = make_calls(args, tokens, tokens, routed, mega_routed, shared, fused_shared,
                                       mb, mega, gb, shared_input, outputs)
         graph_mode = args.cuda_graph_max_tokens_per_rank > 0 and tokens <= args.cuda_graph_max_tokens_per_rank
@@ -284,7 +287,7 @@ def main():
         }
         latencies = {name + '_us': row['slowest_rank_median_us'] for name, row in operator_stats.items()}
         speedups = {name + '_over_gc_se': latencies[name + '_us'] / latencies['gc_se_us']
-                    for name in ('gc_unfused', 'mega_unfused')}
+                    for name in operators if name != 'gc_se'}
         results.append(dict(num_tokens_per_rank=tokens, num_tokens_global=tokens * world,
                             mode='cuda_graph' if graph_mode else 'eager', **latencies, **speedups,
                             operator_stats=operator_stats, workload=workload,
@@ -303,29 +306,30 @@ def main():
         out = Path(args.output_json)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(dict(world_size=world, config=vars(args), requested_capacity=capacity,
-                                      aligned_capacity={'gc_unfused': mb.num_max_tokens_per_rank,
-                                                        'mega_unfused': mega.num_max_tokens_per_rank,
-                                                        'gc_se': gb.num_max_tokens_per_rank},
+                                      aligned_capacity={name: buffer.num_max_tokens_per_rank
+                                                        for name, buffer in buffers.items()},
                                       routed_recipe=ROUTED_RECIPE,
                                       shared_recipe=recipe, shared_raw_recipe=recipe,
-                                      shared_dense_recipe=DENSE_SHARED_RECIPE,
+                                      shared_dense_recipe=None if args.gc_only else DENSE_SHARED_RECIPE,
                                       shared_fused_recipe=SHARED_RECIPE,
                                       activation_gran_k=32, warmup=args.warmup,
                                       iters=args.iters, inner_iters=args.inner_iters,
                                       latency='maximum of per-rank medians over CUDA-event windows',
                                       audit=rank_audits[0], rank_audits=rank_audits,
-                                      operators=OPERATORS,
-                                      modules={'mega_unfused': deep_gemm.__file__, 'gc_unfused': gc_moe.__file__, 'gc_se': gc_moe.__file__},
+                                      operators=operators,
+                                      modules={name: (deep_gemm if name == 'mega_unfused' else gc_moe).__file__
+                                               for name in operators},
                                       throughput_metrics=_throughput_definitions(),
                                       weight_storage_by_rank=weight_storage_by_rank,
                                       decode_mean_speedups={name + '_over_gc_se': float(np.mean([r[name + '_over_gc_se'] for r in results]))
-                                                            for name in ('gc_unfused', 'mega_unfused')},
+                                                            for name in operators if name != 'gc_se'},
                                       results=results), indent=2) + '\n')
         print('Wrote', str(out), flush=True)
     torch.cuda.synchronize(device)
     gb.destroy()
-    mb.destroy()
-    mega.destroy()
+    if mb is not None:
+        mb.destroy()
+        mega.destroy()
     dist.barrier()
     dist.destroy_process_group()
 

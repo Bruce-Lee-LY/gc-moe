@@ -283,6 +283,7 @@ def main():
     parser.add_argument("--gc-replays", type=int, default=5)
     parser.add_argument("--output-json", type=str, default="results/_accuracy_results_sm90_gc.json")
     parser.add_argument("--processed-diff-threshold", type=float, default=0.002)
+    parser.add_argument("--gc-only", action="store_true", help="Skip the SM90 MegaMoE comparison.")
     args = parser.parse_args()
     if args.activation_alpha != 1.0:
         parser.error("SM90 swiglu uses activation_alpha=1")
@@ -321,7 +322,8 @@ def main():
     })
     assert sorted(row["rank"] for row in rank_packages) == list(range(num_ranks))
     assert len({row["gc"]["source_sha256"] for row in rank_packages}) == 1
-    assert all(row["baseline_version"] == "2.8.2" for row in rank_packages)
+    if not args.gc_only:
+        assert all(row["baseline_version"] == "2.8.2" for row in rank_packages)
 
     if rank == 0:
         print(f"[tests/test_sm90_gc_moe] world_size={num_ranks} device={device}")
@@ -390,13 +392,13 @@ def main():
         print("Quantizing weights to FP4 ...")
     l1_packed = cast_grouped_weights_to_fp4(w1_local)
     l2_packed = cast_grouped_weights_to_fp4(w2_local)
-    base_weights = deep_gemm.transform_weights_for_mega_moe_sm90(
+    base_weights = None if args.gc_only else deep_gemm.transform_weights_for_mega_moe_sm90(
         l1_packed, l2_packed, layout="tiled",
     )
     candidate_weights = gc_moe.transform_weights_for_gc_moe_sm90(
         l1_packed, l2_packed,
     )
-    base_buffer = deep_gemm.get_symm_buffer_for_mega_moe_sm90(
+    base_buffer = None if args.gc_only else deep_gemm.get_symm_buffer_for_mega_moe_sm90(
         dist.group.WORLD, args.num_experts, num_max_tokens_per_rank,
         args.num_topk, args.hidden, args.intermediate_hidden,
         activation=args.activation,
@@ -407,7 +409,9 @@ def main():
         activation=args.activation,
     )
     if rank == 0:
-        print(f"Symmetric buffers: Mega {base_buffer.buffer.nbytes / 2 ** 30:.3f} GiB, GC {candidate_buffer.buffer.nbytes / 2 ** 30:.3f} GiB")
+        print(f"GC symmetric buffer: {candidate_buffer.buffer.nbytes / 2 ** 30:.3f} GiB")
+        if base_buffer is not None:
+            print(f"Mega symmetric buffer: {base_buffer.buffer.nbytes / 2 ** 30:.3f} GiB")
 
     # Check the host contract without submitting an invalid pointer to CUDA.
     from gc_moe.apis.sm90_gc_moe import validate_call
@@ -435,11 +439,14 @@ def main():
         )
         return y
 
-    assert base_buffer.buffer.data_ptr() != candidate_buffer.buffer.data_ptr()
+    buffers = [candidate_buffer]
+    if base_buffer is not None:
+        assert base_buffer.buffer.data_ptr() != candidate_buffer.buffer.data_ptr()
+        buffers.insert(0, base_buffer)
     raw_full_l1 = cast_grouped_weights_to_fp4(w1_full)
     raw_full_l2 = cast_grouped_weights_to_fp4(w2_full)
-    recv_stats = {"baseline": torch.zeros(Eloc, dtype=torch.int32, device=device),
-                  "gc": torch.zeros(Eloc, dtype=torch.int32, device=device)}
+    recv_stats = {name: torch.zeros(Eloc, dtype=torch.int32, device=device)
+                  for name in (("gc",) if args.gc_only else ("baseline", "gc"))}
     results = []
     all_pass = True
     threshold = args.cosine_threshold
@@ -480,7 +487,7 @@ def main():
 
         # Stage the SAME K128 FP8 input into separate operator buffers.
         x_fp8, x_sf = cast_tokens_to_fp8(x_bf16)
-        for buffer in (base_buffer, candidate_buffer):
+        for buffer in buffers:
             buffer.x[:my_T].copy_(x_fp8)
             buffer.x_sf[:my_T].copy_(x_sf)
             buffer.topk_idx[:my_T].copy_(topk_idx)
@@ -491,8 +498,10 @@ def main():
         processed_ref = reference_processed_moe_forward(
             x_fp8, x_sf, topk_idx, topk_w, raw_full_l1, raw_full_l2,
             args.intermediate_hidden, args.activation_clamp)
-        baseline = run_kernel(my_T, deep_gemm.sm90_fp8_fp4_mega_moe, base_weights, base_buffer)
-        torch.cuda.synchronize(device)
+        baseline = None
+        if base_buffer is not None:
+            baseline = run_kernel(my_T, deep_gemm.sm90_fp8_fp4_mega_moe, base_weights, base_buffer)
+            torch.cuda.synchronize(device)
         y = run_kernel(my_T, gc_moe.sm90_fp8_fp4_gc_moe, candidate_weights, candidate_buffer)
         torch.cuda.synchronize(device)
         first_eager = y.clone()
@@ -516,27 +525,31 @@ def main():
             graph.replay()
         torch.cuda.synchronize(device)
         del graph
-        baseline_diff = diff(baseline, processed_ref)
         gc_diff = diff(y, processed_ref)
         repeat_diff = diff(y, first_eager)
         gc_abs, gc_rel = error_metrics(y, processed_ref)
-        base_abs, base_rel = error_metrics(baseline, processed_ref)
-        worst = torch.tensor([baseline_diff, gc_diff, repeat_diff, gc_abs, gc_rel, base_abs, base_rel],
-                             dtype=torch.float64, device=device)
+        semantic_metrics = dict(gc_processed_diff_max=gc_diff, gc_repeat_graph_diff_max=repeat_diff,
+                                gc_abs_error_max=gc_abs, gc_relative_l2_max=gc_rel)
+        if baseline is not None:
+            base_abs, base_rel = error_metrics(baseline, processed_ref)
+            semantic_metrics.update(baseline_processed_diff_max=diff(baseline, processed_ref),
+                                    baseline_abs_error_max=base_abs, baseline_relative_l2_max=base_rel)
+        worst = torch.tensor(list(semantic_metrics.values()), dtype=torch.float64, device=device)
         dist.all_reduce(worst, op=dist.ReduceOp.MAX)
-        semantic_metrics = dict(zip(("baseline_processed_diff_max", "gc_processed_diff_max",
-            "gc_repeat_graph_diff_max", "gc_abs_error_max", "gc_relative_l2_max",
-            "baseline_abs_error_max", "baseline_relative_l2_max"), worst.tolist()))
+        semantic_metrics = dict(zip(semantic_metrics, worst.tolist()))
         stats_flag = torch.tensor(int(stats_ok), device=device)
         dist.all_reduce(stats_flag, op=dist.ReduceOp.MIN)
-        cos_baseline = cosine(baseline, ref)
-        cos_comparison = cosine(y, baseline)
-        comparison = torch.tensor([cos_baseline, cos_comparison], dtype=torch.float64, device=device)
-        gathered = [torch.empty_like(comparison) for _ in range(num_ranks)]
-        dist.all_gather(gathered, comparison)
-        baseline_cos_per_rank = [float(v[0].item()) for v in gathered]
-        comparison_cos_per_rank = [float(v[1].item()) for v in gathered]
-        finite = torch.tensor([int(torch.isfinite(y).all() and torch.isfinite(baseline).all())], device=device)
+        comparison_metrics = {}
+        if baseline is not None:
+            comparison = torch.tensor([cosine(baseline, ref), cosine(y, baseline)],
+                                      dtype=torch.float64, device=device)
+            gathered = [torch.empty_like(comparison) for _ in range(num_ranks)]
+            dist.all_gather(gathered, comparison)
+            for key, values in zip(("baseline", "gc_vs_baseline"), zip(*(v.tolist() for v in gathered))):
+                comparison_metrics[key + "_cos_per_rank"] = list(values)
+                comparison_metrics[key + "_cos_min"] = min(values)
+        finite = torch.tensor([int(torch.isfinite(y).all()
+                               and (baseline is None or torch.isfinite(baseline).all()))], device=device)
         dist.all_reduce(finite, op=dist.ReduceOp.MIN)
         cos = cosine(y, ref)
         cos_t = torch.tensor([cos], dtype=torch.float64, device=device)
@@ -550,9 +563,10 @@ def main():
         cos_avg = float(cos_t.item() / num_ranks)
         cos_min = float(cos_min_t.item())
         per_rank_cos = [float(v) for v in cos_all.cpu().tolist()]
-        ok = (cos_min >= threshold and min(baseline_cos_per_rank) >= threshold
-              and min(comparison_cos_per_rank) >= threshold and bool(finite.item())
-              and bool(stats_flag.item()) and float(worst[:3].max()) <= args.processed_diff_threshold)
+        ok = (cos_min >= threshold and bool(finite.item()) and bool(stats_flag.item())
+              and all(v >= threshold for k, v in comparison_metrics.items() if k.endswith("_min"))
+              and all(v <= args.processed_diff_threshold for k, v in semantic_metrics.items()
+                      if k.endswith("_diff_max")))
         all_pass = all_pass and ok
 
         if rank == 0:
@@ -569,10 +583,7 @@ def main():
         entry = {
             **semantic_metrics, "recv_stats_exact": bool(stats_flag.item()),
             "num_tokens_per_rank": my_T,
-            "baseline_cos_per_rank": baseline_cos_per_rank,
-            "gc_vs_baseline_cos_per_rank": comparison_cos_per_rank,
-            "baseline_cos_min": min(baseline_cos_per_rank),
-            "gc_vs_baseline_cos_min": min(comparison_cos_per_rank),
+            **comparison_metrics,
             "finite": bool(finite.item()),
             "num_tokens_global": int(sum(vec)) if vec is not None else my_T * num_ranks,
             "gc_replays_eager_and_graph": args.gc_replays,
@@ -592,6 +603,9 @@ def main():
         torch.cuda.empty_cache()
 
     if rank == 0:
+        baseline_capacity = {} if args.gc_only else {"baseline": base_buffer.num_max_tokens_per_rank}
+        baseline_operator = {} if args.gc_only else {"baseline": "deep_gemm.sm90_fp8_fp4_mega_moe"}
+        baseline_module = {} if args.gc_only else {"baseline": deep_gemm.__file__}
         os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
         with open(args.output_json, "w") as f:
             json.dump({
@@ -615,9 +629,9 @@ def main():
                 "package_audit": package_audit(gc_moe),
                 "rank_packages": rank_packages,
                 "requested_capacity": num_max_tokens_per_rank,
-                "aligned_capacity": {"baseline": base_buffer.num_max_tokens_per_rank, "candidate": candidate_buffer.num_max_tokens_per_rank},
-                "operators": {"baseline": "deep_gemm.sm90_fp8_fp4_mega_moe", "candidate": "gc_moe.sm90_fp8_fp4_gc_moe"},
-                "modules": {"baseline": deep_gemm.__file__, "candidate": gc_moe.__file__},
+                "aligned_capacity": {**baseline_capacity, "candidate": candidate_buffer.num_max_tokens_per_rank},
+                "operators": {**baseline_operator, "candidate": "gc_moe.sm90_fp8_fp4_gc_moe"},
+                "modules": {**baseline_module, "candidate": gc_moe.__file__},
                 "all_pass": all_pass,
                 "results": results,
             }, f, indent=2)
@@ -625,7 +639,8 @@ def main():
               f"(threshold={threshold}). Wrote {args.output_json}")
 
     candidate_buffer.destroy()
-    base_buffer.destroy()
+    if base_buffer is not None:
+        base_buffer.destroy()
     dist.barrier()
     dist.destroy_process_group()
     sys.exit(0 if all_pass else 1)

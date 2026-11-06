@@ -29,7 +29,7 @@ from cutlass.base_dsl.compiler import (
 )
 
 
-SYSTEM_PTXAS = '/usr/local/cuda/bin/ptxas'
+SYSTEM_PTXAS = os.environ.get('GC_MOE_PTXAS', '/usr/local/cuda/bin/ptxas')
 PTXAS_OPTIONS = ('-O3', '--register-usage-level=10', '--fmad=true')
 COMPILE_LOCK = threading.RLock()
 

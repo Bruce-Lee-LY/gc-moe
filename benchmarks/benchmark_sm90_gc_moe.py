@@ -253,7 +253,7 @@ def _weight_storage(weights, local_experts=None):
 
 def _common_weight_storage(baseline, candidate, canonical):
     """Select one common storage numerator without assuming SM90 layouts match."""
-    equal = all(
+    equal = baseline is not None and all(
         set(baseline["layers"][i]) == set(candidate["layers"][i])
         and all(baseline["layers"][i][name]["bytes"] ==
                 candidate["layers"][i][name]["bytes"]
@@ -510,6 +510,7 @@ def main():
              "Set 0 to use eager timing for all points.",
     )
     parser.add_argument("--output-json", type=str, default="results/_performance_results_sm90_gc.json")
+    parser.add_argument("--gc-only", action="store_true", help="Skip the SM90 MegaMoE comparison.")
     args = parser.parse_args()
 
     sweep = DEFAULT_TOKENS_PER_RANK if not args.num_tokens_per_rank_list else \
@@ -529,7 +530,8 @@ def main():
     })
     assert sorted(row["rank"] for row in rank_packages) == list(range(num_ranks))
     assert len({row["gc"]["source_sha256"] for row in rank_packages}) == 1
-    assert all(row["baseline_version"] == "2.8.2" for row in rank_packages)
+    if not args.gc_only:
+        assert all(row["baseline_version"] == "2.8.2" for row in rank_packages)
 
     if rank == 0:
         print(f"[benchmarks/benchmark_sm90_gc_moe] world_size={num_ranks} device={device}")
@@ -564,18 +566,18 @@ def main():
         print("Quantizing weights to FP4 ...")
     l1_packed = cast_grouped_weights_to_fp4(w1_local)
     l2_packed = cast_grouped_weights_to_fp4(w2_local)
-    base_weights = deep_gemm.transform_weights_for_mega_moe_sm90(
+    base_weights = None if args.gc_only else deep_gemm.transform_weights_for_mega_moe_sm90(
         l1_packed, l2_packed, layout="tiled",
     )
     candidate_weights = gc_moe.transform_weights_for_gc_moe_sm90(
         l1_packed, l2_packed,
     )
     routed_storage = _common_weight_storage(
-        _weight_storage(base_weights, Eloc),
+        None if args.gc_only else _weight_storage(base_weights, Eloc),
         _weight_storage(candidate_weights, Eloc),
         _weight_storage((l1_packed, l2_packed), Eloc),
     )
-    base_buffer = deep_gemm.get_symm_buffer_for_mega_moe_sm90(
+    base_buffer = None if args.gc_only else deep_gemm.get_symm_buffer_for_mega_moe_sm90(
         dist.group.WORLD, args.num_experts, num_max_tokens_per_rank,
         args.num_topk, args.hidden, args.intermediate_hidden,
         activation=args.activation,
@@ -586,9 +588,14 @@ def main():
         activation=args.activation,
     )
     if rank == 0:
-        print(f"Symmetric buffers: Mega {base_buffer.buffer.nbytes / 2 ** 30:.3f} GiB, GC {candidate_buffer.buffer.nbytes / 2 ** 30:.3f} GiB")
+        print(f"GC symmetric buffer: {candidate_buffer.buffer.nbytes / 2 ** 30:.3f} GiB")
+        if base_buffer is not None:
+            print(f"Mega symmetric buffer: {base_buffer.buffer.nbytes / 2 ** 30:.3f} GiB")
 
-    assert base_buffer.buffer.data_ptr() != candidate_buffer.buffer.data_ptr()
+    buffers = [candidate_buffer]
+    if base_buffer is not None:
+        assert base_buffer.buffer.data_ptr() != candidate_buffer.buffer.data_ptr()
+        buffers.insert(0, base_buffer)
     if args.activation_alpha != 1.0:
         raise ValueError("SM90 swiglu uses activation_alpha=1")
     weight_storage_by_rank = _collect_weight_storage(routed_storage)
@@ -605,7 +612,7 @@ def main():
         x_fp8, x_sf = cast_tokens_to_fp8(x_bf16)
         # Stage inputs into the symmetric buffer ONCE — the timed window
         # below contains only the fused MoE kernel call.
-        for buffer in (base_buffer, candidate_buffer):
+        for buffer in buffers:
             buffer.x[:T].copy_(x_fp8)
             buffer.x_sf[:T].copy_(x_sf)
             buffer.topk_idx[:T].copy_(topk_idx)
@@ -613,14 +620,11 @@ def main():
         torch.cuda.synchronize(device)
         dist.barrier()
 
-        outputs = {
-            "baseline": torch.empty((T, args.hidden), dtype=torch.bfloat16, device=device),
-            "gc": torch.empty((T, args.hidden), dtype=torch.bfloat16, device=device),
-        }
-        operators = {
-            "baseline": (deep_gemm.sm90_fp8_fp4_mega_moe, base_weights, base_buffer),
-            "gc": (gc_moe.sm90_fp8_fp4_gc_moe, candidate_weights, candidate_buffer),
-        }
+        operators = {"gc": (gc_moe.sm90_fp8_fp4_gc_moe, candidate_weights, candidate_buffer)}
+        if base_buffer is not None:
+            operators["baseline"] = (deep_gemm.sm90_fp8_fp4_mega_moe, base_weights, base_buffer)
+        outputs = {name: torch.empty((T, args.hidden), dtype=torch.bfloat16, device=device)
+                   for name in operators}
         def invoke(name):
             operator, weights, buffer = operators[name]
             operator(outputs[name], *weights, buffer,
@@ -636,7 +640,7 @@ def main():
         operator_stats = {}
         # Equal inputs, capacity, warmup/iterations/L2 flush/timing on both paths.
         # Alternate the operator order across points to reduce drift bias.
-        order = ["baseline", "gc"]
+        order = list(reversed(operators))
         if len(results) % 2:
             order.reverse()
         for name in order:
@@ -662,9 +666,11 @@ def main():
         }
         stats = operator_stats["gc"]
         stats["mode"] = "cuda_graph" if use_cuda_graph else "eager"
-        baseline_us = operator_stats["baseline"]["slowest_rank_median_us"]
         gc_us = operator_stats["gc"]["slowest_rank_median_us"]
-        speedup = baseline_us / gc_us
+        comparison = {}
+        if "baseline" in operator_stats:
+            baseline_us = operator_stats["baseline"]["slowest_rank_median_us"]
+            comparison = dict(baseline_us=baseline_us, speedup=baseline_us / gc_us)
 
         if rank == 0:
             print(
@@ -678,9 +684,8 @@ def main():
         results.append({
             "num_tokens_per_rank": T,
             "num_tokens_global": T * num_ranks,
-            "baseline_us": baseline_us,
             "gc_us": gc_us,
-            "speedup": speedup,
+            **comparison,
             "operator_stats": operator_stats,
             "workload": workload,
             "throughput": throughput,
@@ -695,13 +700,19 @@ def main():
         })
 
         if rank == 0:
-            print(f"COMPARE tokens_per_rank={T} total_tokens={T * num_ranks} mode={stats['mode']} mega={baseline_us:.3f}us gc={gc_us:.3f}us speedup={speedup:.5f}")
+            summary = f"gc={gc_us:.3f}us"
+            if comparison:
+                summary += f" mega={comparison['baseline_us']:.3f}us speedup={comparison['speedup']:.5f}"
+            print(f"COMPARE tokens_per_rank={T} total_tokens={T * num_ranks} mode={stats['mode']} {summary}")
             _print_throughput_metrics(T, throughput)
         del outputs, x_bf16, x_fp8, x_sf, topk_idx, topk_w
         gc.collect()
         torch.cuda.empty_cache()
 
     if rank == 0:
+        baseline_capacity = {} if args.gc_only else {"baseline": base_buffer.num_max_tokens_per_rank}
+        baseline_operator = {} if args.gc_only else {"baseline": "deep_gemm.sm90_fp8_fp4_mega_moe"}
+        baseline_module = {} if args.gc_only else {"baseline": deep_gemm.__file__}
         os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
         with open(args.output_json, "w") as f:
             json.dump({
@@ -722,9 +733,9 @@ def main():
                     "num_max_tokens_per_rank": num_max_tokens_per_rank,
                 },
                 "requested_capacity": num_max_tokens_per_rank,
-                "aligned_capacity": {"baseline": base_buffer.num_max_tokens_per_rank, "candidate": candidate_buffer.num_max_tokens_per_rank},
-                "operators": {"baseline": "deep_gemm.sm90_fp8_fp4_mega_moe", "candidate": "gc_moe.sm90_fp8_fp4_gc_moe"},
-                "modules": {"baseline": deep_gemm.__file__, "candidate": gc_moe.__file__},
+                "aligned_capacity": {**baseline_capacity, "candidate": candidate_buffer.num_max_tokens_per_rank},
+                "operators": {**baseline_operator, "candidate": "gc_moe.sm90_fp8_fp4_gc_moe"},
+                "modules": {**baseline_module, "candidate": gc_moe.__file__},
                 "warmup": args.warmup,
                 "iters": args.iters,
                 "inner_iters": args.inner_iters,
@@ -734,7 +745,8 @@ def main():
         print(f"\nWrote {args.output_json}")
 
     candidate_buffer.destroy()
-    base_buffer.destroy()
+    if base_buffer is not None:
+        base_buffer.destroy()
     dist.barrier()
     dist.destroy_process_group()
 
