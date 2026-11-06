@@ -10,11 +10,12 @@ class SM90RoleConfig:
     threads: tuple[int, int, int] = (256, 256, 256)
     # Dispatch allocates a dynamic shared uint32 counter; the graph must reserve it.
     smem: tuple[int, int, int] = (128, 65792, 0)
+    shared_grid: int = 0
 
 
 @lru_cache(maxsize=256)
 def _get_sm90_role_config(config, dispatch_sms: int, compute_sms: int):
-    small_pipelined = 0 < config.bound <= 2
+    small_pipelined = 0 < config.bound <= 16
     pipelined = small_pipelined or config.bound == 0 or config.bound >= 32
     # Common public bound controls geometry only. Every received row is still
     # processed by the kernel's complete M-chunk loop, including skewed loads.
@@ -33,8 +34,18 @@ def _get_sm90_role_config(config, dispatch_sms: int, compute_sms: int):
     direct_scan = 0 < config.bound <= 2
     combine_bound = config.bound or config.capacity
     combine_grid = min(compute_sms * 4, max(1, (combine_bound * config.hidden + 2047) // 2048))
+    compute_grid = compute_sms * workers
+    shared_grid = 0
+    if small_pipelined and config.shared_experts:
+        # Reserve room for routed work while covering the largest shared phase.
+        m_blocks = (config.bound + tile_m - 1) // tile_m
+        shared_tiles = max(config.intermediate * config.shared_experts // 128,
+                           config.hidden // 256)
+        shared_tasks = m_blocks * shared_tiles
+        shared_grid = min(compute_grid, max((3 * compute_sms + 1) // 2, shared_tasks))
     return SM90RoleConfig((config.experts // config.ranks if direct_scan else dispatch_sms * 4,
-                           compute_sms * workers, combine_grid),
+                           compute_grid, combine_grid),
+                          shared_grid=shared_grid,
                           tile_m=tile_m,
                           threads=(128 if direct_scan else 256, 384 if pipelined else 256, 384),
                           smem=(max(128, ((2 * config.ranks + 2) * 4 + 127) // 128 * 128), compute_smem, 0))
@@ -68,4 +79,6 @@ def get_shared_role_config(schedule):
         shared_smem = (2 * stage_stride + 128 + 1023) // 1024 * 1024
         smem = (smem[0], shared_smem, smem[2])
     return replace(schedule, threads=(schedule.threads[0], 256, schedule.threads[2]),
-                   smem=smem)
+                   smem=smem,
+                   grids=(schedule.grids[0], schedule.shared_grid or schedule.grids[1],
+                          schedule.grids[2]))

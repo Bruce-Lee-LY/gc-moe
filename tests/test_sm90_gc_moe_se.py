@@ -70,7 +70,7 @@ def build_weights(args, rank, world, device, reference=False):
                               args.hidden, rank, device)
     quantized = tuple(cast_grouped_weights_to_fp4(w) for w in raw)
     routed = gc_moe.transform_weights_for_gc_moe_sm90(*quantized)
-    mega_routed = deep_gemm.transform_weights_for_mega_moe_sm90(*quantized, layout='tiled')
+    mega_routed = None if args.gc_only else deep_gemm.transform_weights_for_mega_moe_sm90(*quantized, layout='tiled')
     raw_shared = build_shared_weights(args.intermediate_hidden, args.hidden,
                                      args.num_shared_experts, device)
     recipe = (1, 128, 128) if args.shared_weight_gran_k == 128 else DENSE_SHARED_RECIPE
@@ -78,9 +78,11 @@ def build_weights(args, rank, world, device, reference=False):
                    for w in raw_shared)
     # Native SM90 dense weights use N32/K32 block scales. Only scale values
     # are repeated: GLM expands 4x4, while Flash already has this recipe.
-    dense_shared = tuple((w, deep_gemm.transform_sf_into_required_layout(
-        sf.repeat_interleave(recipe[1] // 32, 0).repeat_interleave(recipe[2] // 32, 1).contiguous(),
-        w.shape[0], w.shape[1], DENSE_SHARED_RECIPE, is_sfa=False)) for w, sf in shared)
+    dense_shared = shared
+    if not args.gc_only:
+        dense_shared = tuple((w, deep_gemm.transform_sf_into_required_layout(
+            sf.repeat_interleave(recipe[1] // 32, 0).repeat_interleave(recipe[2] // 32, 1).contiguous(),
+            w.shape[0], w.shape[1], DENSE_SHARED_RECIPE, is_sfa=False)) for w, sf in shared)
     # The existing fused transform consumes per-row K32 scales. Broadcasting
     # the original block scales preserves every FP8 byte and dequantized value.
     fused_input = tuple((w, sf.repeat_interleave(recipe[1], 0)
@@ -88,7 +90,8 @@ def build_weights(args, rank, world, device, reference=False):
     fused_shared = gc_moe.transform_weights_for_gc_moe_sm90(*fused_input, shared_recipe=SHARED_RECIPE)
     for (w, sf), (dense_w, dense_sf), (fused_w, fused_sf) in zip(shared, dense_shared, fused_input):
         assert w.data_ptr() == dense_w.data_ptr() == fused_w.data_ptr()
-        assert torch.equal(dense_sf[::recipe[1] // 32, ::recipe[2] // 32], sf)
+        if not args.gc_only:
+            assert torch.equal(dense_sf[::recipe[1] // 32, ::recipe[2] // 32], sf)
         assert torch.equal(fused_sf[::recipe[1], ::recipe[2] // 32], sf)
     result = routed, mega_routed, dense_shared, fused_shared, recipe
     return (*result, quantized) if reference else result
@@ -156,9 +159,11 @@ OPERATORS = {
 def make_calls(args, tokens, bound, routed_weights, mega_weights, shared_weights, fused_weights,
                gc_buffer, mega_buffer, fused_buffer, shared_input, outputs, stats=None):
     # Both unfused paths execute this identical dense implementation and input.
-    standalone = StandaloneShared(tokens, args.hidden,
-        args.intermediate_hidden * args.num_shared_experts, outputs['gc_se'].device,
-        shared_weights, args.activation_clamp)
+    standalone = None
+    if gc_buffer is not None:
+        standalone = StandaloneShared(tokens, args.hidden,
+            args.intermediate_hidden * args.num_shared_experts, outputs['gc_se'].device,
+            shared_weights, args.activation_clamp)
     common = dict(recipe=ROUTED_RECIPE, activation=args.activation,
                   activation_clamp=args.activation_clamp, fast_math=bool(args.fast_math),
                   num_tokens_bound=bound)
@@ -175,11 +180,15 @@ def make_calls(args, tokens, bound, routed_weights, mega_weights, shared_weights
             cumulative_local_expert_recv_stats=None if stats is None else stats['gc_se'],
             shared_recipe=SHARED_RECIPE, **common)
 
-    return {
-        'gc_unfused': lambda: unfused('gc_unfused', gc_moe.sm90_fp8_fp4_gc_moe, routed_weights, gc_buffer),
-        'mega_unfused': lambda: unfused('mega_unfused', deep_gemm.sm90_fp8_fp4_mega_moe, mega_weights, mega_buffer),
-        'gc_se': fused,
-    }, standalone
+    calls = {}
+    if gc_buffer is not None:
+        calls['gc_unfused'] = lambda: unfused(
+            'gc_unfused', gc_moe.sm90_fp8_fp4_gc_moe, routed_weights, gc_buffer)
+    if mega_buffer is not None:
+        calls['mega_unfused'] = lambda: unfused(
+            'mega_unfused', deep_gemm.sm90_fp8_fp4_mega_moe, mega_weights, mega_buffer)
+    calls['gc_se'] = fused
+    return calls, standalone
 
 
 def run_independent(raw_routed, shared_weights, routed_input, shared_input,
@@ -217,8 +226,11 @@ def run_independent(raw_routed, shared_weights, routed_input, shared_input,
     if tokens:
         x = (shared_input[0].float().reshape(tokens, hidden // 32, 32)
              * shared_input[1].unsqueeze(-1)).reshape(tokens, hidden)
-        w1, w2 = [(w.float().reshape(w.shape[0] // 32, 32, w.shape[1] // 32, 32)
-                   * sf[:, None, :, None]).reshape_as(w) for w, sf in shared_weights]
+        def dequantize_shared(w, sf):
+            block_n, block_k = (size // groups for size, groups in zip(w.shape, sf.shape))
+            blocks = w.float().reshape(sf.shape[0], block_n, sf.shape[1], block_k)
+            return (blocks * sf[:, None, :, None]).reshape_as(w)
+        w1, w2 = (dequantize_shared(w, sf) for w, sf in shared_weights)
         gate, up = (x @ w1.reshape(w1.shape[0], -1).T).to(torch.bfloat16).float().chunk(2, -1)
         gate, up = gate.clamp(max=clamp), up.clamp(-clamp, clamp)
         mid = gate * torch.sigmoid(gate) * up
@@ -262,6 +274,7 @@ def main():
     p.add_argument('--gc-replays', type=int, default=5)
     p.add_argument('--all-routes-invalid', action='store_true')
     p.add_argument('--output-json', default='results/_accuracy_results_sm90_gc_se.json')
+    p.add_argument('--gc-only', action='store_true', help='Test fused GC without the DeepGEMM comparisons.')
     args = p.parse_args()
     assert args.activation_alpha == 1. and args.gc_replays >= 5 and args.num_shared_experts >= 1
     vectors = parse_per_rank_vectors(args.per_rank_tokens_list)
@@ -277,9 +290,13 @@ def main():
     plan = vectors or [[t] * world for t in sweep]
     assert all(len(v) == world and min(v) >= 0 and max(v) <= capacity for v in plan)
     routed, mega_routed, shared, fused_shared, recipe, reference_routed = build_weights(args, rank, world, device, reference=True)
-    base_buffer, fused_buffer = allocate_buffer(args, capacity, False), allocate_buffer(args, capacity, True)
-    mega_buffer = allocate_buffer(args, capacity, False, mega=True)
-    assert len({b.buffer.data_ptr() for b in (base_buffer, mega_buffer, fused_buffer)}) == 3
+    base_buffer = None if args.gc_only else allocate_buffer(args, capacity, False)
+    fused_buffer = allocate_buffer(args, capacity, True)
+    mega_buffer = None if args.gc_only else allocate_buffer(args, capacity, False, mega=True)
+    buffers = {'gc_se': fused_buffer} if args.gc_only else {
+        'gc_unfused': base_buffer, 'mega_unfused': mega_buffer, 'gc_se': fused_buffer}
+    assert len({b.buffer.data_ptr() for b in buffers.values()}) == len(buffers)
+    operators = {name: OPERATORS[name] for name in buffers}
     # Validate malformed calls on the host; never launch a shifted kernel ABI.
     from gc_moe.apis.sm90_gc_moe import validate_call
     contract_y = torch.empty((1, args.hidden), dtype=torch.bfloat16, device=device)
@@ -310,11 +327,11 @@ def main():
         if args.all_routes_invalid:
             indices.fill_(-1)
         routed_input, shared_input = prepare_inputs(x)
-        for b in (base_buffer, mega_buffer, fused_buffer):
+        for b in buffers.values():
             stage_inputs(b, routed_input, shared_input, indices, weights)
         reference, routed_ref, shared_ref = run_independent(reference_routed, shared,
             routed_input, shared_input, indices, weights, vector, rank, args.activation_clamp)
-        outputs = {name: torch.empty_like(reference) for name in OPERATORS}
+        outputs = {name: torch.empty_like(reference) for name in operators}
         stats = {name: torch.zeros(args.num_experts // world, dtype=torch.int32, device=device) for name in outputs}
         calls, standalone = make_calls(args, tokens, bound, routed, mega_routed, shared, fused_shared,
             base_buffer, mega_buffer, fused_buffer, shared_input, outputs, stats)
@@ -348,7 +365,9 @@ def main():
                 output = records[name][i]
                 measured[name + '_diff'] = diff(output, reference)
                 measured[name + '_independent'] = cosine(output, reference)
-            for name in ('gc_unfused', 'mega_unfused'):
+            for name in calls:
+                if name == 'gc_se':
+                    continue
                 fused, base = records['gc_se'][i], records[name][i]
                 suffix = 'gc_se_' + name
                 measured[suffix + '_diff'] = diff(fused, base)
@@ -362,9 +381,12 @@ def main():
         local.update(rank=rank, finite=all(bool(torch.isfinite(t).all()) for t in (*outputs.values(), reference)),
                      recv_stats_exact=stats_ok, repeats_exact=all(torch.equal(v, records[name][0]) for name, values in records.items() for v in values),
                      shared_diff=diff(fused_buffer.shared_y[:tokens], shared_ref),
-                     standalone_shared_diff=diff(standalone.output, shared_ref),
-                     shared_gc_unfused_diff=diff(fused_buffer.shared_y[:tokens], standalone.output),
                      checked_outputs_per_operator=len(records['gc_se']), repeat_checks=repeats)
+        shared_diff_keys = ['shared_diff']
+        if standalone is not None:
+            local.update(standalone_shared_diff=diff(standalone.output, shared_ref),
+                         shared_gc_unfused_diff=diff(fused_buffer.shared_y[:tokens], standalone.output))
+            shared_diff_keys.extend(('standalone_shared_diff', 'shared_gc_unfused_diff'))
         local['shared_output_abs_max'] = (float(fused_buffer.shared_y[:tokens].float().abs().max())
                                           if tokens else 0.)
         local['shared_only_output_nonzero'] = (not args.all_routes_invalid or tokens == 0
@@ -373,15 +395,16 @@ def main():
         # the first case of each process, including global T0 processes.
         if index == 0:
             changed_routed, changed_shared = prepare_inputs(-x * .75)
-            for b in (base_buffer, mega_buffer, fused_buffer):
+            for b in buffers.values():
                 stage_inputs(b, changed_routed, changed_shared, indices, weights)
             # Captured baseline reads its own dense input pair; update it too.
             shared_input[0].copy_(changed_shared[0]); shared_input[1].copy_(changed_shared[1])
             changed_ref, _, _ = run_independent(reference_routed, shared,
                 changed_routed, changed_shared, indices, weights, vector, rank, args.activation_clamp)
+            gc_buffers = [fused_buffer] if base_buffer is None else [base_buffer, fused_buffer]
             for seed, expected, prefix in ((0x7ffffffe, -0x7ffffffe, 'half_'),
                                             (-2, 2, '')):
-                for b in (base_buffer, fused_buffer):
+                for b in gc_buffers:
                     b.header[0] = seed
                 for _ in range(4):
                     for name in calls:
@@ -389,12 +412,12 @@ def main():
                 torch.cuda.synchronize()
                 local[prefix + 'changing_input_diff'] = max(diff(t, changed_ref) for t in outputs.values())
                 local[prefix + 'epoch_wrap_ok'] = all(int(b.header[0].item()) == expected
-                                                      for b in (base_buffer, fused_buffer))
+                                                      for b in gc_buffers)
         del graphs, graph
         local['passed'] = (local['finite'] and local['recv_stats_exact'] and local['repeats_exact']
             and local['shared_only_output_nonzero']
             and min(local[k] for k in cosine_keys) >= args.cosine_threshold
-            and max(local[k] for k in (*diff_keys, 'shared_diff', 'standalone_shared_diff', 'shared_gc_unfused_diff')) <= args.processed_diff_threshold
+            and max(local[k] for k in (*diff_keys, *shared_diff_keys)) <= args.processed_diff_threshold
             and local.get('changing_input_diff', 0.) <= args.processed_diff_threshold
             and local.get('half_changing_input_diff', 0.) <= args.processed_diff_threshold
             and local.get('epoch_wrap_ok', True) and local.get('half_epoch_wrap_ok', True))
@@ -405,10 +428,10 @@ def main():
                     num_tokens_global=sum(vector), passed=all(r['passed'] for r in rank_checks), rank_checks=rank_checks)
         results.append(case)
         if rank == 0:
-            print(f"CASE {case['case']} vector={vector} "
-                  f"gc_se_gc_unfused_diff={max(r['gc_se_gc_unfused_diff'] for r in rank_checks):.9g} "
-                  f"gc_se_mega_unfused_diff={max(r['gc_se_mega_unfused_diff'] for r in rank_checks):.9g} "
-                  f"shared_diff={max(r['shared_gc_unfused_diff'] for r in rank_checks):.9g} "
+            display_keys = ('gc_se_diff', *shared_diff_keys,
+                            *(f'gc_se_{name}_diff' for name in calls if name != 'gc_se'))
+            summary = ' '.join(f'{key}={max(r[key] for r in rank_checks):.9g}' for key in display_keys)
+            print(f"CASE {case['case']} vector={vector} {summary} "
                   f"{'PASS' if case['passed'] else 'FAIL'}", flush=True)
         del calls, standalone, records, outputs, reference, routed_ref, shared_ref
         torch.cuda.synchronize(); torch.cuda.empty_cache()
@@ -420,12 +443,15 @@ def main():
         out = Path(args.output_json); out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(dict(world_size=world, case_category=args.case_category, config=vars(args),
             requested_capacity=capacity, routed_recipe=ROUTED_RECIPE, shared_recipe=recipe,
-            shared_raw_recipe=recipe, shared_dense_recipe=DENSE_SHARED_RECIPE,
+            shared_raw_recipe=recipe,
+            shared_dense_recipe=None if args.gc_only else DENSE_SHARED_RECIPE,
             shared_fused_recipe=SHARED_RECIPE,
-            operators=OPERATORS,
+            operators=operators,
             audit=rank_audits[0], rank_audits=rank_audits, all_pass=all_pass, results=results), indent=2) + '\n')
         print('ALL PASS' if all_pass else 'SOME FAILED', out, flush=True)
-    torch.cuda.synchronize(); fused_buffer.destroy(); base_buffer.destroy(); mega_buffer.destroy()
+    torch.cuda.synchronize()
+    for buffer in reversed(list(buffers.values())):
+        buffer.destroy()
     dist.barrier(); dist.destroy_process_group()
     if not all_pass:
         raise SystemExit(1)

@@ -34,6 +34,10 @@ DSV4.1-Flash on eight NVIDIA H20 GPUs.
 
 [Full H20 SE accuracy and performance data](docs/h20_gc_moe_se.md).
 
+The four-GPU H200 results use the same DSV4.1-Flash shape to compare SM90
+scheduling before and after the small-batch changes. See the [H200 routed report](docs/h200_gc_moe.md)
+and the [H200 fused shared expert report](docs/h200_gc_moe_se.md).
+
 ### Blackwell
 
 GLM5.2 and DSV4.1-Flash on eight NVIDIA B300 GPUs.
@@ -59,12 +63,12 @@ GLM5.2 and DSV4.1-Flash on eight NVIDIA B300 GPUs.
 ### Requirements
 
 - Linux and an NVIDIA Hopper or Blackwell GPU. The Hopper SM90 path uses
-  `sm_90a` kernels and is validated on H20; the Blackwell path is validated
+  `sm_90a` kernels and is validated on H20 and H200. The Blackwell path is validated
   on B300 (compute capability 10.3) and selects `sm_103f`.
 - A CUDA driver supporting Green Contexts. Multi-GPU execution also requires
   peer-accessible GPUs and PyTorch symmetric memory, with one process per GPU.
 - Python 3.10 or later.
-- A system CUDA Toolkit providing `/usr/local/cuda/bin/ptxas`. The validated
+- A CUDA Toolkit assembler, resolved at `/usr/local/cuda/bin/ptxas` by default. The validated
   toolchain is CUDA 13.2 with ptxas 13.2.78; the assembler must support the PTX
   emitted by the installed CuTe DSL.
 
@@ -98,9 +102,9 @@ python -m pip install dist/*.whl
 
 `build.sh` uses `python` from `PATH` and replaces the existing `build/`, `dist/`
 and package metadata directories. Kernel compilation happens when the operator
-first encounters a new configuration. The JIT path uses the system assembler
-at `/usr/local/cuda/bin/ptxas` and checks its compatibility with the generated
-PTX.
+first encounters a new configuration. The JIT uses the assembler at
+`/usr/local/cuda/bin/ptxas` by default. Set `GC_MOE_PTXAS` to select another
+assembler compatible with the generated PTX.
 
 For editable development, use `python -m pip install -e .` instead of installing
 the wheel. Wheel versions include the Git revision for a clean tree, or
@@ -335,6 +339,16 @@ cosine thresholds are 0.97 for non-SE and 0.99 for SE. Additional eight-rank
 readiness checks are available in [the non-SE readiness test](tests/test_gc_moe_readiness.py)
 and [the SE readiness test](tests/test_gc_moe_se_readiness.py).
 
+The SM90 wrappers use the DSV4.1-Flash preset. Pass `--gc-only` when the
+DeepGEMM build lacks the SM90 comparison kernels. The SE wrapper then tests
+the fused shared expert against the independent reference and times the fused
+operator. The DeepGEMM quantization utilities are still required.
+
+```bash
+bash scripts/run_sm90.sh 4 both --gc-only
+bash scripts/run_sm90_se.sh 4 both --gc-only
+```
+
 Each accuracy or benchmark stage waits for all selected GPUs to be idle:
 utilization 0%, no compute processes and at least 51200 MiB free per GPU,
 observed over at least three samples and ten seconds. `GC_MOE_PYTHON_BIN` selects the
@@ -355,6 +369,7 @@ ranks. Decode average speedup is the arithmetic mean of the per-point ratios
 | --- | --- | --- |
 | `GC_MOE_USE_LOCAL_VERSION` | `1` | Include a local revision in the wheel version; use `0` for the public version. |
 | `GC_MOE_WHEEL_CUDA_VERSION` | Unset | Append a user-provided CUDA label to the local wheel version. |
+| `GC_MOE_PTXAS` | `/usr/local/cuda/bin/ptxas` | Select the assembler used by the JIT. |
 | `GC_MOE_DISPATCH_SMS` | `16` | Request dispatch SMs; the driver determines the aligned dispatch/compute partition. |
 | `GC_MOE_BALANCED_WORKQUEUES` | `1` | Request balanced Green workqueues when supported by the driver. |
 | `GC_MOE_NVLINK_BARRIER_TIMEOUT_SECS` | `3600` | Set the positive cross-rank barrier timeout in seconds. |
