@@ -51,7 +51,7 @@ def _assemble_role_ptx(ptx, role, dump_dir, identity):
                 else r'\.u32' if ordinal < 16 else r'\.f32')
         if re.search(kind + r'\s+\S+_param_' + str(ordinal) + r',?\s*$', formal) is None:
             raise RuntimeError(f'SM90 CuTe launch formal {ordinal} changed type or order')
-    if role in (2, 4) and ('wgmma.mma_async' not in ptx or 'cp.async.bulk' not in ptx):
+    if role in (2, 4, 5) and ('wgmma.mma_async' not in ptx or 'cp.async.bulk' not in ptx):
         raise RuntimeError('SM90 CuTe compute lost its Hopper WGMMA/TMA operations')
     return assemble_ptx(ptx, dump_dir, f'sm90_role{role}', target='sm_90a',
                         ptxas_options=identity.ptxas_options)
@@ -89,18 +89,44 @@ _POINTER_TYPES = (Uint8, Uint64, BFloat16, Uint8, Uint8, Float32,
 def _role_specs(config, layout, schedule, has_stats):
     routed = get_routed_role_config(config, schedule)
     shared = get_shared_role_config(schedule) if config.shared_experts else None
-    roles = (1, 4, 2, 3) if config.shared_experts else (1, 2, 3)
+    split = bool(config.shared_experts and schedule.split_shared)
+    l2_grid = (schedule.shared_l2_grid or shared.grids[1]) if split else 0
+    # Bound waiting L2 CTAs, and order their launch after every L1 CTA has
+    # begun. L1 never waits for L2; original per-block releases/acquires
+    # provide data visibility without relying on concurrent execution.
+    stream_shared = split and 0 < l2_grid < getattr(schedule, 'compute_sms', 0)
+    roles = ((1, 4, 5, 2, 3) if split else
+             ((1, 4, 2, 3) if config.shared_experts else (1, 2, 3)))
     specs = []
     for role in roles:
-        index = 1 if role == 4 else role - 1
+        index = 1 if role in (4, 5) else role - 1
         # Workspace routed offsets are a strict prefix of the shared layout.
         role_config = replace(config, shared_experts=0) if role == 2 else config
-        role_schedule = shared if role == 4 else (routed.schedule if role == 2 else schedule)
+        role_schedule = shared if role in (4, 5) else (routed.schedule if role == 2 else schedule)
+        if role == 5 and schedule.shared_l2_grid:
+            # A bounded L2 branch may overlap M64 routed on different SMs;
+            # these two resource-heavy kernels cannot share one SM.
+            role_schedule = replace(role_schedule,
+                                    grids=(role_schedule.grids[0], schedule.shared_l2_grid,
+                                           role_schedule.grids[2]))
         kernel = SM90GCMoERoleKernel(role_config, layout, role, role_schedule, has_stats,
-                                    routed_n_factor=routed.n_factor if role == 2 else 1)
-        wait_for = (4,) if config.shared_experts and role == 2 and schedule.tile_m >= 32 else ()
-        specs.append((kernel, (role, role_schedule.smem[index], role_schedule.threads[index],
-                               role_schedule.grids[index], wait_for)))
+                                    routed_n_factor=routed.n_factor if role == 2 else 1,
+                                    routed_stage_count=routed.stage_count_override if role == 2 else 0)
+        wait_for = ((4,) if split and (role == 2 or (role == 5 and not stream_shared)) else
+                    ((4,) if config.shared_experts and role == 2 and schedule.tile_m >= 32 else ()))
+        launch = (role, role_schedule.smem[index], role_schedule.threads[index],
+                  role_schedule.grids[index], wait_for)
+        if role == 5 and stream_shared:
+            # CUDA launch-order port 2, default input port 0, PROGRAMMATIC 1.
+            # Unlike a full edge this may overlap, but only after all L1
+            # blocks have started. Finalize still joins full completions.
+            launch += (((4, 2, 0, 1),),)
+        if role == 2 and stream_shared and schedule.tile_m in (32, 64):
+            # Preserve all launch resources. Only allow the independent routed
+            # worker to start after every bounded L2 CTA has begun; L1 is finite
+            # and never depends on either consumer. Finalize joins completions.
+            launch = (*launch[:4], (), ((5, 2, 0, 1),))
+        specs.append((kernel, launch))
     return tuple(specs)
 
 
@@ -130,7 +156,7 @@ def _get_or_compile_binaries(key, identity, specs):
         if binaries is None:
             binaries = _compile_roles(specs, identity)
             expected = tuple(launch[0] for _, launch in specs)
-            if (expected not in ((1, 2, 3), (1, 4, 2, 3))
+            if (expected not in ((1, 2, 3), (1, 4, 2, 3), (1, 4, 5, 2, 3))
                     or tuple(item.role for item in binaries) != expected):
                 raise RuntimeError('SM90 compilation did not produce all role binaries')
             if _compiler_identity('sm_90a') != identity:
@@ -151,7 +177,7 @@ def prepare_role_binaries(config, y, w1, w2, buffer, stats=None, context=None,
     # call. CuTe resolves its compiler environment at initialization; identity
     # is audited on preparation/compilation misses, not by rescanning os.environ.
     key = (config, buffer.layout, stats is not None, context.dispatch_sms,
-           context.compute_sms)
+           context.compute_sms, context.schedule_policy)
     prepared = _CACHE.get(key)
     if prepared is None:
         with COMPILE_LOCK:

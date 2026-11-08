@@ -4,13 +4,13 @@ GC MoE is a CuTe DSL implementation of FP8/FP4 mixture-of-experts inference
 with CUDA Green Contexts for NVIDIA Hopper and Blackwell GPUs. It overlaps
 expert-parallel token dispatch with
 Tensor Core computation, then combines the expert outputs through a CUDA Graph
-with three kernel nodes (four for SM90 fused SE).
+with three kernel nodes (four or five for SM90 fused SE).
 The operator supports routed experts and optional fused shared
 experts (SE), with FP8 activations, packed FP4 routed weights, FP8 shared
 weights and BF16 outputs.
 
 GPU kernels are JIT compiled on first use. Installation builds a Python wheel;
-it does not compile CUDA kernels. The current package version is `0.4.1`.
+it does not compile CUDA kernels. The current package version is `0.4.2`.
 
 ## Performance
 
@@ -20,23 +20,37 @@ per-rank count. The figures use the measurements recorded in the linked reports.
 
 ### Hopper
 
+#### H20
+
 DSV4.1-Flash on eight NVIDIA H20 GPUs.
 
-#### Routed experts (non-SE)
+##### Routed experts (non-SE)
 
 ![DSV4.1-Flash non-SE: GC MoE versus Mega MoE latency and speedup on eight H20 GPUs](docs/h20_dsv41_flash_gc_moe.png)
 
 [Full H20 non-SE accuracy and performance data](docs/h20_gc_moe.md).
 
-#### Fused shared experts (SE)
+##### Fused shared experts (SE)
 
 ![DSV4.1-Flash fused SE: gc_se versus gc_unfused and mega_unfused on eight H20 GPUs](docs/h20_dsv41_flash_gc_moe_se.png)
 
 [Full H20 SE accuracy and performance data](docs/h20_gc_moe_se.md).
 
-The four-GPU H200 results use the same DSV4.1-Flash shape to compare SM90
-scheduling before and after the small-batch changes. See the [H200 routed report](docs/h200_gc_moe.md)
-and the [H200 fused shared expert report](docs/h200_gc_moe_se.md).
+#### H100 / L20Z
+
+DSV4.1-Flash on eight NVIDIA L20Z (H100) GPUs.
+
+##### Routed experts (non-SE)
+
+![DSV4.1-Flash non-SE: GC MoE versus Mega MoE latency and speedup on eight H100 GPUs](docs/h100_dsv41_flash_gc_moe.png)
+
+[Full H100 non-SE accuracy and performance data](docs/h100_gc_moe.md).
+
+##### Fused shared experts (SE)
+
+![DSV4.1-Flash fused SE: gc_se versus gc_unfused and mega_unfused on eight H100 GPUs](docs/h100_dsv41_flash_gc_moe_se.png)
+
+[Full H100 SE accuracy and performance data](docs/h100_gc_moe_se.md).
 
 ### Blackwell
 
@@ -63,7 +77,7 @@ GLM5.2 and DSV4.1-Flash on eight NVIDIA B300 GPUs.
 ### Requirements
 
 - Linux and an NVIDIA Hopper or Blackwell GPU. The Hopper SM90 path uses
-  `sm_90a` kernels and is validated on H20 and H200. The Blackwell path is validated
+  `sm_90a` kernels and is validated on H20 and H100. The Blackwell path is validated
   on B300 (compute capability 10.3) and selects `sm_103f`.
 - A CUDA driver supporting Green Contexts. Multi-GPU execution also requires
   peer-accessible GPUs and PyTorch symmetric memory, with one process per GPU.
@@ -109,7 +123,7 @@ assembler compatible with the generated PTX.
 For editable development, use `python -m pip install -e .` instead of installing
 the wheel. Wheel versions include the Git revision for a clean tree, or
 `+local` for a dirty tree or a source copy without Git metadata. Set
-`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.4.1` version.
+`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.4.2` version.
 
 ## Interfaces
 
@@ -139,6 +153,20 @@ use E4M3FN with contiguous FP32 K128 scales. Pass `shared_l1_weights` and
 [SM90 interfaces](gc_moe/sm90_gc/__init__.py),
 [routed-expert test](tests/test_sm90_gc_moe.py) and
 [shared-expert test](tests/test_sm90_gc_moe_se.py) for complete preparation.
+
+The SM90 Green Context selects and caches its scheduling policy from CUDA's
+device-visible total SM count before splitting communication and compute:
+devices with at least 128 SMs, including full 132-SM H100 devices, use
+the small-batch pipelined schedule; smaller devices, including 78-SM H20, keep
+the legacy schedule. This selection covers routed and
+shared launch geometry and shared-memory budgets and does not tune during graph
+replay.
+
+For calls with shared experts, the high-SM policy uses one routed compute CTA
+per compute SM at 1–16 tokens/rank. Its shared grid covers the shared task count
+with a floor of half the compute SM count. Routed-only calls use two routed
+compute CTAs per compute SM in this range. These rules apply to all supported
+expert-parallel group sizes and model shapes.
 
 The input contract and examples below describe the Blackwell interfaces.
 

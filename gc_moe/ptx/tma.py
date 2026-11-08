@@ -1,8 +1,8 @@
-"""Raw-address 1D bulk copies for the GC rank-to-rank token pull.
+"""PTX asynchronous copies and TensorMap operations for GC MoE.
 
-CuTe's tiled TMA atoms require tensor-map descriptors. The reference uses
-the raw-address cp.async.bulk forms for this particular remote token path;
-the matrix load path will use CuTe tensor-map atoms separately.
+Raw-address 1D bulk copies serve the SM90 matrix-staging path.
+TensorMap loads/stores and async-proxy fences serve the SM100 path.
+The helpers expose their barrier and cache-policy operands explicitly.
 """
 
 from __future__ import annotations
@@ -47,13 +47,13 @@ def prefetch_tensormap(desc: cute.Pointer, *, loc=None, ip=None) -> None:
 @dsl_user_op
 def bulk_g2s_1d(dst_smem: cute.Pointer, src_gmem: cute.Pointer,
                 num_bytes: Uint32, mbar_smem: cute.Pointer,
-                *, loc=None, ip=None) -> None:
+                *, cache_hint: int = EVICT_FIRST, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None, [dst_smem.toint(loc=loc, ip=ip).ir_value(),
                src_gmem.toint(loc=loc, ip=ip).ir_value(),
                num_bytes.ir_value(loc=loc, ip=ip),
                mbar_smem.toint(loc=loc, ip=ip).ir_value(),
-               Uint64(EVICT_FIRST).ir_value(loc=loc, ip=ip)],
+               Uint64(cache_hint).ir_value(loc=loc, ip=ip)],
         'cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.'
         'L2::cache_hint [$0], [$1], $2, [$3], $4;',
         'r,l,r,r,l,~{memory}', has_side_effects=True,

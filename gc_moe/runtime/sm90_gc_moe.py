@@ -1,4 +1,4 @@
-"""Independent SM90 CUDA driver Green Context resources and role graph with optional isolated shared compute.
+"""Independent SM90 CUDA driver Green Context resources and role graphs.
 
 The role kernels are CuTe DSL SM90 cubins.  A CUDA library kernel plus an explicit
 context is required for Graph kernel nodes: ``func`` remains null.
@@ -18,6 +18,7 @@ from typing import Sequence
 
 import torch
 from cuda.bindings import driver as cu
+from ..jit_kernels.heuristics.sm90_gc_moe import select_sm90_schedule_policy
 
 
 def _ok(result):
@@ -133,12 +134,15 @@ def _green_resources():
 
 @dataclass(frozen=True)
 class RoleBinary:
+    # 1 dispatch, 2 routed, 3 finalize, 4 shared (or L1), 5 split shared L2.
     role: int
     cubin: bytes
     smem_bytes: int
     threads: int
     grid: int
     wait_for: tuple[int, ...] = ()
+    # (upstream role, outgoing port, incoming port, dependency type).
+    launch_after: tuple[tuple[int, int, int, int], ...] = ()
 
 
 class _KernelArgs:
@@ -166,6 +170,10 @@ def _child_key(binaries: Sequence[RoleBinary], arguments: Sequence[_KernelArgs])
         prerequisites = getattr(binary, 'wait_for', ())
         key.update(len(prerequisites).to_bytes(4, 'little'))
         key.update(bytes(prerequisites))
+        launch_edges = getattr(binary, 'launch_after', ())
+        key.update(len(launch_edges).to_bytes(4, 'little'))
+        for edge in launch_edges:
+            key.update(bytes(edge))
         key.update(binary.smem_bytes.to_bytes(8, 'little'))
         key.update(binary.threads.to_bytes(4, 'little'))
         key.update(binary.grid.to_bytes(4, 'little'))
@@ -201,7 +209,7 @@ def _runtime_locked(function):
 class _ChildGraph:
     def __init__(self, owner: 'GreenContextPair', binaries: Sequence[RoleBinary],
                  arguments: Sequence[_KernelArgs]):
-        if tuple(x.role for x in binaries) not in ((1, 2, 3), (1, 2, 4, 3), (1, 4, 2, 3)):
+        if tuple(x.role for x in binaries) not in ((1, 2, 3), (1, 2, 4, 3), (1, 4, 2, 3), (1, 4, 5, 2, 3)):
             raise ValueError('expected dispatch, routed, optional shared, finalize cubins')
         if len(arguments) != len(binaries):
             raise ValueError('expected one argument vector per role')
@@ -230,16 +238,32 @@ class _ChildGraph:
                 params.kernel.blockDimY = params.kernel.blockDimZ = 1
                 params.kernel.sharedMemBytes = binary.smem_bytes
                 params.kernel.kernelParams = arguments[index].pointer
-                # Dispatch remains an independent root. A compute policy may
-                # retire local SE before routed begins; its original device
-                # queues still acquire every required dispatch publication.
+                # Dispatch is an independent root. Compute dependencies retire
+                # shared work or order routed after split shared L2 has started.
+                # Device acquires still protect every dispatch publication.
                 # Finalize/cleanup always joins every local producer.
                 prerequisites = getattr(binary, 'wait_for', ())
-                if any(role not in role_nodes for role in prerequisites):
+                launch_edges = getattr(binary, 'launch_after', ())
+                launch_roles = tuple(edge[0] for edge in launch_edges)
+                if any(role not in role_nodes for role in (*prerequisites, *launch_roles)):
                     raise ValueError('kernel dependency must reference an earlier graph node')
+                if (len(set((*prerequisites, *launch_roles))) != len(prerequisites) + len(launch_roles)
+                        or (binary.role == 3 and launch_edges)
+                        or any(edge[1:] != (2, 0, 1) for edge in launch_edges)):
+                    raise ValueError('invalid launch-order kernel dependency')
                 dependencies = (list(nodes) if binary.role == 3 else
                                 [role_nodes[role] for role in prerequisites])
-                node = _ok(cu.cuGraphAddNode(self.graph, dependencies, None,
+                edge_data = None
+                if launch_edges:
+                    edge_data = [cu.CUgraphEdgeData() for _ in dependencies]
+                    for role, from_port, to_port, dependency_type in launch_edges:
+                        edge = cu.CUgraphEdgeData()
+                        edge.from_port = from_port
+                        edge.to_port = to_port
+                        edge.type = dependency_type
+                        dependencies.append(role_nodes[role])
+                        edge_data.append(edge)
+                node = _ok(cu.cuGraphAddNode(self.graph, dependencies, edge_data,
                                              len(dependencies), params))
                 nodes.append(node)
                 role_nodes[binary.role] = node
@@ -285,6 +309,9 @@ class GreenContextPair:
         green_resources = _green_resources()
         total, compute, communication = green_resources.get_sm_split(
             self.device, requested_dispatch_sms)
+        # Resolve once, before partition sizes affect launch geometry. Captured
+        # graph replay and role preparation only use this cached resource class.
+        self.schedule_policy = select_sm90_schedule_policy(total)
         workqueue = (green_resources.get_balanced_workqueue()
                      if _get_env_int('GC_MOE_SM90_BALANCED_WORKQUEUES', 1)
                      else None)

@@ -142,3 +142,35 @@ def wgmma_rs_k32_pair(fragment0: tuple, fragment1: tuple, descriptor: Uint64,
         has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
     parts = tuple(Float32(llvm.extractvalue(T.f32(), result, [i])) for i in range(count))
     return parts
+
+
+@dsl_user_op
+def wgmma_rs_k32_pair_issue(fragment0: tuple, fragment1: tuple, descriptor: Uint64,
+                       n: cutlass.Constexpr,
+                       *, loc=None, ip=None):
+    """Issue independent K32 banks; callers must wait before consuming either.
+
+    Keep A source registers unchanged until the paired wait has completed.
+    """
+    count = n
+    out0 = ','.join('$' + str(i) for i in range(n // 2))
+    out1 = ','.join('$' + str(n // 2 + i) for i in range(n // 2))
+    in0 = ','.join('$' + str(count + i) for i in range(4))
+    in1 = ','.join('$' + str(count + 4 + i) for i in range(4))
+    body = '{ .reg .b64 b; '
+    body += (f'mov.b64 b, ${count + 8}; wgmma.fence.sync.aligned; '
+             f'wgmma.mma_async.sync.aligned.m64n{n}k32.f32.e4m3.e4m3 '
+             f'{{{out0}}}, {{{in0}}}, b, 0, 1, 1; '
+             'add.u64 b, b, 2; '
+             f'wgmma.mma_async.sync.aligned.m64n{n}k32.f32.e4m3.e4m3 '
+             f'{{{out1}}}, {{{in1}}}, b, 0, 1, 1; '
+             'wgmma.commit_group.sync.aligned; ')
+    body += '}'
+    types = ['f32'] * count
+    result = llvm.inline_asm(
+        ir.Type.parse('!llvm.struct<(' + ','.join(types) + ')>'),
+        [*(x.ir_value() for x in (*fragment0, *fragment1)), descriptor.ir_value()], body,
+        ','.join(['=f'] * count + ['r'] * 8 + ['l', '~{memory}']),
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+    parts = tuple(Float32(llvm.extractvalue(T.f32(), result, [i])) for i in range(count))
+    return parts

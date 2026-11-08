@@ -42,8 +42,8 @@ class SM90GCBufferLayout:
             cursor += size
         local = experts // ranks
         rows = ranks * capacity
-        # epoch, input_ready, input_tokens, task_queue, finalize_count,
-        # compute_done, finalized; all epochs monotonically increase.
+        # Header contains the uint32 epoch and per-call publication/counter state.
+        # Epoch equality checks remain valid across modulo-2**32 wraparound.
         reserve('header', (32,), 'int32', 4)
         reserve('peer_table', (ranks,), 'int64', 8)
         reserve('expert_ready', (local,), 'int32', 4)
@@ -93,12 +93,17 @@ class SharedStorageLayout:
 
 @lru_cache(maxsize=32)
 def get_role_shared_layout(tile_m: int, warp_specialized: bool,
-                           routed_n_factor: int) -> SharedStorageLayout:
+                           routed_n_factor: int, stage_count_override: int = 0) -> SharedStorageLayout:
     routed_x = 17408 * routed_n_factor
     stage_m = 8 if routed_n_factor == 2 else (tile_m if warp_specialized else 64)
     sf_stage = routed_x + stage_m * 128
     stage = align(sf_stage + stage_m * 4, 1024)
     stages = 5 if tile_m == 64 else (3 if tile_m == 32 else 4)
+    if stage_count_override:
+        if not (stage_count_override == 6 and tile_m == 64
+                and warp_specialized and routed_n_factor == 1):
+            raise ValueError('stage override requires the routed M64 pipeline')
+        stages = stage_count_override
     full = stages * stage
     empty = full + stages * 8
     task_full = empty + stages * 8

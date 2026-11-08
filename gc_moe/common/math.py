@@ -10,6 +10,17 @@ from cutlass._mlir.dialects import llvm
 
 
 @dsl_user_op
+def preweight_routed_sf(value: Float32, secondary: Float32, *, loc=None, ip=None) -> Float32:
+    """Preserve both FP32 RN boundaries: (value *64), then *secondary."""
+    product = llvm.inline_asm(
+        T.f32(), [value.ir_value(loc=loc, ip=ip), secondary.ir_value(loc=loc, ip=ip)],
+        '{ .reg .f32 original; mul.rn.f32 original, $1, 0f42800000; '
+        'mul.rn.f32 $0, original, $2; }', '=f,f,f',
+        has_side_effects=False, asm_dialect=llvm.AsmDialect.AD_ATT)
+    return Float32(product)
+
+
+@dsl_user_op
 def round_bf16_f32(value: Float32, *, loc=None, ip=None) -> Float32:
     rounded = llvm.inline_asm(
         T.f32(), [value.ir_value(loc=loc, ip=ip)],

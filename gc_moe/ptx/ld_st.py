@@ -344,6 +344,19 @@ def copy_global_16(dst: Uint64, src: Uint64, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def copy_global_2x16(dst: Uint64, src: Uint64, *, loc=None, ip=None):
+    # Two contiguous warp panels, separated by32 vectors, before either store.
+    llvm.inline_asm(None, [dst.ir_value(), src.ir_value()],
+                    '{ .reg .b32 a,b,c,d,e,f,g,h; '
+                    'ld.global.v4.u32 {a,b,c,d}, [$1]; '
+                    'ld.global.v4.u32 {e,f,g,h}, [$1+512]; '
+                    'st.global.v4.u32 [$0], {a,b,c,d}; '
+                    'st.global.v4.u32 [$0+512], {e,f,g,h}; }',
+                    'l,l,~{memory}', has_side_effects=True,
+                    asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
 def load_shared_8(ptr: cute.Pointer, paired: cutlass.Constexpr,
                    *, loc=None, ip=None):
     offset = 512 if paired else 16
