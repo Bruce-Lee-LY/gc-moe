@@ -34,6 +34,45 @@ def mma_mxf8f6f4_2cta(desc_a: Uint64, desc_b: Uint64,
 
 
 @dsl_user_op
+def mma_mxf8f6f4_k128_2cta(desc_a: Uint64, desc_b: Uint64,
+                          accum_tmem: Uint32, first_accumulate: Uint32,
+                          instr0: Uint32, instr1: Uint32,
+                          instr2: Uint32, instr3: Uint32,
+                          sfa_tmem: Uint32, sfb_tmem: Uint32,
+                          *, loc=None, ip=None) -> None:
+    """Same four ordered K32 MMAs; reuse two local descriptor registers.
+
+    Each original K128 stage descriptor starts on a 1024B boundary. Its
+    encoded low-14-bit start is 64-unit aligned, so +2/+4/+6 cannot carry
+    into reserved/layout bits. No asynchronous memory pointer is mutated.
+    """
+    operands = [accum_tmem, desc_a, desc_b, instr0, instr1,
+                instr2, instr3, first_accumulate, sfa_tmem, sfb_tmem]
+    llvm.inline_asm(
+        None, [x.ir_value(loc=loc, ip=ip) for x in operands],
+        '{ .reg .pred p; .reg .b64 mma_desc_a, mma_desc_b; '
+        'mov.b64 mma_desc_a, $1; mov.b64 mma_desc_b, $2; '
+        'setp.ne.b32 p, $7, 0; '
+        'tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale '
+        '[$0], mma_desc_a, mma_desc_b, $3, [$8], [$9], p; '
+        'add.u64 mma_desc_a, mma_desc_a, 2; '
+        'add.u64 mma_desc_b, mma_desc_b, 2; '
+        'setp.ne.b32 p, 1, 0; '
+        'tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale '
+        '[$0], mma_desc_a, mma_desc_b, $4, [$8], [$9], p; '
+        'add.u64 mma_desc_a, mma_desc_a, 2; '
+        'add.u64 mma_desc_b, mma_desc_b, 2; '
+        'tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale '
+        '[$0], mma_desc_a, mma_desc_b, $5, [$8], [$9], p; '
+        'add.u64 mma_desc_a, mma_desc_a, 2; '
+        'add.u64 mma_desc_b, mma_desc_b, 2; '
+        'tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale '
+        '[$0], mma_desc_a, mma_desc_b, $6, [$8], [$9], p; }',
+        'r,l,l,r,r,r,r,r,r,r', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
 def utccp_sf_4x32_2cta(smem_desc: Uint64, tmem_col: Uint32,
                        *, loc=None, ip=None) -> None:
     """Copy 128 packed-int32 UE8M0 elements (512 bytes) to TMEM."""

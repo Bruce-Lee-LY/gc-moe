@@ -10,13 +10,14 @@ experts (SE), with FP8 activations, packed FP4 routed weights, FP8 shared
 weights and BF16 outputs.
 
 GPU kernels are JIT compiled on first use. Installation builds a Python wheel;
-it does not compile CUDA kernels. The current package version is `0.4.2`.
+it does not compile CUDA kernels. The current package version is `0.5.0`.
 
 ## Performance
 
 Decode latency comparing GC MoE with Mega MoE using CUDA Graph replay on eight
-GPUs. Each point uses 1–256 tokens per rank; total tokens equal eight times the
-per-rank count. The figures use the measurements recorded in the linked reports.
+or 32 GPUs. Each point uses 1–256 tokens per rank; total tokens equal eight or
+32 times the per-rank count. The figures use the measurements recorded in the
+linked reports.
 
 ### Hopper
 
@@ -54,9 +55,11 @@ DSV4.1-Flash on eight NVIDIA L20Z (H100) GPUs.
 
 ### Blackwell
 
-GLM5.2 and DSV4.1-Flash on eight NVIDIA B300 GPUs.
+#### B300 / L20D
 
-#### Routed experts (non-SE)
+GLM5.2 and DSV4.1-Flash on eight NVIDIA L20D (B300) GPUs.
+
+##### Routed experts (non-SE)
 
 ![GLM5.2 non-SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/b300_glm52_gc_moe.png)
 
@@ -64,7 +67,7 @@ GLM5.2 and DSV4.1-Flash on eight NVIDIA B300 GPUs.
 
 [Full B300 non-SE accuracy and performance data](docs/b300_gc_moe.md).
 
-#### Fused shared experts (SE)
+##### Fused shared experts (SE)
 
 ![GLM5.2 fused SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/b300_glm52_gc_moe_se.png)
 
@@ -72,13 +75,34 @@ GLM5.2 and DSV4.1-Flash on eight NVIDIA B300 GPUs.
 
 [Full B300 SE accuracy and performance data](docs/b300_gc_moe_se.md).
 
+#### GB200 / L20A
+
+GLM5.2 and DSV4.1-Flash on 32 NVIDIA L20A (GB200) GPUs.
+
+##### Routed experts (non-SE)
+
+![GLM5.2 non-SE: GC MoE versus Mega MoE latency and speedup on 32 GB200 GPUs](docs/gb200_glm52_gc_moe.png)
+
+![DSV4.1-Flash non-SE: GC MoE versus Mega MoE latency and speedup on 32 GB200 GPUs](docs/gb200_dsv41_flash_gc_moe.png)
+
+[Full GB200 non-SE accuracy and performance data](docs/gb200_gc_moe.md).
+
+##### Fused shared experts (SE)
+
+![GLM5.2 fused SE: GC MoE versus Mega MoE latency and speedup on 32 GB200 GPUs](docs/gb200_glm52_gc_moe_se.png)
+
+![DSV4.1-Flash fused SE: GC MoE versus Mega MoE latency and speedup on 32 GB200 GPUs](docs/gb200_dsv41_flash_gc_moe_se.png)
+
+[Full GB200 SE accuracy and performance data](docs/gb200_gc_moe_se.md).
+
 ## Quick start
 
 ### Requirements
 
 - Linux and an NVIDIA Hopper or Blackwell GPU. The Hopper SM90 path uses
-  `sm_90a` kernels and is validated on H20 and H100. The Blackwell path is validated
-  on B300 (compute capability 10.3) and selects `sm_103f`.
+  `sm_90a` kernels and is validated on H20 and H100. The Blackwell path supports
+  compute capability 10.0 and 10.3 and selects `sm_100f` or `sm_103f`
+  accordingly.
 - A CUDA driver supporting Green Contexts. Multi-GPU execution also requires
   peer-accessible GPUs and PyTorch symmetric memory, with one process per GPU.
 - Python 3.10 or later.
@@ -123,7 +147,7 @@ assembler compatible with the generated PTX.
 For editable development, use `python -m pip install -e .` instead of installing
 the wheel. Wheel versions include the Git revision for a clean tree, or
 `+local` for a dirty tree or a source copy without Git metadata. Set
-`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.4.2` version.
+`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.5.0` version.
 
 ## Interfaces
 

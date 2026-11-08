@@ -12,6 +12,7 @@ from cutlass._mlir.dialects import arith, llvm
 
 from ..ptx.tcgen05 import (
     mma_mxf8f6f4_2cta,
+    mma_mxf8f6f4_k128_2cta,
     tcgen05_after_thread_sync,
     tcgen05_commit_2cta,
     utccp_sf_4x32_2cta,
@@ -162,7 +163,8 @@ def issue_mixed_k128(weight_desc_start: Uint32, activation_desc_start: Uint32,
                      last_k_block: Uint32, is_shared: Uint32,
                      sf_block_m: cutlass.Constexpr,
                      shared_weight_gran_k: cutlass.Constexpr,
-                     has_shared: cutlass.Constexpr) -> None:
+                     has_shared: cutlass.Constexpr,
+                     reuse_descriptors: cutlass.Constexpr) -> None:
     """Issue the reference swapped-A/B 2CTA mixed MMA for one K128 stage.
 
     The caller has already completed the stage's TMA G2S and mbarrier wait.
@@ -206,6 +208,7 @@ def issue_mixed_k128(weight_desc_start: Uint32, activation_desc_start: Uint32,
         # FP4 16U4_ALIGN16B TMA expands sixteen nibbles into an 8-byte
         # payload and 8-byte padding. K32 advances each descriptor low by
         # two 16-byte address units. Keep every mutation in the elected lane.
+        runtime_instr_descs = ()
         for k in cutlass.range_constexpr(4):
             weight_sf_id = Uint32(k)
             if cutlass.const_expr(has_shared and shared_weight_gran_k == 128):
@@ -214,15 +217,27 @@ def issue_mixed_k128(weight_desc_start: Uint32, activation_desc_start: Uint32,
             runtime_instr_desc = (
                 instr_desc_base | (weight_sf_id << Uint32(29)) |
                 Uint32(16 * k))
-            weight_desc = data_desc_hi | Uint64(
-                weight_start + Uint32(2 * k))
-            activation_desc = data_desc_hi | Uint64(
-                activation_start + Uint32(2 * k))
-            accumulate = (Uint32(1) if k > 0 else
-                          Uint32(1) if k_block > Uint32(0) else Uint32(0))
-            mma_mxf8f6f4_2cta(
-                weight_desc, activation_desc, accum_tmem, accumulate,
-                runtime_instr_desc, weight_sf_tmem, activation_sf_tmem)
+            runtime_instr_descs += (runtime_instr_desc,)
+        if cutlass.const_expr(reuse_descriptors):
+            weight_desc = data_desc_hi | Uint64(weight_start)
+            activation_desc = data_desc_hi | Uint64(activation_start)
+            first_accumulate = Uint32(1) if k_block > Uint32(0) else Uint32(0)
+            mma_mxf8f6f4_k128_2cta(
+                weight_desc, activation_desc, accum_tmem, first_accumulate,
+                runtime_instr_descs[0], runtime_instr_descs[1],
+                runtime_instr_descs[2], runtime_instr_descs[3],
+                weight_sf_tmem, activation_sf_tmem)
+        else:
+            for k in cutlass.range_constexpr(4):
+                weight_desc = data_desc_hi | Uint64(
+                    weight_start + Uint32(2 * k))
+                activation_desc = data_desc_hi | Uint64(
+                    activation_start + Uint32(2 * k))
+                accumulate = (Uint32(1) if k > 0 else
+                              Uint32(1) if k_block > Uint32(0) else Uint32(0))
+                mma_mxf8f6f4_2cta(
+                    weight_desc, activation_desc, accum_tmem, accumulate,
+                    runtime_instr_descs[k], weight_sf_tmem, activation_sf_tmem)
         tcgen05_commit_2cta(stage_empty_bar, Uint16(3))
         if last_k_block != Uint32(0):
             tcgen05_commit_2cta(accum_full_bar, Uint16(3))

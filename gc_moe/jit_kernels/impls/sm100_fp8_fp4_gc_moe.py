@@ -19,6 +19,7 @@ import torch
 from cuda.bindings import driver as cu
 
 from ...comm.gc_barrier import DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS
+from ...common.tma_copy import use_small_tile_path
 from ...impls.sm100_fp8_fp4_gc_moe import GCMoERoleKernel
 from ...layout.gc_moe import (
     MAX_RANKS,
@@ -52,7 +53,7 @@ from .runtime_utils import (
 
 @dataclass(frozen=True)
 class GCTmaPlan:
-    """The 18 ordered tensor maps passed by value to role2."""
+    """Original eighteen maps, optionally followed by four fused-SE prefix maps."""
 
     l1_acts: TmaDescriptorSpec
     l1_acts_sf: TmaDescriptorSpec
@@ -73,8 +74,19 @@ class GCTmaPlan:
     shared_l2_weights: TmaDescriptorSpec
     shared_l2_weights_sf: TmaDescriptorSpec
 
+    l1_acts_16: TmaDescriptorSpec | None = None
+    l2_acts_16: TmaDescriptorSpec | None = None
+    l1_acts_24: TmaDescriptorSpec | None = None
+    l2_acts_24: TmaDescriptorSpec | None = None
+
     def ordered(self) -> tuple[TmaDescriptorSpec, ...]:
-        return tuple(getattr(self, name) for name in self.__dataclass_fields__)
+        values = tuple(getattr(self, name) for name in self.__dataclass_fields__)
+        optional = values[18:]
+        if any(value is None for value in optional):
+            if not all(value is None for value in optional):
+                raise ValueError('prefix maps must be all absent or all present')
+            return values[:18]
+        return values
 
 
 def build_gc_tma_plan(config, sym_buffer, l1_weights, l2_weights,
@@ -143,7 +155,13 @@ def build_gc_tma_plan(config, sym_buffer, l1_weights, l2_weights,
     else:
         # Supply routed maps in unused shared positions.
         shared = routed
-    return GCTmaPlan(*routed, *shared)
+    narrow = tuple(acts(t, inner, ring, bk, min(rows, config.load_m),
+                        config.swizzle_acts)
+                   for rows in (16, 24)
+                   for t, inner in ((sym_buffer.l1_acts, h),
+                                    (sym_buffer.l2_acts, i))) \
+        if use_small_tile_path(shared_count, config.load_m * 2) else ()
+    return GCTmaPlan(*routed, *shared, *narrow)
 
 def _get_gc_moe_nvlink_barrier_timeout_secs() -> int:
     """Read the positive signed-decimal int32 barrier timeout."""
@@ -160,6 +178,16 @@ def _get_gc_moe_nvlink_barrier_timeout_secs() -> int:
     if not 0 < seconds <= 2_147_483_647:
         raise ValueError(f"Invalid {name}: {value}")
     return seconds
+
+
+def _routed_weight_linger(config, num_topk: int) -> bool:
+    """Linger when the uniform-routing estimate gives an expert two or more m-blocks.
+
+    The gate compares average tokens per expert against the tile, so skewed
+    routing can leave some experts below one m-block and others above it.
+    """
+    tokens_per_expert = ceil_div(config.tokens * num_topk, config.local_experts)
+    return tokens_per_expert >= 2 * config.block_m
 
 
 def _compiler_identity(target: str) -> CompilerIdentity:
@@ -260,7 +288,7 @@ def _rewrite_value_formal(ptx: str, ordinal: int, value_bytes: int,
         ptx, count=1)
     # The reference keeps by-value TensorMap addresses in param space across
     # task-phase selection. The peer value is accessed through a generic
-    # address, so only the eighteen role2 maps use the raw form here.
+    # address, so only the role2 maps use the raw form here.
     address_op = 'mov.b64' if raw_param_address else 'cvta.param::entry.u64'
     ptx = load.sub(
         lambda m: f"{m.group(1)}{address_op} {m.group(2)}, {name};",
@@ -268,7 +296,7 @@ def _rewrite_value_formal(ptx: str, ordinal: int, value_bytes: int,
     return ptx
 
 
-def _convert_role2_map_uses(ptx: str) -> str:
+def _convert_role2_map_uses(ptx: str, map_count: int) -> str:
     """Convert early prefetches and W1 output stores at PTX instruction uses.
 
     CuTe exposes map parameters as pointers. After the by-value formal rewrite
@@ -281,7 +309,7 @@ def _convert_role2_map_uses(ptx: str) -> str:
     Fail closed on changes to CuTe's generated descriptor instruction forms.
     This bridge deliberately does not depend on PTX register IDs or labels.
     """
-    map_ordinals = (4, *range(7, 24))
+    map_ordinals = (4, *range(7, map_count + 6))
     raw_map_regs = []
     for ordinal in map_ordinals:
         raw = re.findall(
@@ -290,7 +318,7 @@ def _convert_role2_map_uses(ptx: str) -> str:
         if len(raw) != 1:
             raise RuntimeError(f"role2 raw TensorMap {ordinal} changed")
         raw_map_regs.append(raw[0])
-    if len(set(raw_map_regs)) != 18:
+    if len(set(raw_map_regs)) != map_count:
         raise RuntimeError('role2 TensorMap address registers alias')
 
     register_decl = re.compile(
@@ -310,7 +338,7 @@ def _convert_role2_map_uses(ptx: str) -> str:
         r"(?m)^([ \t]*cp\.async\.bulk\.tensor\.2d\.global\.shared"
         r"[^\n]*?\[)(%rd[0-9]+)(,[ \t]*\{[^\n]+)$")
     prefetch_regs = [m.group(2) for m in prefetch.finditer(ptx)]
-    if len(prefetch_regs) != 18 or set(prefetch_regs) != set(raw_map_regs):
+    if len(prefetch_regs) != map_count or set(prefetch_regs) != set(raw_map_regs):
         raise RuntimeError('role2 TensorMap prefetch set changed')
     tensor_op_count = len(re.findall(
         r"(?m)^[ \t]*cp\.async\.bulk\.tensor\.", ptx))
@@ -345,15 +373,15 @@ def _convert_role2_map_uses(ptx: str) -> str:
     ptx = register_decl.sub(
         lambda m: m.group(1) + str(next_reg) + m.group(3), ptx, count=1)
     if len(re.findall(r"\bcvta\.param\.u64\b", ptx)) != \
-            source_cvta_count + 18 + s2g_count:
+            source_cvta_count + map_count + s2g_count:
         raise RuntimeError('role2 TensorMap conversion count changed')
     return ptx
 
 
 def _device_compile_target(device: torch.device) -> str:
     major, minor = torch.cuda.get_device_capability(device)
-    if (major, minor) != (10, 3):
-        raise NotImplementedError('current three-role device path requires compute capability 10.3')
+    if (major, minor) not in ((10, 0), (10, 3)):
+        raise NotImplementedError('current three-role device path requires compute capability 10.0 or 10.3')
     return device_compile_target((major, minor))
 
 
@@ -376,16 +404,16 @@ def _entry_formals(ptx: str) -> list[str]:
     return lines
 
 
-def _order_role2_value_formals(ptx: str) -> str:
-    """Keep ordinary scalars ahead of the eighteen contiguous value maps."""
+def _order_role2_value_formals(ptx: str, map_count: int) -> str:
+    """Keep ordinary scalars ahead of the configuration-selected value maps."""
     formals = _entry_formals(ptx)
-    if len(formals) != 24:
+    if len(formals) != map_count + 6:
         raise RuntimeError('role2 value-formal count changed')
     for index, line in enumerate(formals):
         if re.search(r"\b[A-Za-z0-9_.$]+_param_" + str(index) +
                      r"(?:\[[0-9]+\])?,?[ \t]*$", line) is None:
             raise RuntimeError('role2 value-formal order changed')
-    order = (0, 1, 2, 3, 5, 6, 4, *range(7, 24))
+    order = (0, 1, 2, 3, 5, 6, 4, *range(7, map_count + 6))
     ordered = [formals[i].rstrip().rstrip(',') for i in order]
     original = '\n'.join(formals)
     if ptx.count(original) != 1:
@@ -395,14 +423,16 @@ def _order_role2_value_formals(ptx: str) -> str:
 
 def _assemble_role_value_params(ptx: str, role: int,
                                 dump_dir: str, *, target: str,
+                                use_small_tile_path: bool,
                                 ptxas_options: tuple[str, ...] = PTXAS_OPTIONS) -> tuple[str, bytes, str]:
     """Build each role with relative peer value, plus role2's value maps."""
+    map_count = 22 if use_small_tile_path else 18
     ptx = _clean_cute_ptx(ptx)
     if ptx_target(ptx) != target:
         raise RuntimeError('CuTe generated a different device target')
     expected = {1: ('ptr', 'ptr', 'u32', 'u32', 'f32', 'f32'),
                 2: (('ptr', 'ptr', 'u32', 'u32', 'ptr', 'f32', 'f32') +
-                    ('ptr',) * 17),
+                    ('ptr',) * (map_count - 1)),
                 3: ('ptr', 'ptr', 'u32', 'u32', 'ptr', 'ptr', 'ptr',
                     'f32', 'f32')}[role]
     formals = _entry_formals(ptx)
@@ -418,18 +448,19 @@ def _assemble_role_value_params(ptx: str, role: int,
         raise RuntimeError(f"role{role} peer parameter load path is missing")
     ptx = _rewrite_value_formal(ptx, 1, 592, 8)
     if role == 2:
-        for map_ordinal in (4, *range(7, 24)):
+        for map_ordinal in (4, *range(7, map_count + 6)):
             ptx = _rewrite_value_formal(
                 ptx, map_ordinal, 128, 128, raw_param_address=True)
-        ptx = _convert_role2_map_uses(ptx)
-        ptx = _order_role2_value_formals(ptx)
+        ptx = _convert_role2_map_uses(ptx, map_count)
+        ptx = _order_role2_value_formals(ptx, map_count)
     return assemble_ptx(ptx, dump_dir, f"role{role}_value_params",
                                 target=target, ptxas_options=ptxas_options)
 
 
 def _capture_key(config, sym_buffer, green_context, y, l1_weights, l2_weights,
                  shared_l1_weights, shared_l2_weights, stats,
-                 nvlink_timeout_secs: int, role_resources: tuple,
+                 nvlink_timeout_secs: int, routed_weight_linger: bool,
+                 role_resources: tuple,
                  combine_resources: tuple, compiler_identity: CompilerIdentity) -> tuple:
     status, cuda_context = cu.cuCtxGetCurrent()
     if status != cu.CUresult.CUDA_SUCCESS:
@@ -448,6 +479,7 @@ def _capture_key(config, sym_buffer, green_context, y, l1_weights, l2_weights,
             config.shared_weight_gran_k, config.clamp != inf,
             config.fast_math, sym_buffer.num_topk,
             nvlink_timeout_secs,
+            routed_weight_linger,
             stats is not None,
             role_resources, combine_resources,
             layout.nbytes, layout.ring_tokens, layout.sf_ring_tokens,
@@ -524,6 +556,10 @@ def prepare_role_binaries(config, y: torch.Tensor,
                           context=None):
     """Encode live maps once per pointer set and compile each role once/shape."""
     _check_supported(config, sym_buffer)
+    small_tile_path = use_small_tile_path(config.shared_experts, config.block_m)
+    map_count = 22 if small_tile_path else 18
+    if config.shared_experts != sym_buffer.num_shared_experts:
+        raise ValueError('configuration and symmetric-buffer shared experts disagree')
     if context is None:
         context = get_context()
     device = sym_buffer.buffer.device
@@ -540,9 +576,11 @@ def prepare_role_binaries(config, y: torch.Tensor,
     compiler_target = _device_compile_target(sym_buffer.buffer.device)
     compiler_identity = _compiler_identity(compiler_target)
     nvlink_timeout_secs = _get_gc_moe_nvlink_barrier_timeout_secs()
+    routed_weight_linger = _routed_weight_linger(config, sym_buffer.num_topk)
     role_configs = tuple(get_role_config(role, config.block_m,
                                          sym_buffer.num_experts,
-                                         config.hidden)
+                                         config.hidden,
+                                         local_experts=config.local_experts)
                          for role in (1, 2, 3))
     role_resources = tuple((item.num_stages, item.dynamic_smem, item.threads)
                            for item in role_configs)
@@ -552,13 +590,16 @@ def prepare_role_binaries(config, y: torch.Tensor,
     if role3_layout.field_end > role3_config.dynamic_smem:
         raise ValueError('role3 shared storage exceeds its launch allocation')
     combine_geometry = get_combine_geometry(
-        config.hidden, combine_reusable_bytes, role3_config.dynamic_smem)
-    combine_chunks, combine_chunk_bytes, _, _ = combine_geometry
+        config.hidden, sym_buffer.num_topk +
+        (1 if sym_buffer.num_shared_experts else 0),
+        combine_reusable_bytes, role3_config.dynamic_smem)
+    combine_chunks, combine_chunk_bytes, _ = combine_geometry
     combine_resources = (combine_reusable_bytes, combine_chunks,
                          combine_chunk_bytes)
     key = _capture_key(config, sym_buffer, context, y, l1_weights, l2_weights,
                        shared_l1_weights, shared_l2_weights, stats,
-                       nvlink_timeout_secs, role_resources, combine_resources,
+                       nvlink_timeout_secs, routed_weight_linger,
+                       role_resources, combine_resources,
                        compiler_identity)
     prepared = _CACHE.get(key)
     if prepared is None:
@@ -577,8 +618,8 @@ def prepare_role_binaries(config, y: torch.Tensor,
                     if len(payload) != 128:
                         raise RuntimeError(f"TensorMap {i} is not 128 bytes")
                     payloads.append(payload)
-                if len(payloads) != 18:
-                    raise RuntimeError('GC role2 needs exactly 18 ordered TensorMaps')
+                if len(payloads) != map_count:
+                    raise RuntimeError('GC role2 TensorMap count disagrees with its configuration')
                 maps = b"".join(payloads)
                 role_kernels = []
                 for index, role in enumerate((1, 2, 3)):
@@ -599,6 +640,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         fast_math=config.fast_math,
                         has_stats=stats is not None,
                         nvlink_timeout_secs=nvlink_timeout_secs,
+                        routed_weight_linger=routed_weight_linger,
                         role_config=role_configs[index],
                         combine_geometry=combine_geometry if role == 3 else None)
                     role_kernels.append(role_kernel)
@@ -612,7 +654,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                     # TensorMap pointer load becomes a host-supplied value param.
                     map_storage = sym_buffer.buffer.view(torch.uint8).flatten()
                     map_views = tuple(from_dlpack(map_storage[i * 128:(i + 1) * 128])
-                                      for i in range(18))
+                                      for i in range(map_count))
                     role3_map_view = from_dlpack(map_storage[:2304])
                     y_view = from_dlpack(y)
                     stats_view = from_dlpack(stats) if stats is not None else signal_view
@@ -635,6 +677,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                             role_kernel, compile_args, compiler_identity,
                             lambda ptx, dump_dir: _assemble_role_value_params(
                                 ptx, role, dump_dir, target=compiler_target,
+                                use_small_tile_path=small_tile_path,
                                 ptxas_options=compiler_identity.ptxas_options))
                         role_config = role_configs[index]
                         compiled_binaries.append(RoleBinary(
@@ -651,6 +694,8 @@ def prepare_role_binaries(config, y: torch.Tensor,
                 if _compiler_identity(compiler_target) != compiler_identity:
                     raise RuntimeError('compiler identity changed while preparing role binaries')
                 _CACHE[key] = prepared
+    if len(prepared.maps) != map_count * 128:
+        raise RuntimeError('cached TensorMap payload disagrees with its configuration')
     signal_arg = ctypes.c_void_p(sym_buffer.buffer.data_ptr())
     peer_arg = _sym_buffer_value(sym_buffer)
     rank_arg = ctypes.c_uint32(sym_buffer.rank_idx)
@@ -658,9 +703,9 @@ def prepare_role_binaries(config, y: torch.Tensor,
     clamp_arg = ctypes.c_float(config.clamp)
     alpha_arg = ctypes.c_float(config.alpha)
     map_args = tuple((ctypes.c_uint8 * 128).from_buffer_copy(
-        prepared.maps[i * 128:(i + 1) * 128]) for i in range(18))
+        prepared.maps[i * 128:(i + 1) * 128]) for i in range(map_count))
     # Role3 retains its original 8-byte unused CuTe pointer formal. Role2
-    # carries the eighteen separate 128-byte descriptor values.
+    # carries the configuration-selected 128-byte descriptor values.
     role3_map_arg = ctypes.c_void_p(sym_buffer.buffer.data_ptr())
     y_arg = ctypes.c_void_p(y.data_ptr())
     stats_arg = ctypes.c_void_p(stats.data_ptr() if stats is not None else

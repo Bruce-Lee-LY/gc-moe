@@ -45,6 +45,22 @@ def get_block_m_for_gc_moe(num_ranks: int, num_experts: int,
             block_m = candidate
             if _f32(num_blocks * candidate) >= covered:
                 break
+        # The legacy count above is derived from the 240-row tile, so a
+        # mid-sized estimate can leave the last block mostly padding.  Trade
+        # at most one extra m-block of weight traffic for at least a full
+        # tile of padded MMA rows, and only for tiles that keep the 24-warp
+        # loader (block_m >= 96).
+        legacy_rows = _f32(num_blocks * block_m)
+        for candidate in (96, 128, 192):
+            if candidate >= block_m:
+                break
+            candidate_blocks = ceil(_f32(covered / candidate))
+            if candidate_blocks - num_blocks > 1:
+                continue
+            rows = _f32(candidate_blocks * candidate)
+            if _f32(rows + candidate) <= legacy_rows:
+                block_m = candidate
+                break
     return block_m
 
 
@@ -111,7 +127,7 @@ class RoleConfig:
 
 @lru_cache(maxsize=256)
 def get_role_config(role: int, block_m: int, num_experts: int,
-                    hidden: int) -> RoleConfig:
+                    hidden: int, *, local_experts: int) -> RoleConfig:
     if role not in (1, 2, 3) or block_m not in CANDIDATE_BLOCK_M or block_m % 16:
         raise ValueError('invalid GC role/block M')
     pull_bytes = hidden
@@ -121,7 +137,9 @@ def get_role_config(role: int, block_m: int, num_experts: int,
         pull_bytes //= 2
     store1 = 8 if block_m <= 16 else 16 if block_m <= 96 else 32 if block_m <= 192 else 24
     store2 = 8 if block_m == 240 else store1
-    routing_warps = 12 if block_m >= 96 else 8
+    # Large local expert tables need 96 registers per dispatch thread.
+    # Keep that path within the per-SM register budget.
+    routing_warps = (24 if local_experts <= 64 else 12) if block_m >= 96 else 8
     dispatch_threads = routing_warps * 32 if role == 1 else 128
     dispatch_warps = dispatch_threads // 32
     smem_cd = align(max(2 * store1 * 64 * 2, 2 * store2 * 128 * 2), 1024)
@@ -131,7 +149,7 @@ def get_role_config(role: int, block_m: int, num_experts: int,
     # dispatch warps. Its JIT separately widens role1 and fixes its stages=2.
     budget_dispatch = (1024 if role == 2 else
                        align(num_experts * 4, 1024) + align(4 * pull_bytes, 1024))
-    budget_barriers = (4 + 4 + 16 + 4) * 8
+    budget_barriers = (4 + 4 + 8 + 4) * 8
     budget_fixed = budget_dispatch + smem_cd + smem_amax + budget_barriers + 2 * 32 + 4
     budget_stages = (SMEM_CAPACITY - budget_fixed) // stage
     if budget_stages < 2:
@@ -142,15 +160,20 @@ def get_role_config(role: int, block_m: int, num_experts: int,
     # count distinct from the launch allocation retained by the reference.
     actual_dispatch = (1024 if role == 2 else align(num_experts * 4, 1024) +
                        align(dispatch_warps * pull_bytes, 1024))
-    actual_barriers = (dispatch_warps + 4 + 16 + 4) * 8
+    actual_barriers = (dispatch_warps + 4 + 8 + 4) * 8
     fixed = actual_dispatch + smem_cd + smem_amax + actual_barriers + 2 * 32 + 4
-    if fixed + stages * stage > dynamic_smem:
+    if role != 1 and fixed + stages * stage > dynamic_smem:
         raise ValueError('role shared-storage footprint exceeds launch allocation')
     threads = dispatch_threads if role == 1 else 384
     shared_layout = get_role_shared_layout(
         role, block_m, num_experts, pull_bytes, stages,
         store_m_l1=store1, store_m_l2=store2, dispatch_warps=dispatch_warps,
         block_n=BLOCK_N, block_k=BLOCK_K, sf_block_m=align(block_m, 128))
+    if role == 1:
+        # The dispatch layout has no MMA planes; use its actual footprint.
+        dynamic_smem = shared_layout.field_end
+        if dynamic_smem > SMEM_CAPACITY:
+            raise ValueError('role1 pull region exceeds shared memory')
     if shared_layout.field_end > dynamic_smem:
         raise ValueError('role shared storage exceeds its launch allocation')
     return RoleConfig(role, block_m, BLOCK_N, BLOCK_K, store1, store2,
@@ -159,24 +182,29 @@ def get_role_config(role: int, block_m: int, num_experts: int,
                       128, 128, 64, routing_warps, pull_bytes, shared_layout)
 
 
-def get_combine_geometry(hidden: int, reusable_bytes: int,
-                         launch_bytes: int) -> tuple[int, int, int, int]:
-    """Reusable-prefix and per-warp combine scratch geometry."""
-    if hidden <= 0 or reusable_bytes <= 0 or launch_bytes <= 0:
+def get_combine_geometry(hidden: int, slots: int, reusable_bytes: int,
+                         launch_bytes: int) -> tuple[int, int, int]:
+    """Reusable-prefix and per-warp combine scratch geometry.
+
+    A chunk fetches every routed slot at once, so the scratch holds `slots`
+    fetch planes per warp; the output plane aliases the first fetch plane.
+    """
+    if hidden <= 0 or slots <= 0 or reusable_bytes <= 0 or launch_bytes <= 0:
         raise ValueError('invalid role3 combine resources')
-    chunks = 1 if 48 * hidden <= reusable_bytes and hidden <= 4096 else 2
-    if hidden % chunks:
-        raise ValueError('role3 hidden must divide into whole chunks')
-    chunk_bytes = 2 * hidden // chunks
-    scratch_bytes = 3 * 8 * chunk_bytes
-    if scratch_bytes > reusable_bytes:
+    # Every chunk needs at least one 16-byte value per lane (512 bytes).
+    # Preserve power-of-two splits when possible, then try other divisors.
+    candidates = sorted(range(1, hidden // 256 + 1),
+                        key=lambda chunks: (bool(chunks & (chunks - 1)), chunks))
+    for chunks in candidates:
+        if hidden % chunks:
+            continue
+        chunk_bytes = 2 * hidden // chunks
+        if chunk_bytes % 512 == 0:
+            scratch_bytes = slots * 8 * chunk_bytes
+            if scratch_bytes <= reusable_bytes:
+                break
+    else:
         raise ValueError('role3 combine scratch exceeds reusable shared memory')
-    if chunk_bytes % 512:
-        raise ValueError('role3 combine chunk needs one 16-byte value per lane')
-    if scratch_bytes + 16 * 8 > launch_bytes:
+    if scratch_bytes + 8 * 8 > launch_bytes:
         raise ValueError('role3 compact combine allocation exceeds launch shared memory')
-    if chunks == 2 and hidden > 4096 and hidden % 1024 == 0:
-        chunks = 4
-        chunk_bytes //= 2
-        scratch_bytes //= 2
-    return chunks, chunk_bytes, scratch_bytes, chunk_bytes // 512
+    return chunks, chunk_bytes, chunk_bytes // 512

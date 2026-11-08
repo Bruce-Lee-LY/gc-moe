@@ -14,6 +14,9 @@ EVICT_NORMAL = 0x1000000000000000
 
 EVICT_FIRST = 0x12F0000000000000
 
+EVICT_LAST = 0x14F0000000000000
+
+
 @dsl_user_op
 def ld_volatile_u32(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint32:
     address = ptr.toint(loc=loc, ip=ip).ir_value()

@@ -28,7 +28,7 @@ def sync_dispatch_threads(participants: cutlass.Constexpr = 0) -> None:
     """Dispatch barrier id 0; zero preserves the existing whole-CTA scope.
 
     The caller must have exactly ``participants`` threads enter each nonzero
-    scope: role3 dispatch uses 128; role1 uses its full 256/384-thread block.
+    scope: role3 dispatch uses 128; role1 uses its routing_warps * 32 threads.
     """
     if cutlass.const_expr(participants == 128):
         sync_aligned(128, 0)

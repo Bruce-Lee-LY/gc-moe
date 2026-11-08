@@ -3,6 +3,8 @@
 # Usage: bash scripts/run.sh [GC_MOE_NUM_GPUS] [both|test|bench] [Python overrides...]
 # Compare Mega MoE and GC MoE operators.
 # Sweep 1..256 tokens per rank by powers of two with CUDA Graph timing.
+# Multi-node runs set GC_MOE_NUM_NODES, GC_MOE_NODE_RANK and GC_MOE_MASTER_ADDR
+# on every node; the positional GPU count is then the world size.
 # Set TMPDIR and GC_MOE_RESULT_DIR within the authorized ASI task directory.
 
 set -euo pipefail
@@ -47,18 +49,33 @@ if [[ ! "$GC_MOE_NUM_GPUS" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
-# One rank per selected GPU. An explicit GPU count takes precedence over GC_MOE_NUM_GPUS.
+# Multi-node launch: GC_MOE_NUM_GPUS is the world size and must divide evenly
+# across nodes. Every node runs this script with its own GC_MOE_NODE_RANK.
+GC_MOE_NUM_NODES=${GC_MOE_NUM_NODES:-1}
+GC_MOE_NODE_RANK=${GC_MOE_NODE_RANK:-0}
+GC_MOE_MASTER_ADDR=${GC_MOE_MASTER_ADDR:-127.0.0.1}
+if [[ ! "$GC_MOE_NUM_NODES" =~ ^[1-9][0-9]*$ ]] || (( GC_MOE_NUM_GPUS % GC_MOE_NUM_NODES != 0 )); then
+    echo "[run.sh] ERROR: GC_MOE_NUM_NODES must be a positive divisor of GC_MOE_NUM_GPUS (got nodes=$GC_MOE_NUM_NODES, gpus=$GC_MOE_NUM_GPUS)" >&2
+    exit 2
+fi
+if (( GC_MOE_NODE_RANK < 0 || GC_MOE_NODE_RANK >= GC_MOE_NUM_NODES )); then
+    echo "[run.sh] ERROR: GC_MOE_NODE_RANK must be in [0, $GC_MOE_NUM_NODES) (got: $GC_MOE_NODE_RANK)" >&2
+    exit 2
+fi
+GC_MOE_LOCAL_GPUS=$(( GC_MOE_NUM_GPUS / GC_MOE_NUM_NODES ))
+
+# One rank per selected GPU on this node. An explicit GPU count takes precedence over GC_MOE_NUM_GPUS.
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     GPU_DEVICES=()
-    for (( gpu=0; gpu<GC_MOE_NUM_GPUS; gpu++ )); do GPU_DEVICES+=("$gpu"); done
+    for (( gpu=0; gpu<GC_MOE_LOCAL_GPUS; gpu++ )); do GPU_DEVICES+=("$gpu"); done
 else
     IFS=',' read -ra GPU_DEVICES <<<"$CUDA_VISIBLE_DEVICES"
-    if (( ${#GPU_DEVICES[@]} < GC_MOE_NUM_GPUS )); then
-        echo "[run.sh] ERROR: fewer visible GPUs than GC_MOE_NUM_GPUS=$GC_MOE_NUM_GPUS" >&2
+    if (( ${#GPU_DEVICES[@]} < GC_MOE_LOCAL_GPUS )); then
+        echo "[run.sh] ERROR: fewer visible GPUs than the per-node rank count $GC_MOE_LOCAL_GPUS" >&2
         exit 2
     fi
 fi
-export CUDA_VISIBLE_DEVICES=$(IFS=,; echo "${GPU_DEVICES[*]:0:GC_MOE_NUM_GPUS}")
+export CUDA_VISIBLE_DEVICES=$(IFS=,; echo "${GPU_DEVICES[*]:0:GC_MOE_LOCAL_GPUS}")
 
 GC_MOE_PYTHON_BIN=${GC_MOE_PYTHON_BIN:-/opt/conda310/bin/python}
 GC_MOE_TEST_SCRIPT=${GC_MOE_TEST_SCRIPT:-tests/test_gc_moe.py}
@@ -258,11 +275,15 @@ run_torchrun() {
     # Args: <label> <script> <port> <extra args ...>
     local label="$1" script="$2" port="$3"; shift 3
     echo "================================================================"
-    echo "[run.sh] $label  (GC_MOE_NUM_GPUS=$GC_MOE_NUM_GPUS, CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES, port=$port)"
+    echo "[run.sh] $label  (world=$GC_MOE_NUM_GPUS, nodes=$GC_MOE_NUM_NODES, node_rank=$GC_MOE_NODE_RANK, CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES, port=$port)"
     echo "================================================================"
     local script_path="$script"
     [[ "$script_path" = /* ]] || script_path="$REPO_ROOT/$script_path"
-    local cmd=("$GC_MOE_PYTHON_BIN" -m torch.distributed.run --nproc_per_node="$GC_MOE_NUM_GPUS" --master_port="$port" "$script_path" "$@")
+    local -a launch=(--nproc_per_node="$GC_MOE_LOCAL_GPUS" --master_port="$port")
+    if (( GC_MOE_NUM_NODES > 1 )); then
+        launch+=(--nnodes="$GC_MOE_NUM_NODES" --node_rank="$GC_MOE_NODE_RANK" --master_addr="$GC_MOE_MASTER_ADDR")
+    fi
+    local cmd=("$GC_MOE_PYTHON_BIN" -m torch.distributed.run "${launch[@]}" "$script_path" "$@")
     wait_gpus_idle
     "${cmd[@]}"
 

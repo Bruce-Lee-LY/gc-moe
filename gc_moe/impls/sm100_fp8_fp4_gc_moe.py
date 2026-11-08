@@ -30,8 +30,9 @@ from ..common.math import (
     ue8m0_fp8_scale_exp,
     warp_group4_max,
 )
-from ..common.tma_copy import load_mixed_k128_tma
+from ..common.tma_copy import load_mixed_k128_tma, use_small_tile_path
 from ..layout.gc_moe import (
+    ACCUM_BARRIER_STAGES,
     GCBufferLayout,
     MAX_RANKS,
     SIGNAL_OFFSETS,
@@ -99,7 +100,6 @@ from ..ptx.utils import (
     sync_aligned,
     sync_unaligned,
     undefined_u32,
-    warp_first_set_bit,
     warp_nth_set_bit,
     warpgroup_reg_alloc,
     warpgroup_reg_dealloc,
@@ -255,7 +255,8 @@ class GCMoERoleKernel:
                  fast_math: bool = True,
                  has_stats: bool = False,
                  nvlink_timeout_secs: int = DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS,
-                 *, role_config, combine_geometry: tuple[int, int, int, int] | None = None):
+                 *, role_config, combine_geometry: tuple[int, int, int] | None = None,
+                 routed_weight_linger: bool = False):
         if role_config.role != role or role_config.block_m != block_m:
             raise ValueError('kernel role/block M differs from its host configuration')
         math_stages = role_config.num_stages
@@ -287,6 +288,7 @@ class GCMoERoleKernel:
         self.fast_math = fast_math
         self.has_stats = has_stats
         self.shared_experts = shared_experts
+        self.use_small_tile_path = use_small_tile_path(shared_experts, block_m)
         self.capacity = capacity
         self.finalize_output = finalize_output
         self.shared_weight_gran_k = shared_weight_gran_k
@@ -298,6 +300,7 @@ class GCMoERoleKernel:
             else EVICT_NORMAL)
         self.math_stages = math_stages
         self.nvlink_timeout_secs = nvlink_timeout_secs
+        self.routed_weight_linger = routed_weight_linger
         # Block configuration and the shared C/D storage union.
         self.store_m_l1 = role_config.store_m_l1
         self.store_m_l2 = role_config.store_m_l2
@@ -313,6 +316,9 @@ class GCMoERoleKernel:
         self.l2_clusters = tile.l2_clusters
         self.l1_full_mask = (1 << tile.l1_n_blocks) - 1
         self.tmem_cols = tile.tmem_cols
+        self.accum_stages = tile.epilogue_stages
+        if self.accum_stages > ACCUM_BARRIER_STAGES:
+            raise ValueError('epilogue stages exceed the reserved accumulator barriers')
         self.sf_block_m = role_config.sf_block_m
         self.sfa_tmem_cols = tile.sfa_tmem_cols
         self.dispatch_warps = role_config.routing_warps
@@ -329,7 +335,7 @@ class GCMoERoleKernel:
             if combine_geometry is None:
                 raise ValueError('finalize requires host combine geometry')
             (self.combine_chunks, self.combine_chunk_bytes,
-             self.combine_scratch_bytes, self.combine_uint4_per_lane) = combine_geometry
+             self.combine_uint4_per_lane) = combine_geometry
             self.finalize_sms = min(
                 compute_sms,
                 max(min(compute_sms, local_experts + 1),
@@ -408,7 +414,7 @@ class GCMoERoleKernel:
                         cute.arch.mbarrier_init(data_empty + index, 1)
                     accum_full = cute.recast_ptr(slab + self.shared_layout.accum_full, dtype=Uint64)
                     accum_empty = cute.recast_ptr(slab + self.shared_layout.accum_empty, dtype=Uint64)
-                    for index in cutlass.range_constexpr(2):
+                    for index in cutlass.range_constexpr(self.accum_stages):
                         cute.arch.mbarrier_init(accum_full + index, 1)
                         if cta_rank == 0:
                             cute.arch.mbarrier_init(accum_empty + index, TASK_EMPTY_CONSUMERS)
@@ -420,7 +426,7 @@ class GCMoERoleKernel:
                             cute.arch.mbarrier_init(empty + index, TASK_EMPTY_CONSUMERS)
                 elif cutlass.const_expr(self.role == 3):
                     combine = cute.recast_ptr(slab + self.shared_layout.combine_bars, dtype=Uint64)
-                    for index in cutlass.range_constexpr(16):
+                    for index in cutlass.range_constexpr(8):
                         cute.arch.mbarrier_init(combine + index, 1)
             cute.arch.mbarrier_init_fence()
         elif physical_warp == 3:
@@ -585,18 +591,24 @@ class GCMoERoleKernel:
                 peer += Uint32(8)
             sync_aligned(256, 2)
         if cutlass.const_expr(self.finalize_output):
-            # One warp owns a token chunk. Each load slot has one
-            # transaction-counted barrier; store has its own region.
+            # One warp owns a token chunk. Every routed slot of the chunk is
+            # fetched into its own plane under a single barrier so the
+            # reduction exposes one TMA latency instead of one per slot. The
+            # output plane aliases slot 0 and is retired before the next
+            # chunk overwrites it.
             combine = cute.recast_ptr(
                 signals.iterator, dtype=Uint8) + \
                 Uint64(self.combine_words) * Uint64(4)
             output = cute.recast_ptr(y_out.iterator, dtype=Uint8)
             routes = cute.recast_ptr(
                 signals.iterator + self.topk_offset_words, dtype=Uint64)
-            store_smem = combine_smem + \
-                Uint32((16 + epi_warp) * chunk_bytes)
+            combine_slots = self.topk + (1 if self.shared_experts > 0 else 0)
+            # Keep the historical reduction order: shared slot, then routes.
+            slot_of = ([self.topk] if self.shared_experts > 0 else []) + \
+                list(range(self.topk))
+            store_smem = combine_smem + Uint32(epi_warp * chunk_bytes)
             store_words = cute.recast_ptr(store_smem, dtype=Uint32)
-            stage = Uint32(0)
+            bar = combine_bars + epi_warp
             phase = Uint32(0)
             token_chunk = epi_warp * Uint32(self.finalize_sms) + block
             while token_chunk < num_tokens * Uint32(combine_chunks):
@@ -630,76 +642,56 @@ class GCMoERoleKernel:
                     if lane == self.topk:
                         lane_valid = True
                 mask = Uint32(cute.arch.vote_ballot_sync(lane_valid))
-                # Start the first load, then prefetch the next slot
-                # before waiting/accumulating the current load.
-                do_reduce = mask != Uint32(0)
-                if do_reduce:
-                    if cutlass.const_expr(self.shared_experts > 0):
-                        slot = (Uint32(self.topk) if
-                                (mask & (Uint32(1) << Uint32(self.topk))) != Uint32(0)
-                                else warp_first_set_bit(mask))
-                    else:
-                        slot = warp_first_set_bit(mask)
-                    mask ^= Uint32(1) << slot
+                # Retire the previous chunk's output before any fetch plane
+                # reuses the aliased slot-0 region, also when this chunk has
+                # no valid route and only writes zeros. The wait is per-thread
+                # and only the elected lane issued the store, so converge the
+                # warp before any lane touches the plane.
+                tma_store_wait_0()
+                cute.arch.sync_warp()
+                if mask != Uint32(0):
                     if elect_one_sync():
-                        src = combine + \
-                            (Uint64(slot) * Uint64(self.capacity) +
-                             Uint64(token)) * Uint64(self.hidden * 2) + \
-                            Uint64(chunk_offset)
-                        load_smem = combine_smem + \
-                            (stage * Uint32(8) + epi_warp) * Uint32(chunk_bytes)
-                        bar = combine_bars + epi_warp * Uint32(2) + stage
-                        bulk_g2s_1d(load_smem, src, Uint32(chunk_bytes), bar)
-                        cute.arch.mbarrier_arrive_and_expect_tx(bar, chunk_bytes)
+                        expect = Uint32(0)
+                        for g in cutlass.range_constexpr(combine_slots):
+                            if ((mask >> Uint32(slot_of[g])) & Uint32(1)) != Uint32(0):
+                                expect += Uint32(chunk_bytes)
+                        cute.arch.mbarrier_arrive_and_expect_tx(bar, expect)
+                        for g in cutlass.range_constexpr(combine_slots):
+                            if ((mask >> Uint32(slot_of[g])) & Uint32(1)) != Uint32(0):
+                                src = combine + \
+                                    (Uint64(slot_of[g]) * Uint64(self.capacity) +
+                                     Uint64(token)) * Uint64(self.hidden * 2) + \
+                                    Uint64(chunk_offset)
+                                bulk_g2s_1d(
+                                    combine_smem +
+                                    (Uint32(slot_of[g]) * Uint32(8) + epi_warp) *
+                                    Uint32(chunk_bytes), src,
+                                    Uint32(chunk_bytes), bar)
                     cute.arch.sync_warp()
+                    cute.arch.mbarrier_wait(bar, phase)
+                    phase ^= Uint32(1)
                 reduced = cute.make_rmem_tensor((u4_per_lane * 8,), Float32)
                 for index in cutlass.range_constexpr(u4_per_lane * 8):
                     reduced[index] = Float32(0)
-                while do_reduce:
-                    next_reduce = mask != Uint32(0)
-                    if next_reduce:
-                        if cutlass.const_expr(self.shared_experts > 0):
-                            slot = (Uint32(self.topk) if
-                                    (mask & (Uint32(1) << Uint32(self.topk))) != Uint32(0)
-                                    else warp_first_set_bit(mask))
-                        else:
-                            slot = warp_first_set_bit(mask)
-                        mask ^= Uint32(1) << slot
-                        if elect_one_sync():
-                            src = combine + \
-                                (Uint64(slot) * Uint64(self.capacity) +
-                                 Uint64(token)) * Uint64(self.hidden * 2) + \
-                                Uint64(chunk_offset)
-                            next_stage = stage ^ Uint32(1)
-                            load_next = combine_smem + \
-                                (next_stage * Uint32(8) + epi_warp) * Uint32(chunk_bytes)
-                            next_bar = combine_bars + epi_warp * Uint32(2) + next_stage
-                            bulk_g2s_1d(load_next, src, Uint32(chunk_bytes), next_bar)
-                            cute.arch.mbarrier_arrive_and_expect_tx(next_bar, chunk_bytes)
-                        cute.arch.sync_warp()
-
-                    current_bar = combine_bars + epi_warp * Uint32(2) + stage
-                    cute.arch.mbarrier_wait(current_bar, phase)
-                    load_words = cute.recast_ptr(
-                        combine_smem + (stage * Uint32(8) + epi_warp) *
-                        Uint32(chunk_bytes), dtype=Uint32)
-                    for j in cutlass.range_constexpr(u4_per_lane):
-                        words = ld_shared_u32x4(
-                            load_words + (j * 32 + lane) * 4)
-                        for q in cutlass.range_constexpr(4):
-                            packed = words[q]
-                            reduced[j * 8 + q * 2] = \
-                                accumulate_bf16_into_f32(
-                                    reduced[j * 8 + q * 2],
-                                    Uint16(packed & Uint32(0xffff)))
-                            reduced[j * 8 + q * 2 + 1] = \
-                                accumulate_bf16_into_f32(
-                                    reduced[j * 8 + q * 2 + 1],
-                                    Uint16(packed >> Uint32(16)))
-                    cute.arch.fence_view_async_shared()
-                    phase ^= stage
-                    stage ^= Uint32(1)
-                    do_reduce = next_reduce
+                for g in cutlass.range_constexpr(combine_slots):
+                    if ((mask >> Uint32(slot_of[g])) & Uint32(1)) != Uint32(0):
+                        load_words = cute.recast_ptr(
+                            combine_smem + (Uint32(slot_of[g]) * Uint32(8) + epi_warp) *
+                            Uint32(chunk_bytes), dtype=Uint32)
+                        for j in cutlass.range_constexpr(u4_per_lane):
+                            words = ld_shared_u32x4(
+                                load_words + (j * 32 + lane) * 4)
+                            for q in cutlass.range_constexpr(4):
+                                packed = words[q]
+                                reduced[j * 8 + q * 2] = \
+                                    accumulate_bf16_into_f32(
+                                        reduced[j * 8 + q * 2],
+                                        Uint16(packed & Uint32(0xffff)))
+                                reduced[j * 8 + q * 2 + 1] = \
+                                    accumulate_bf16_into_f32(
+                                        reduced[j * 8 + q * 2 + 1],
+                                        Uint16(packed >> Uint32(16)))
+                cute.arch.fence_view_async_shared()
 
                 for j in cutlass.range_constexpr(u4_per_lane):
                     packed_words = cute.make_rmem_tensor((4,), Uint32)
@@ -707,9 +699,6 @@ class GCMoERoleKernel:
                         packed_words[q] = pack_bf16_pair(
                             reduced[j * 8 + q * 2],
                             reduced[j * 8 + q * 2 + 1])
-                    if cutlass.const_expr(j == 0):
-                        tma_store_wait_0()
-                        cute.arch.sync_warp()
                     st_shared_u32x4(
                         store_words + (j * 32 + lane) * 4,
                         packed_words[0], packed_words[1],
@@ -735,7 +724,9 @@ class GCMoERoleKernel:
                tensor_map_7=None, tensor_map_8=None, tensor_map_9=None,
                tensor_map_10=None, tensor_map_11=None, tensor_map_12=None,
                tensor_map_13=None, tensor_map_14=None, tensor_map_15=None,
-               tensor_map_16=None, tensor_map_17=None):
+               tensor_map_16=None, tensor_map_17=None,
+               tensor_map_18=None, tensor_map_19=None,
+               tensor_map_20=None, tensor_map_21=None):
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         physical_warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -1104,7 +1095,7 @@ class GCMoERoleKernel:
         elif cutlass.const_expr(self.role == 2):
             if physical_warp == 0:
                 # Each descriptor has its own aligned by-value kernel
-                # parameter, in the reference's eighteen-map order.
+                # parameter, in the configuration's map order.
                 prefetch_tensormap(tensor_maps.iterator)
                 prefetch_tensormap(tensor_map_1.iterator)
                 prefetch_tensormap(tensor_map_2.iterator)
@@ -1123,6 +1114,11 @@ class GCMoERoleKernel:
                 prefetch_tensormap(tensor_map_15.iterator)
                 prefetch_tensormap(tensor_map_16.iterator)
                 prefetch_tensormap(tensor_map_17.iterator)
+                if cutlass.const_expr(self.use_small_tile_path):
+                    prefetch_tensormap(tensor_map_18.iterator)
+                    prefetch_tensormap(tensor_map_19.iterator)
+                    prefetch_tensormap(tensor_map_20.iterator)
+                    prefetch_tensormap(tensor_map_21.iterator)
             smem = cutlass.utils.SmemAllocator()
             slab = cute.recast_ptr(
                 smem.allocate(self.shared_layout.field_end, 1024), dtype=Uint8)
@@ -1225,6 +1221,21 @@ class GCMoERoleKernel:
                                 activation_sf_map = tensor_map_15.iterator
                                 weight_map = tensor_map_16.iterator
                                 weight_sf_map = tensor_map_17.iterator
+                        # The MMA B operand consumes N/2 rows from each CTA.
+                        # Keep the original stage pitch and full shared/fallback maps.
+                        activation_rows = Uint32(self.block_m // 2)
+                        if cutlass.const_expr(self.use_small_tile_path):
+                            if is_shared == Uint32(0) and valid_m <= Uint32(32):
+                                activation_rows = Uint32(16)
+                                activation_map = tensor_map_18.iterator
+                                if task_phase == Uint32(GCBlockPhase.Linear2):
+                                    activation_map = tensor_map_19.iterator
+                        if cutlass.const_expr(self.use_small_tile_path and self.block_m > 48):
+                            if is_shared == Uint32(0) and valid_m > Uint32(32) and valid_m <= Uint32(48):
+                                activation_rows = Uint32(24)
+                                activation_map = tensor_map_20.iterator
+                                if task_phase == Uint32(GCBlockPhase.Linear2):
+                                    activation_map = tensor_map_21.iterator
                         # Keep this pair generic for the entire K loop.
                         # The conversion is full-warp, before elected TMA.
                         activation_map = generic_tensormap_ptr(activation_map)
@@ -1269,12 +1280,13 @@ class GCMoERoleKernel:
                                 data_full + data_stage, data_empty + data_stage,
                                 k_block, data_phase, block_idx,
                                 n_cluster * Uint32(2) + cta_rank,
-                                local_expert, valid_m, shape_k,
+                                local_expert, valid_m, activation_rows, shape_k,
                                 is_shared, cta_rank, 0,
                                 self.block_m, self.sf_block_m,
                                 self.shared_weight_gran_k,
                                 self.shared_experts > 0,
-                                self.shared_weight_cache_hint)
+                                self.shared_weight_cache_hint,
+                                self.routed_weight_linger)
                             data_stage = Uint32(0) if data_stage == \
                                 Uint32(self.math_stages - 1) else data_stage + Uint32(1)
                             data_phase ^= Uint32(data_stage == Uint32(0))
@@ -1330,6 +1342,7 @@ class GCMoERoleKernel:
                         weight_sf_map = generic_tensormap_ptr(weight_sf_map)
                         k_block = Uint32(0)
                         while k_block < shape_k // Uint32(128):
+                            # The weight loader ignores the activation geometry.
                             load_mixed_k128_tma(
                                 activation_map, activation_sf_map,
                                 weight_map, weight_sf_map,
@@ -1340,12 +1353,13 @@ class GCMoERoleKernel:
                                 data_full + data_stage, data_empty + data_stage,
                                 k_block, data_phase, block_idx,
                                 n_cluster * Uint32(2) + cta_rank,
-                                local_expert, valid_m, shape_k,
+                                local_expert, valid_m, Uint32(0), shape_k,
                                 is_shared, cta_rank, 1,
                                 self.block_m, self.sf_block_m,
                                 self.shared_weight_gran_k,
                                 self.shared_experts > 0,
-                                self.shared_weight_cache_hint)
+                                self.shared_weight_cache_hint,
+                                self.routed_weight_linger)
                             data_stage = Uint32(0) if data_stage == \
                                 Uint32(self.math_stages - 1) else data_stage + Uint32(1)
                             data_phase ^= Uint32(data_stage == Uint32(0))
@@ -1386,8 +1400,8 @@ class GCMoERoleKernel:
                         aligned_n = (valid_m + Uint32(15)) & Uint32(~15)
                         instr_desc_base = blockscaled_instr_desc_hi(
                             aligned_n, weight_format, Uint32(0), Uint32(0))
-                        accum_stage = task_iter % Uint32(2)
-                        accum_phase = (task_iter // Uint32(2)) % Uint32(2)
+                        accum_stage = task_iter % Uint32(self.accum_stages)
+                        accum_phase = (task_iter // Uint32(self.accum_stages)) % Uint32(2)
                         cute.arch.mbarrier_wait(accum_empty + accum_stage,
                                                 accum_phase ^ Uint32(1))
                         tcgen05_after_thread_sync()
@@ -1410,14 +1424,16 @@ class GCMoERoleKernel:
                                 data_sfb, data_sfa, data_stage,
                                 data_desc_hi, sf_desc_hi,
                                 accum_stage * Uint32(self.block_m),
-                                Uint32(2 * self.block_m + self.sfa_tmem_cols),
-                                Uint32(2 * self.block_m),
+                                Uint32(self.accum_stages * self.block_m +
+                                       self.sfa_tmem_cols),
+                                Uint32(self.accum_stages * self.block_m),
                                 data_empty + data_stage, accum_full + accum_stage,
                                 instr_desc_base, k_block,
                                 Uint32(k_block == num_k_blocks - Uint32(1)),
                                 is_shared, self.sf_block_m,
                                 self.shared_weight_gran_k,
-                                self.shared_experts > 0)
+                                self.shared_experts > 0,
+                                self.use_small_tile_path)
                             data_stage = Uint32(0) if data_stage == \
                                 Uint32(self.math_stages - 1) else data_stage + Uint32(1)
                             data_phase ^= Uint32(data_stage == Uint32(0))
@@ -1427,8 +1443,8 @@ class GCMoERoleKernel:
                 # producer warp, as the reference does after its loop.
                 if task_iter > Uint32(1):
                     last_valid_iter = task_iter - Uint32(2)
-                    last_stage = last_valid_iter % Uint32(2)
-                    last_phase = (last_valid_iter // Uint32(2)) % Uint32(2)
+                    last_stage = last_valid_iter % Uint32(self.accum_stages)
+                    last_phase = (last_valid_iter // Uint32(self.accum_stages)) % Uint32(2)
                     cute.arch.mbarrier_wait(accum_empty + last_stage,
                                             last_phase)
             if physical_warp >= 4:
@@ -1446,8 +1462,8 @@ class GCMoERoleKernel:
                     pool_block = Uint32(task_words[stage * 8 + 4])
                     valid_m = Uint32(task_words[stage * 8 + 5])
                     if task_phase != Uint32(GCBlockPhase.None_):
-                        accum_stage = iteration % Uint32(2)
-                        accum_phase = (iteration // Uint32(2)) % Uint32(2)
+                        accum_stage = iteration % Uint32(self.accum_stages)
+                        accum_phase = (iteration // Uint32(self.accum_stages)) % Uint32(2)
                         cute.arch.mbarrier_wait(accum_full + accum_stage,
                                                 accum_phase)
                         tcgen05_after_thread_sync()
@@ -1474,9 +1490,8 @@ class GCMoERoleKernel:
                         if cutlass.const_expr(self.shared_experts > 0):
                             is_l1 = is_l1 or task_phase == Uint32(GCBlockPhase.SharedLinear1)
                         if is_l1:
-                            # Provisional source-contract W1 epilogue. The
-                            # current production 16dp register bijection
-                            # still needs validM>8 device discrimination.
+                            # W1 epilogue: the 16dp register mapping below
+                            # predicates stores with this task's valid rows.
                             is_shared_l1 = Uint32(0)
                             if cutlass.const_expr(self.shared_experts > 0):
                                 is_shared_l1 = Uint32(1) if task_phase == \
@@ -1881,8 +1896,8 @@ class GCMoERoleKernel:
             combine_smem = cute.recast_ptr(signals.iterator, dtype=Uint8)
             combine_bars = cute.recast_ptr(signals.iterator, dtype=Uint64)
             if cutlass.const_expr(self.finalize_output):
-                # Three 8-warp regions are two load slots and one output slot.
-                # Their sizes follow the validated host role3 reusable prefix.
+                # One fetch plane per combine slot; the output plane aliases
+                # slot 0. Both live inside the role3 reusable prefix.
                 combine_alloc = cutlass.utils.SmemAllocator()
                 combine_smem = cute.recast_ptr(
                     combine_alloc.allocate(self.shared_layout.field_end, 1024), dtype=Uint8)
@@ -1919,21 +1934,23 @@ class GCMoERoleKernel:
                  tensor_map_7=None, tensor_map_8=None, tensor_map_9=None,
                  tensor_map_10=None, tensor_map_11=None, tensor_map_12=None,
                  tensor_map_13=None, tensor_map_14=None, tensor_map_15=None,
-                 tensor_map_16=None, tensor_map_17=None):
+                 tensor_map_16=None, tensor_map_17=None,
+                 tensor_map_18=None, tensor_map_19=None,
+                 tensor_map_20=None, tensor_map_21=None):
         if cutlass.const_expr(self.role == 1):
             if cutlass.const_expr(activation_clamp is None and activation_alpha is None):
                 self.kernel(signals, peer_ptrs, rank_idx, num_tokens).launch(
                     grid=(self.dispatch_sms, 1, 1),
-                    block=(384 if self.block_m >= 96 else 256, 1, 1),
-                    max_number_threads=(384 if self.block_m >= 96 else 256, 1, 1),
+                    block=(self.dispatch_warps * 32, 1, 1),
+                    max_number_threads=(self.dispatch_warps * 32, 1, 1),
                     min_blocks_per_mp=1)
             else:
                 self.kernel(signals, peer_ptrs, rank_idx, num_tokens,
                             None, None, None,
                             activation_clamp, activation_alpha).launch(
                     grid=(self.dispatch_sms, 1, 1),
-                    block=(384 if self.block_m >= 96 else 256, 1, 1),
-                    max_number_threads=(384 if self.block_m >= 96 else 256, 1, 1),
+                    block=(self.dispatch_warps * 32, 1, 1),
+                    max_number_threads=(self.dispatch_warps * 32, 1, 1),
                     min_blocks_per_mp=1)
         elif cutlass.const_expr(self.role == 2):
             if cutlass.const_expr(activation_clamp is None and activation_alpha is None):
@@ -1944,7 +1961,9 @@ class GCMoERoleKernel:
                             tensor_map_7, tensor_map_8, tensor_map_9,
                             tensor_map_10, tensor_map_11, tensor_map_12,
                             tensor_map_13, tensor_map_14, tensor_map_15,
-                            tensor_map_16, tensor_map_17).launch(
+                            tensor_map_16, tensor_map_17,
+                            tensor_map_18, tensor_map_19,
+                            tensor_map_20, tensor_map_21).launch(
                     grid=(self.compute_sms, 1, 1), block=(384, 1, 1),
                     max_number_threads=(384, 1, 1),
                     cluster=(2, 1, 1), min_blocks_per_mp=1)
@@ -1957,7 +1976,9 @@ class GCMoERoleKernel:
                             tensor_map_7, tensor_map_8, tensor_map_9,
                             tensor_map_10, tensor_map_11, tensor_map_12,
                             tensor_map_13, tensor_map_14, tensor_map_15,
-                            tensor_map_16, tensor_map_17).launch(
+                            tensor_map_16, tensor_map_17,
+                            tensor_map_18, tensor_map_19,
+                            tensor_map_20, tensor_map_21).launch(
                     grid=(self.compute_sms, 1, 1), block=(384, 1, 1),
                     max_number_threads=(384, 1, 1),
                     cluster=(2, 1, 1), min_blocks_per_mp=1)

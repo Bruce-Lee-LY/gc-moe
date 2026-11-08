@@ -8,12 +8,21 @@ from cutlass import Uint32, Uint64
 
 from ..ptx.ld_st import (
     EVICT_FIRST,
+    EVICT_LAST,
     EVICT_NORMAL,
 )
 from ..ptx.tma import (
     tile_g2s_2cta_2d,
     tile_g2s_2cta_4d,
 )
+
+
+def use_small_tile_path(shared_experts: int, block_m: int) -> bool:
+    """Whether the fused-SE geometry enables valid_m-shrunk routed tiles.
+
+    Gates the prefix activation maps and the K128 descriptor reuse.
+    """
+    return shared_experts > 0 and block_m // 2 > 16
 
 
 @cute.jit
@@ -29,6 +38,7 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
                         k_block: Uint32, stage_phase: Uint32,
                         block_idx: Uint32, n_block: Uint32,
                         local_expert: Uint32, valid_m: Uint32,
+                        activation_rows: Uint32,
                         shape_k: Uint32, is_shared: Uint32,
                         cta_rank: Uint32,
                         loader_warp: cutlass.Constexpr,
@@ -36,7 +46,8 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
                         sf_block_m: cutlass.Constexpr,
                         shared_weight_gran_k: cutlass.Constexpr,
                         has_shared: cutlass.Constexpr,
-                        shared_weight_cache_hint: cutlass.Constexpr) -> None:
+                        shared_weight_cache_hint: cutlass.Constexpr,
+                        routed_weight_linger: cutlass.Constexpr) -> None:
     """Warp 0/1 stage the same K128 task through 2CTA TensorMaps.
 
     Both CTAs issue their own TMA transfers into local SMEM. The leader's
@@ -45,7 +56,9 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
     """
     cute.arch.mbarrier_wait(empty_bar, stage_phase ^ Uint32(1))
     k_idx = k_block * Uint32(128)
-    cache_hint = Uint64(EVICT_NORMAL)
+    # Every activation tile is read again by the other N-tiles of its
+    # expert, so keep the stream resident while the weight stream cycles.
+    cache_hint = Uint64(EVICT_LAST)
     if cutlass.const_expr(loader_warp == 0):
         aligned_m = (valid_m + Uint32(15)) & Uint32(~15)
         m_idx = block_idx * Uint32(block_m)
@@ -59,17 +72,20 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
                              cache_hint)
             if cta_rank == Uint32(0):
                 cute.arch.mbarrier_arrive_and_expect_tx(
-                    full_bar, 2 * ((block_m // 2) * 128 + sf_block_m * 4))
+                    full_bar, 2 * (activation_rows * Uint32(128) + Uint32(sf_block_m * 4)))
             else:
                 cute.arch.mbarrier_arrive(full_bar, peer_cta_rank_in_cluster=0)
     else:
         n_idx = n_block * Uint32(128)
-        # Routed FP4 uses evict-first; the host selects the shared FP8
-        # weight/SF policy from the expected routed tokens per expert.
-        weight_cache_hint = Uint64(EVICT_FIRST)
+        # Every M-block of an expert walks the same weight tiles, so the
+        # host lets routed FP4 linger in L2 when an expert spans two or
+        # more M-blocks. Shared FP8 keeps the policy chosen by the host.
+        routed_cache_hint = (Uint64(EVICT_NORMAL) if routed_weight_linger
+                             else Uint64(EVICT_FIRST))
+        weight_cache_hint = routed_cache_hint
         gran = Uint32(32)
         if cutlass.const_expr(has_shared):
-            weight_cache_hint = (Uint64(EVICT_FIRST) if is_shared == Uint32(0)
+            weight_cache_hint = (routed_cache_hint if is_shared == Uint32(0)
                                  else Uint64(shared_weight_cache_hint))
             if cutlass.const_expr(shared_weight_gran_k == 128):
                 if is_shared != Uint32(0):
