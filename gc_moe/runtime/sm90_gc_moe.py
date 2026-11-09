@@ -231,7 +231,9 @@ class _ChildGraph:
                 params = cu.CUgraphNodeParams()
                 params.type = cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
                 params.kernel.kern = kernel
-                params.kernel.ctx = owner.contexts[0 if index == 0 else 1]
+                params.kernel.ctx = (owner.primary_context
+                                     if owner.primary_ctx_roles else
+                                     owner.contexts[0 if index == 0 else 1])
                 params.kernel.gridDimX = binary.grid
                 params.kernel.gridDimY = params.kernel.gridDimZ = 1
                 params.kernel.blockDimX = binary.threads
@@ -292,7 +294,11 @@ class _ChildGraph:
 
 
 class GreenContextPair:
-    """SM90 communication/compute split; exact partition is queried from CUDA."""
+    """SM90 communication/compute split; exact partition is queried from CUDA.
+
+    GC_MOE_PRIMARY_CTX=1 binds all role kernels to the primary context and
+    uses the split for grid sizes only.
+    """
 
     @_runtime_locked
     def __init__(self, device_index: int | None = None,
@@ -301,6 +307,7 @@ class GreenContextPair:
             raise RuntimeError(f"kernel runtime is {_RUNTIME_STATE}")
         torch.cuda.init()
         self.primary_context = _ok(cu.cuCtxGetCurrent())
+        self.primary_ctx_roles = _get_env_int('GC_MOE_PRIMARY_CTX', 0) != 0
         if requested_dispatch_sms is None:
             requested_dispatch_sms = _get_env_int('GC_MOE_SM90_DISPATCH_SMS', 4)
         if device_index is None:
@@ -312,12 +319,12 @@ class GreenContextPair:
         # Resolve once, before partition sizes affect launch geometry. Captured
         # graph replay and role preparation only use this cached resource class.
         self.schedule_policy = select_sm90_schedule_policy(total)
-        workqueue = (green_resources.get_balanced_workqueue()
-                     if _get_env_int('GC_MOE_SM90_BALANCED_WORKQUEUES', 1)
-                     else None)
+        workqueue = None
+        if not self.primary_ctx_roles and _get_env_int('GC_MOE_SM90_BALANCED_WORKQUEUES', 1):
+            workqueue = green_resources.get_balanced_workqueue()
         self.compute_sms = compute.sm.smCount
         self.dispatch_sms = communication.sm.smCount
-        parts = (communication, compute)
+        parts = () if self.primary_ctx_roles else (communication, compute)
         if self.compute_sms < 32 or self.compute_sms % 2 or \
                 self.dispatch_sms <= 1 or self.compute_sms + self.dispatch_sms != total:
             raise RuntimeError('unsupported Green SM partition')
@@ -442,14 +449,26 @@ class GreenContextPair:
             raise RuntimeError(f"Green context pair is {self._state}")
         self._state = 'closing'
         try:
-            # Callers retire outer captured graphs first. These events then
-            # retire work on each Green context before any child graph unload.
-            for green, event in zip(self.green, self.retirement):
-                status = cu.cuGreenCtxRecordEvent(green, event)[0]
-                if status == cu.CUresult.CUDA_SUCCESS:
-                    _ok(cu.cuEventSynchronize(event))
-                else:
-                    raise RuntimeError(f"cannot retire Green context work: {status}")
+            # Callers retire outer captured graphs first. Primary-role work
+            # belongs to the caller's context, which may no longer be current
+            # during thread-local teardown.
+            if self.primary_ctx_roles:
+                current = _ok(cu.cuCtxGetCurrent())
+                switch_context = int(current) != int(self.primary_context)
+                if switch_context:
+                    _ok(cu.cuCtxPushCurrent(self.primary_context))
+                try:
+                    _ok(cu.cuCtxSynchronize())
+                finally:
+                    if switch_context:
+                        _ok(cu.cuCtxPopCurrent())
+            else:
+                for green, event in zip(self.green, self.retirement):
+                    status = cu.cuGreenCtxRecordEvent(green, event)[0]
+                    if status == cu.CUresult.CUDA_SUCCESS:
+                        _ok(cu.cuEventSynchronize(event))
+                    else:
+                        raise RuntimeError(f"cannot retire Green context work: {status}")
             for graph in self.graphs.values():
                 graph.close()
             for graph in self._failed_children:
