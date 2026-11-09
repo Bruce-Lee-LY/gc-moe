@@ -115,6 +115,8 @@ class SM90GCMoERoleKernel:
         self.shared_cache_hint = (EVICT_NORMAL if role in (4, 5) and schedule.shared_cache_normal
                                   else EVICT_FIRST)
         self.selected_combine = role == 3 and schedule.selected_combine
+        self.combine_vector = (16 if role == 3 and schedule.policy == 'pipelined'
+                               and self.hidden % 512 == 0 else 8)
         if self.selected_combine and (self.hidden % 256 or not 1 <= self.topk <= 32):
             raise ValueError('selected combine requires warp-uniform rows and topk in [1, 32]')
         self.shared_i = config.intermediate * config.shared_experts
@@ -1347,10 +1349,11 @@ class SM90GCMoERoleKernel:
                 if math_tid < self.ranks:
                     wait_epoch(self._field(base, 'compute_ready', Uint32) + math_tid, epoch, True)
                 sync_math()
-            for index in cutlass.range(block * 256 + math_tid, tokens * (self.hidden // 8), self.grid * 256):
-                token, col = index // (self.hidden // 8), (index % (self.hidden // 8)) * 8
+            for index in cutlass.range(block * 256 + math_tid, tokens * (self.hidden // self.combine_vector), self.grid * 256):
+                token = index // (self.hidden // self.combine_vector)
+                col = (index % (self.hidden // self.combine_vector)) * self.combine_vector
                 if cutlass.const_expr(self.selected_combine):
-                    # H/8 and both index strides are multiples of 32.
+                    # The row-vector count and both strides are multiples of 32.
                     # Every participating warp is complete and has one token.
                     lane = math_tid % 32
                     valid_owner = Boolean(False)
@@ -1365,20 +1368,24 @@ class SM90GCMoERoleKernel:
                         if valid_owner and not peer_ready:
                             peer_ready = ld_acquire_sys_u32(self._field(base, 'compute_ready', Uint32) + owner) == epoch
                     cute.arch.sync_warp()
-                total = cute.make_rmem_tensor((8,), Float32)
+                total = cute.make_rmem_tensor((self.combine_vector,), Float32)
                 total.fill(Float32(0))
                 for slot in cutlass.range_constexpr(self.topk):
                     expert = cell(base, Uint64(self.off_topk_idx) + Uint64(token * self.topk + slot) * 8, Int64)[0]
                     if expert >= 0:
                         address = base + Uint64(self.off_combine) + (Uint64(token * self.topk + slot) * self.hidden + col) * 2
-                        values8 = load_bf16_8(address)
-                        for i in cutlass.range_constexpr(8):
-                            total[i] += values8[i]
+                        for part in cutlass.range_constexpr(self.combine_vector // 8):
+                            values8 = load_bf16_8(address + Uint64(part * 16))
+                            for i in cutlass.range_constexpr(8):
+                                total[part * 8 + i] += values8[i]
                 if cutlass.const_expr(self.shared_experts > 0):
-                    shared = load_bf16_8(base + Uint64(self.off_shared_y) + Uint64(index) * 16)
-                    for i in cutlass.range_constexpr(8):
-                        total[i] = round_bf16_f32(total[i]) + shared[i]
-                store_bf16_8(Uint64(y.toint()) + Uint64(index) * 16, tuple(total[i] for i in range(8)))
+                    for part in cutlass.range_constexpr(self.combine_vector // 8):
+                        shared = load_bf16_8(base + Uint64(self.off_shared_y) + Uint64(index) * (self.combine_vector * 2) + Uint64(part * 16))
+                        for i in cutlass.range_constexpr(8):
+                            total[part * 8 + i] = round_bf16_f32(total[part * 8 + i]) + shared[i]
+                for part in cutlass.range_constexpr(self.combine_vector // 8):
+                    store_bf16_8(Uint64(y.toint()) + Uint64(index) * (self.combine_vector * 2) + Uint64(part * 16),
+                                 tuple(total[part * 8 + i] for i in range(8)))
             fence_sys()
             sync_math()
             if math_tid == 0:

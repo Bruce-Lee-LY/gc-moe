@@ -66,7 +66,9 @@ def _get_sm90_role_config(config, dispatch_sms: int, compute_sms: int, policy: s
         compute_smem = 53376
     direct_scan = 0 < config.bound <= 2
     combine_bound = config.bound or config.capacity
-    combine_grid = min(compute_sms * 4, max(1, (combine_bound * config.hidden + 2047) // 2048))
+    combine_vector = 16 if high_sm and config.hidden % 512 == 0 else 8
+    combine_elements = 256 * combine_vector
+    combine_grid = min(compute_sms * 4, max(1, (combine_bound * config.hidden + combine_elements - 1) // combine_elements))
     if high_sm and pipelined and tile_m >= 16:
         combine_grid = min(combine_grid, compute_sms * 2)
     compute_grid = compute_sms * workers
