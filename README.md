@@ -10,7 +10,7 @@ experts (SE), with FP8 activations, packed FP4 routed weights, FP8 shared
 weights and BF16 outputs.
 
 GPU kernels are JIT compiled on first use. Installation builds a Python wheel;
-it does not compile CUDA kernels. The current package version is `0.5.3`.
+it does not compile CUDA kernels. The current package version is `0.6.0`.
 
 ## Performance
 
@@ -95,20 +95,40 @@ GLM5.2 and DSV4.1-Flash on 32 NVIDIA L20A (GB200) GPUs.
 
 [Full GB200 SE accuracy and performance data](docs/gb200_gc_moe_se.md).
 
+#### RTX PRO 5000
+
+GLM5.2 and DSV4.1-Flash on eight NVIDIA RTX PRO 5000 72GB Blackwell GPUs.
+
+##### Routed experts (non-SE)
+
+![GLM5.2 non-SE: GC MoE versus FlashInfer Cake and CuTeDSL on eight RTX PRO 5000 GPUs](docs/pro5000_glm52_gc_moe.png)
+
+![DSV4.1-Flash non-SE: GC MoE versus FlashInfer Cake and CuTeDSL on eight RTX PRO 5000 GPUs](docs/pro5000_dsv41_flash_gc_moe.png)
+
+[Full RTX PRO 5000 non-SE accuracy and performance data](docs/pro5000_gc_moe.md).
+
+##### Fused shared experts (SE)
+
+![GLM5.2 fused SE latency and speedup over Cake on eight RTX PRO 5000 GPUs](docs/pro5000_glm52_gc_moe_se.png)
+
+![DSV4.1-Flash fused SE latency and speedup over Cake on eight RTX PRO 5000 GPUs](docs/pro5000_dsv41_flash_gc_moe_se.png)
+
+[Full RTX PRO 5000 SE accuracy and performance data](docs/pro5000_gc_moe_se.md).
+
 ## Quick start
 
 ### Requirements
 
 - Linux and an NVIDIA Hopper or Blackwell GPU. The Hopper SM90 path uses
-  `sm_90a` kernels and is validated on H20 and H100. The Blackwell path supports
-  compute capability 10.0 and 10.3 and selects `sm_100f` or `sm_103f`
-  accordingly.
+  `sm_90a` kernels and is validated on H20 and H100. The Blackwell SM100 path
+  supports compute capabilities 10.0 and 10.3, selecting `sm_100f` or
+  `sm_103f`, respectively. The SM120 path uses `sm_120a` kernels and is
+  validated on RTX PRO 5000 (compute capability 12.0).
 - A CUDA driver supporting Green Contexts. Multi-GPU execution also requires
   peer-accessible GPUs and PyTorch symmetric memory, with one process per GPU.
 - Python 3.10 or later.
 - A CUDA Toolkit assembler, resolved at `/usr/local/cuda/bin/ptxas` by default. The validated
-  toolchain is CUDA 13.2 with ptxas 13.2.78; the assembler must support the PTX
-  emitted by the installed CuTe DSL.
+  assembler is ptxas 13.2.78.
 
 Runtime dependencies are constrained by [setup.py](setup.py):
 
@@ -122,7 +142,7 @@ Runtime dependencies are constrained by [setup.py](setup.py):
 [requirements.txt](requirements.txt) records the exact versions used for the
 runtime, build, tests and benchmarks. It also includes `deep-gemm==2.8.2`, which
 is used by the comparison scripts. Use a reference build exposing
-`deep_gemm.fp8_fp4_mega_moe` for Blackwell comparisons or
+`deep_gemm.fp8_fp4_mega_moe` for SM100 comparisons or
 `deep_gemm.sm90_fp8_fp4_mega_moe` for Hopper comparisons.
 
 ### Installation
@@ -147,20 +167,20 @@ assembler compatible with the generated PTX.
 For editable development, use `python -m pip install -e .` instead of installing
 the wheel. Wheel versions include the Git revision for a clean tree, or
 `+local` for a dirty tree or a source copy without Git metadata. Set
-`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.5.3` version.
+`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.6.0` version.
 
 ## Interfaces
 
-The public entry points are exported from `gc_moe`. The following interfaces
-target Blackwell:
+The public entry points are exported from `gc_moe`. SM100 uses the following
+allocation, weight transform and execution interfaces.
 
 | Interface | Purpose |
 | --- | --- |
 | `get_symm_buffer_for_gc_moe` | Allocate and rendezvous the symmetric input and workspace buffers. |
 | `transform_weights_for_gc_moe` | Convert quantized routed or shared weights to the required layout. |
 | `fp8_fp4_gc_moe` | Write routed-expert output, optionally including shared experts, into `y`. |
-| `get_block_m_for_gc_moe` | Query the token block size, including for shared-input scale staging. |
-| `GCSymmBuffer` | Own input views, peer addresses and workspace storage. |
+| `get_block_m_for_gc_moe` | Query the token block size for SM100 and SM120 shared-input scale staging. |
+| `GCSymmBuffer` | Own SM100 input views, peer addresses and workspace storage. |
 
 Hopper uses separate SM90 interfaces, also exported from `gc_moe`:
 
@@ -192,7 +212,23 @@ with a floor of half the compute SM count. Routed-only calls use two routed
 compute CTAs per compute SM in this range. These rules apply to all supported
 expert-parallel group sizes and model shapes.
 
-The input contract and examples below describe the Blackwell interfaces.
+SM120 (compute capability 12.0) has separate interfaces.
+
+| Interface | Purpose |
+| --- | --- |
+| `get_symm_buffer_for_gc_moe_sm120` | Allocate and rendezvous the SM120 workspace. |
+| `transform_weights_for_gc_moe_sm120` | Convert quantized routed or shared weights for SM120. |
+| `sm120_fp8_fp4_gc_moe` | Write SM120 routed and optional fused shared output into `y`. |
+| `SM120GCSymmBuffer` | Own SM120 input views, peer addresses and workspace storage. |
+
+The input contract and examples below describe SM100. The same packed-weight
+preparation and shared-input scale staging work with the SM120 entry points.
+If supplying `num_tokens_bound`, use the same positive bound on all ranks and
+cover every rank's token count. Valid expert IDs within each token must be
+distinct. If repeated IDs exhaust a source's capacity for an expert, SM120
+returns NaN for the affected output rows and counts only admitted routes.
+See the [SM120 test](tests/test_sm120_gc_moe.py)
+for complete routed and shared-expert examples.
 
 ### Input contract
 
@@ -399,6 +435,16 @@ operator. The DeepGEMM quantization utilities are still required.
 ```bash
 bash scripts/run_sm90.sh 4 both --gc-only
 bash scripts/run_sm90_se.sh 4 both --gc-only
+```
+
+The SM120 benchmarks use FlashInfer Cake MegaMoE and optionally FlashInfer
+CuTe DSL W4A8 MegaMoE for routed experts. Pass `--arms gc` to the benchmark
+stage when FlashInfer is unavailable.
+
+```bash
+bash scripts/run_sm120.sh 8 test
+bash scripts/run_sm120.sh 8 bench --arms baseline,cake,gc
+bash scripts/run_sm120_se.sh 8 both
 ```
 
 Each accuracy or benchmark stage waits for all selected GPUs to be idle:
