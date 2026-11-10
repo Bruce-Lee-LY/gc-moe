@@ -43,21 +43,21 @@ def wgmma_rs_k128(frag: tuple, desc_b: Uint64, n: cutlass.Constexpr,
 
 
 @dsl_user_op
-def decode_fragment(words: cute.Pointer, scales: cute.Pointer, *, loc=None, ip=None):
-    """Four K32 register-A fragments from two aligned LDS128 vectors."""
-    body = '{ .reg .b32 sf0, sf1, o, lo, hi, mag, tmp, sign; '
+def decode_fragment_nib4(words: cute.Pointer, scales: cute.Pointer, *, loc=None, ip=None):
+    """Four K32 register-A fragments; one 4-bit packed exponent word.
+
+    Weight exponents are stored two per byte (even index in the low nibble).
+    One aligned 32-bit LDS carries all eight exponents, and each group/row
+    nibble is extracted with a compile-time ``bfe`` position.
+    """
+    body = '{ .reg .b32 sf, o, lo, hi, mag, tmp, sign; '
     body += '.reg .b32 p<8>; '
-    body += 'ld.shared.v2.u32 {sf0, sf1}, [$16]; '
+    body += 'ld.shared.u32 sf, [$16]; '
     body += 'ld.shared.v4.u32 {p0,p1,p2,p3}, [$17]; '
     body += 'ld.shared.v4.u32 {p4,p5,p6,p7}, [$17+512]; '
     for g in range(4):
         for r in range(2):
-            if g == 0:
-                body += f'and.b32 o, sf{r}, 255; '
-            elif g == 3:
-                body += f'shr.u32 o, sf{r}, 24; '
-            else:
-                body += f'prmt.b32 o, sf{r}, 0, {0x4440 + g}; '
+            body += f'bfe.u32 o, sf, {4 * g + 16 * r}, 4; '
             body += 'mad.lo.u32 lo, o, 0x08080800, 0x0c080000; '
             body += 'mad.lo.u32 hi, o, 0x08080808, 0x1c181410; '
             body += f'and.b32 mag, p{g * 2 + r}, 0x77777777; '

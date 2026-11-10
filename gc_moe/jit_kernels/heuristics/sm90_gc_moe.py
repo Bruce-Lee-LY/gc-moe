@@ -2,6 +2,8 @@
 from dataclasses import dataclass, replace
 from functools import lru_cache
 
+from ...layout.sm90_gc_moe import get_role_pipeline_geometry
+
 
 def select_sm90_schedule_policy(total_sms: int) -> str:
     """Select from the device-visible SM resource before communication splitting.
@@ -47,7 +49,12 @@ def _get_sm90_role_config(config, dispatch_sms: int, compute_sms: int, policy: s
     # processed by the kernel's complete M-chunk loop, including skewed loads.
     expected_rows = (config.bound or config.capacity) * config.ranks * config.topk / config.experts
     if pipelined:
-        tile_m = 8 if small_pipelined else (16 if expected_rows <= 12 else (32 if expected_rows <= 24 else 64))
+        if small_pipelined:
+            tile_m = 8
+        elif expected_rows <= 12:
+            tile_m = 24 if high_sm else 16
+        else:
+            tile_m = 32 if expected_rows <= 24 else 64
     else:
         tile_m = 8 if config.bound <= 16 else 16
     workers = (1 if tile_m == 64 else 2) if pipelined else (3 if tile_m == 8 else 2)
@@ -55,13 +62,14 @@ def _get_sm90_role_config(config, dispatch_sms: int, compute_sms: int, policy: s
     if small_shared:
         # A shared branch uses the same compute SM budget as routed work.
         workers = 1
-    elif has_shared and pipelined and tile_m == 16:
-        # M16 shares the compute context with the complete shared branch.
+    elif has_shared and pipelined and tile_m == 24:
+        # M24 shares the compute context with the complete shared branch.
         workers = 1
     if pipelined:
         stage_bytes = (17408 + tile_m * 132 + 1023) // 1024 * 1024
-        stages = 5 if tile_m == 64 else (3 if tile_m == 32 else 4)
-        compute_smem = stages * stage_bytes + 1024 + tile_m * 1024 + (0 if tile_m == 64 else 256)
+        stages, epilogue_rows = get_role_pipeline_geometry(tile_m, policy)
+        compute_smem = (stages * stage_bytes + 1024 + epilogue_rows * 1024
+                        + (0 if tile_m == 64 else 256))
     else:
         compute_smem = 53376
     direct_scan = 0 < config.bound <= 2
@@ -106,7 +114,7 @@ def _get_sm90_role_config(config, dispatch_sms: int, compute_sms: int, policy: s
                           # Geometry-derived shared budgets stay separate; this
                           # flag pairs the routed SF writer and consumer.
                           routed_scale_preweighted=(high_sm and pipelined
-                                                     and tile_m in (16, 32, 64)),
+                                                     and tile_m in (16, 24, 32, 64)),
                           shared_scale_prefetch=(has_shared and pipelined and tile_m >= 16
                                                  and (shared_tile_m or tile_m) >= 32),
                           shared_tile_m=shared_tile_m,

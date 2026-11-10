@@ -16,7 +16,7 @@ from ..common.math import (
 )
 from ..mma.sm90 import (
     canonical_offset,
-    decode_fragment,
+    decode_fragment_nib4,
     smem_descriptor,
     wgmma_rs_issue,
     wgmma_rs_k128,
@@ -129,7 +129,7 @@ class SM90GCMoERoleKernel:
                                  or role in (4, 5))
         self.max_m = schedule.tile_m
         # The existing common schedule qualifies BOTH receiver and consumer.
-        self.preweighted_routed_sf = (role in (1, 2) and self.max_m in (16, 32, 64)
+        self.preweighted_routed_sf = (role in (1, 2) and self.max_m in (16, 24, 32, 64)
                                       and schedule.policy == 'pipelined'
                                       and schedule.threads[1] == 384
                                       and schedule.routed_scale_preweighted)
@@ -148,11 +148,9 @@ class SM90GCMoERoleKernel:
             if not (routed_stage_count == 6 and role == 2 and self.max_m == 64
                     and self.preweighted_routed_sf and self.early_routed_count):
                 raise ValueError('stage override requires the qualified routed M64 role')
-            shared_layout = get_role_shared_layout(self.max_m, self.warp_specialized,
-                                                   self.routed_n_factor, routed_stage_count)
-        else:
-            shared_layout = get_role_shared_layout(self.max_m, self.warp_specialized,
-                                                   self.routed_n_factor)
+        shared_layout = get_role_shared_layout(self.max_m, self.warp_specialized,
+                                               self.routed_n_factor, routed_stage_count,
+                                               policy=schedule.policy)
         for name in shared_layout.__dataclass_fields__:
             setattr(self, name, getattr(shared_layout, name))
         for name, spec in layout.views.items():
@@ -433,11 +431,11 @@ class SM90GCMoERoleKernel:
         stage_base = stage * self.stage_bytes
         if tid == 0:
             bar = cute.recast_ptr(slab + self.smem - 128 + stage * 8, dtype=Uint64)
-            cute.arch.mbarrier_arrive_and_expect_tx(bar, 17408 * self.routed_n_factor)
+            cute.arch.mbarrier_arrive_and_expect_tx(bar, 16896 * self.routed_n_factor)
             for sub in cutlass.range_constexpr(self.routed_n_factor):
                 index = (Uint64(expert) * (n_size // 256) + ntile * self.routed_n_factor + sub) * (k_size // 128) + kb
                 bulk_g2s_1d(slab + stage_base + sub * 16384, weights + index * 16384, Uint32(16384), bar)
-                bulk_g2s_1d(slab + stage_base + 16384 * self.routed_n_factor + sub * 1024, offsets + index * 1024, Uint32(1024), bar)
+                bulk_g2s_1d(slab + stage_base + 16384 * self.routed_n_factor + sub * 512, offsets + index * 512, Uint32(512), bar)
         for j in cutlass.range(tid, n * 8, 256):
             row, k = Uint32(j // 8), Uint32((j % 8) * 16)
             size = Uint32(0)
@@ -494,8 +492,8 @@ class SM90GCMoERoleKernel:
                 weight_half = Uint32(wg * 2 * self.routed_n_factor + h)
                 row = Uint32(warp * 16 + lane // 4)
                 word_ptr = slab + stage * self.stage_bytes + weight_half * 4096 + Uint32(warp * 1024 + lane * 16)
-                scale_ptr = slab + stage * self.stage_bytes + Uint32(16384 * self.routed_n_factor) + weight_half * 256 + Uint32(warp * 64 + (lane // 4) * 8)
-                frag = decode_fragment(word_ptr, scale_ptr)
+                scale_ptr = slab + stage * self.stage_bytes + Uint32(16384 * self.routed_n_factor) + weight_half * 128 + Uint32(warp * 32 + (lane // 4) * 4)
+                frag = decode_fragment_nib4(word_ptr, scale_ptr)
                 part = wgmma_rs_k128(frag, smem_descriptor(slab + stage * self.stage_bytes + self.routed_x_offset), n)
                 for group in cutlass.range_constexpr(n // 8):
                     final[h, group * 4] = cute.math.fma(part[group * 4], scales[group * 2], final[h, group * 4])
@@ -575,10 +573,10 @@ class SM90GCMoERoleKernel:
             n_size = 2 * self.intermediate if l1 else self.hidden
             stage_base = stage * self.stage_bytes
             full = cute.recast_ptr(slab + self.full_offset + stage * 8, dtype=Uint64)
-            cute.arch.mbarrier_arrive_and_expect_tx(full, 17408)
+            cute.arch.mbarrier_arrive_and_expect_tx(full, 16896)
             index = (Uint64(expert) * (n_size // 256) + ntile) * (k_size // 128) + kb
             bulk_g2s_1d(slab + stage_base, weights + index * 16384, Uint32(16384), full)
-            bulk_g2s_1d(slab + stage_base + 16384, offsets + index * 1024, Uint32(1024), full)
+            bulk_g2s_1d(slab + stage_base + 16384, offsets + index * 512, Uint32(512), full)
 
     @cute.jit
     def _stage_activation(self, base: Uint64, slab: cute.Pointer, expert: Uint32,
@@ -589,24 +587,49 @@ class SM90GCMoERoleKernel:
         input_offset = self.off_l1_acts if l1 else self.off_l2_acts
         stage_base = stage * self.stage_bytes
         full = cute.recast_ptr(slab + self.full_offset + stage * 8, dtype=Uint64)
-        for j in cutlass.range(tid, n * 8, 128 if self.max_m == 64 else 64):
-            row, k = Uint32(j // 8), Uint32((j % 8) * 16)
-            size = Uint32(0)
-            if row < valid:
-                size = Uint32(16)
-            address = base + Uint64(input_offset) + ((Uint64(expert) * self.rows + start + row) * k_size + kb * 128 + k)
-            src = cute.make_ptr(Uint8, address, cute.AddressSpace.gmem, assumed_align=16)
-            copy_async_16(slab + stage_base + 17408 + canonical_offset(row, k), src, size)
-        if tid < n:
-            sf_size = Uint32(0)
-            if tid < valid:
-                sf_size = Uint32(4)
-            sf_offset = self.off_l1_acts_sf if l1 else self.off_l2_acts_sf
-            sf_address = base + Uint64(sf_offset) + ((Uint64(expert) * (k_size // 128) + kb) * self.rows + start + tid) * 4
-            sf_src = cute.make_ptr(Uint8, sf_address, cute.AddressSpace.gmem, assumed_align=4)
-            copy_async_4(slab + stage_base + self.sf_stage_offset + tid * 4, sf_src, sf_size)
-        copy_commit()
-        copy_arrive(full)
+        if cutlass.const_expr(self.max_m == 64):
+            # Fill the reserved 8 KB activation tile in two 4 KB row halves,
+            # each with its own commit group; rows beyond valid are zero-filled.
+            for half in cutlass.range_constexpr(2):
+                for step in cutlass.range_constexpr(2):
+                    j = tid + Uint32(half * 256 + step * 128)
+                    row, k = Uint32(j // 8), Uint32((j % 8) * 16)
+                    size = Uint32(0)
+                    if row < valid:
+                        size = Uint32(16)
+                    address = base + Uint64(input_offset) + ((Uint64(expert) * self.rows + start + row) * k_size + kb * 128 + k)
+                    src = cute.make_ptr(Uint8, address, cute.AddressSpace.gmem, assumed_align=16)
+                    copy_async_16(slab + stage_base + self.routed_x_offset + canonical_offset(row, k), src, size)
+                if cutlass.const_expr(half == 0):
+                    if tid < n:
+                        sf_size = Uint32(0)
+                        if tid < valid:
+                            sf_size = Uint32(4)
+                        sf_offset = self.off_l1_acts_sf if l1 else self.off_l2_acts_sf
+                        sf_address = base + Uint64(sf_offset) + ((Uint64(expert) * (k_size // 128) + kb) * self.rows + start + tid) * 4
+                        sf_src = cute.make_ptr(Uint8, sf_address, cute.AddressSpace.gmem, assumed_align=4)
+                        copy_async_4(slab + stage_base + self.sf_stage_offset + tid * 4, sf_src, sf_size)
+                copy_commit()
+                copy_arrive(full)
+        else:
+            for j in cutlass.range(tid, n * 8, 64):
+                row, k = Uint32(j // 8), Uint32((j % 8) * 16)
+                size = Uint32(0)
+                if row < valid:
+                    size = Uint32(16)
+                address = base + Uint64(input_offset) + ((Uint64(expert) * self.rows + start + row) * k_size + kb * 128 + k)
+                src = cute.make_ptr(Uint8, address, cute.AddressSpace.gmem, assumed_align=16)
+                copy_async_16(slab + stage_base + self.routed_x_offset + canonical_offset(row, k), src, size)
+            if tid < n:
+                sf_size = Uint32(0)
+                if tid < valid:
+                    sf_size = Uint32(4)
+                sf_offset = self.off_l1_acts_sf if l1 else self.off_l2_acts_sf
+                sf_address = base + Uint64(sf_offset) + ((Uint64(expert) * (k_size // 128) + kb) * self.rows + start + tid) * 4
+                sf_src = cute.make_ptr(Uint8, sf_address, cute.AddressSpace.gmem, assumed_align=4)
+                copy_async_4(slab + stage_base + self.sf_stage_offset + tid * 4, sf_src, sf_size)
+            copy_commit()
+            copy_arrive(full)
 
     @cute.jit
     def _bucket_tile(self, base: Uint64, peers: cute.Pointer, slab: cute.Pointer,
@@ -624,6 +647,16 @@ class SM90GCMoERoleKernel:
                 if cutlass.const_expr(self.max_m == 16):
                     self._tile_sync(base, peers, slab, expert, ntile, start, valid,
                                weights, offsets, secondary, clamp, 16, l1)
+                elif cutlass.const_expr(self.max_m == 24):
+                    if valid <= 8:
+                        self._tile_sync(base, peers, slab, expert, ntile, start, valid,
+                                   weights, offsets, secondary, clamp, 8, l1)
+                    elif valid <= 16:
+                        self._tile_sync(base, peers, slab, expert, ntile, start, valid,
+                                   weights, offsets, secondary, clamp, 16, l1)
+                    else:
+                        self._tile_sync(base, peers, slab, expert, ntile, start, valid,
+                                   weights, offsets, secondary, clamp, 24, l1)
                 else:
                     if valid <= 16:
                         self._tile_sync(base, peers, slab, expert, ntile, start, valid,
@@ -707,6 +740,8 @@ class SM90GCMoERoleKernel:
             load_m = Uint32(8)
         elif valid <= 16:
             load_m = Uint32(16)
+        elif valid <= 24 and self.max_m == 24:
+            load_m = Uint32(24)
         elif valid <= 32:
             load_m = Uint32(32)
         elif valid <= 40:
@@ -813,16 +848,16 @@ class SM90GCMoERoleKernel:
         cute.arch.sync_warp()
         tma_store_fence()
         initial_word = slab + first_stage * self.stage_bytes + Uint32(wg * 8192 + warp * 1024 + lane * 16)
-        initial_scale = slab + first_stage * self.stage_bytes + Uint32(16384 + wg * 512 + warp * 64 + (lane // 4) * 8)
-        frag0 = decode_fragment(initial_word, initial_scale)
+        initial_scale = slab + first_stage * self.stage_bytes + Uint32(16384 + wg * 256 + warp * 32 + (lane // 4) * 4)
+        frag0 = decode_fragment_nib4(initial_word, initial_scale)
         for kb in cutlass.range(k_size // 128):
             iteration = data_iter + Uint32(kb)
             stage = Uint32(iteration % self.stages)
-            descriptor = smem_descriptor(slab + stage * self.stage_bytes + 17408)
+            descriptor = smem_descriptor(slab + stage * self.stage_bytes + self.routed_x_offset)
             raw0 = wgmma_rs_issue(frag0, descriptor, n)
             word_ptr = slab + stage * self.stage_bytes + Uint32(wg * 8192 + warp * 1024 + lane * 16)
-            scale_ptr = slab + stage * self.stage_bytes + Uint32(16384 + wg * 512 + warp * 64 + (lane // 4) * 8)
-            frag1 = decode_fragment(word_ptr + 4096, scale_ptr + 256)
+            scale_ptr = slab + stage * self.stage_bytes + Uint32(16384 + wg * 256 + warp * 32 + (lane // 4) * 4)
+            frag1 = decode_fragment_nib4(word_ptr + 4096, scale_ptr + 128)
             scales = cute.make_rmem_tensor((n // 4,), Float32)
             for group in cutlass.range_constexpr(n // 8):
                 token = Uint32(group * 8 + 2 * (lane % 4))
@@ -845,10 +880,12 @@ class SM90GCMoERoleKernel:
                 if lane == 0:
                     cute.arch.mbarrier_wait(cute.recast_ptr(slab + self.full_offset + next_stage * 8, dtype=Uint64), Uint32(((iteration + 1) // self.stages) % 2))
                 cute.arch.sync_warp()
+                # Activation uses non-bulk cp.async (generic proxy); publish
+                # each completed stage before WGMMA reads it in the async proxy.
                 tma_store_fence()
                 next_word = slab + next_stage * self.stage_bytes + Uint32(wg * 8192 + warp * 1024 + lane * 16)
-                next_scale = slab + next_stage * self.stage_bytes + Uint32(16384 + wg * 512 + warp * 64 + (lane // 4) * 8)
-                frag0 = decode_fragment(next_word, next_scale)
+                next_scale = slab + next_stage * self.stage_bytes + Uint32(16384 + wg * 256 + warp * 32 + (lane // 4) * 4)
+                frag0 = decode_fragment_nib4(next_word, next_scale)
             part1 = wgmma_rs_wait(raw1)
             for group in cutlass.range_constexpr(n // 8):
                 final[1, group * 4] = cute.math.fma(part1[group * 4], scales[group * 2], final[1, group * 4])
@@ -859,74 +896,162 @@ class SM90GCMoERoleKernel:
             cute.arch.sync_warp()
             if lane == 0:
                 cute.arch.mbarrier_arrive(cute.recast_ptr(slab + self.empty_offset + stage * 8, dtype=Uint64))
-        sync_math()
-        for h in cutlass.range_constexpr(2):
-            output_half = Uint32(wg * 2 + h)
-            for group in cutlass.range_constexpr(n // 8):
-                token = Uint32(group * 8 + 2 * (lane % 4))
-                row = Uint32(warp * 16 + lane // 4)
-                # XOR token-pair bits into columns, as in swizzled staging.
-                skew = Uint32((token % 8) // 2 * 8)
-                # L1 needs row XOR only; L2 also permutes vector chunks.
-                if cutlass.const_expr(l1):
-                    shared_cell(epi_slab, (token * 256 + ((output_half * 64 + row) ^ skew)) * 4, Float32)[0] = final[h, group * 4]
-                    shared_cell(epi_slab, ((token + 1) * 256 + ((output_half * 64 + row) ^ skew)) * 4, Float32)[0] = final[h, group * 4 + 1]
-                    shared_cell(epi_slab, (token * 256 + ((output_half * 64 + row + 8) ^ skew)) * 4, Float32)[0] = final[h, group * 4 + 2]
-                    shared_cell(epi_slab, ((token + 1) * 256 + ((output_half * 64 + row + 8) ^ skew)) * 4, Float32)[0] = final[h, group * 4 + 3]
-                else:
-                    shared_cell(epi_slab, (token * 256 + ((output_half * 64 + row) ^ skew ^ (((output_half * 64 + row) & 32) >> 3))) * 4, Float32)[0] = final[h, group * 4]
-                    shared_cell(epi_slab, ((token + 1) * 256 + ((output_half * 64 + row) ^ skew ^ (((output_half * 64 + row) & 32) >> 3))) * 4, Float32)[0] = final[h, group * 4 + 1]
-                    shared_cell(epi_slab, (token * 256 + ((output_half * 64 + row + 8) ^ skew ^ (((output_half * 64 + row + 8) & 32) >> 3))) * 4, Float32)[0] = final[h, group * 4 + 2]
-                    shared_cell(epi_slab, ((token + 1) * 256 + ((output_half * 64 + row + 8) ^ skew ^ (((output_half * 64 + row + 8) & 32) >> 3))) * 4, Float32)[0] = final[h, group * 4 + 3]
-        sync_math()
-        if cutlass.const_expr(l1):
-            output_secondary_value = Float32(1)
-            if cutlass.const_expr(self.preweighted_routed_sf):
-                output_secondary_value = cute.make_tensor(output_secondary, cute.make_layout((self.local,)))[expert]
-            for ep_token in cutlass.range(math_tid // 32, valid, 8):
-                values = cute.make_rmem_tensor((4,), Float32)
-                amax = Float32(0)
-                weight = cell(base, Uint64(self.off_route_weight) + (Uint64(expert) * self.rows + start + ep_token) * 4, Float32)[0]
-                skew = Uint32((ep_token % 8) // 2 * 8)
-                raw = load_shared_8(epi_slab + ep_token * 1024 + ((lane * 4) ^ skew) * 4, True)
-                for ep_j in cutlass.range_constexpr(4):
-                    gate = cute.math.min(raw[ep_j], clamp)
-                    up = cute.math.min(cute.math.max(raw[ep_j + 4], -clamp), clamp)
-                    sigmoid = cute.math.rcp(Float32(1) + cute.math.exp(-gate, fastmath=self.fast_math))
-                    values[ep_j] = gate * sigmoid * up * weight
-                    amax = cute.math.max(amax, abs_f32(values[ep_j]))
-                for shift in cutlass.range_constexpr(5):
-                    amax = cute.math.max(amax, cute.arch.shuffle_sync_bfly(amax, 16 >> shift))
-                scale = cute.math.max(amax, Float32(1e-10)) * Float32(1.0 / 448.0)
-                inverse = cute.math.rcp(scale)
-                if lane == 0:
-                    activation_scale_out = cell(base, Uint64(self.off_l2_acts_sf) + ((Uint64(expert) * (self.intermediate // 128) + ntile) * self.rows + start + ep_token) * 4, Float32)
-                    if cutlass.const_expr(self.preweighted_routed_sf):
-                        activation_scale_out[0] = preweight_routed_sf(scale, output_secondary_value)
+        # Tiles no wider than the slab keep the original epilogue verbatim;
+        # only a wider tile is drained in several batches.
+        if cutlass.const_expr(n <= self.epilogue_rows):
+            sync_math()
+            for h in cutlass.range_constexpr(2):
+                output_half = Uint32(wg * 2 + h)
+                for group in cutlass.range_constexpr(n // 8):
+                    token = Uint32(group * 8 + 2 * (lane % 4))
+                    row = Uint32(warp * 16 + lane // 4)
+                    # XOR token-pair bits into columns, as in swizzled staging.
+                    skew = Uint32((token % 8) // 2 * 8)
+                    # L1 needs row XOR only; L2 also permutes vector chunks.
+                    if cutlass.const_expr(l1):
+                        shared_cell(epi_slab, (token * 256 + ((output_half * 64 + row) ^ skew)) * 4, Float32)[0] = final[h, group * 4]
+                        shared_cell(epi_slab, ((token + 1) * 256 + ((output_half * 64 + row) ^ skew)) * 4, Float32)[0] = final[h, group * 4 + 1]
+                        shared_cell(epi_slab, (token * 256 + ((output_half * 64 + row + 8) ^ skew)) * 4, Float32)[0] = final[h, group * 4 + 2]
+                        shared_cell(epi_slab, ((token + 1) * 256 + ((output_half * 64 + row + 8) ^ skew)) * 4, Float32)[0] = final[h, group * 4 + 3]
                     else:
-                        activation_scale_out[0] = scale * Float32(64)
-                low = f32x2_to_e4m3x2_bits(values[0] * inverse, values[1] * inverse)
-                high = f32x2_to_e4m3x2_bits(values[2] * inverse, values[3] * inverse)
-                activation_out = cell(base, Uint64(self.off_l2_acts) + (Uint64(expert) * self.rows + start + ep_token) * self.intermediate + ntile * 128 + lane * 4, Uint32)
-                activation_out[0] = Uint32(low) | (Uint32(high) << 16)
+                        shared_cell(epi_slab, (token * 256 + ((output_half * 64 + row) ^ skew ^ (((output_half * 64 + row) & 32) >> 3))) * 4, Float32)[0] = final[h, group * 4]
+                        shared_cell(epi_slab, ((token + 1) * 256 + ((output_half * 64 + row) ^ skew ^ (((output_half * 64 + row) & 32) >> 3))) * 4, Float32)[0] = final[h, group * 4 + 1]
+                        shared_cell(epi_slab, (token * 256 + ((output_half * 64 + row + 8) ^ skew ^ (((output_half * 64 + row + 8) & 32) >> 3))) * 4, Float32)[0] = final[h, group * 4 + 2]
+                        shared_cell(epi_slab, ((token + 1) * 256 + ((output_half * 64 + row + 8) ^ skew ^ (((output_half * 64 + row + 8) & 32) >> 3))) * 4, Float32)[0] = final[h, group * 4 + 3]
+            sync_math()
+            if cutlass.const_expr(l1):
+                output_secondary_value = Float32(1)
+                if cutlass.const_expr(self.preweighted_routed_sf):
+                    output_secondary_value = cute.make_tensor(output_secondary, cute.make_layout((self.local,)))[expert]
+                for ep_token in cutlass.range(math_tid // 32, valid, 8):
+                    values = cute.make_rmem_tensor((4,), Float32)
+                    amax = Float32(0)
+                    weight = cell(base, Uint64(self.off_route_weight) + (Uint64(expert) * self.rows + start + ep_token) * 4, Float32)[0]
+                    skew = Uint32((ep_token % 8) // 2 * 8)
+                    raw = load_shared_8(epi_slab + ep_token * 1024 + ((lane * 4) ^ skew) * 4, True)
+                    for ep_j in cutlass.range_constexpr(4):
+                        gate = cute.math.min(raw[ep_j], clamp)
+                        up = cute.math.min(cute.math.max(raw[ep_j + 4], -clamp), clamp)
+                        sigmoid = cute.math.rcp(Float32(1) + cute.math.exp(-gate, fastmath=self.fast_math))
+                        values[ep_j] = gate * sigmoid * up * weight
+                        amax = cute.math.max(amax, abs_f32(values[ep_j]))
+                    for shift in cutlass.range_constexpr(5):
+                        amax = cute.math.max(amax, cute.arch.shuffle_sync_bfly(amax, 16 >> shift))
+                    scale = cute.math.max(amax, Float32(1e-10)) * Float32(1.0 / 448.0)
+                    inverse = cute.math.rcp(scale)
+                    if lane == 0:
+                        activation_scale_out = cell(base, Uint64(self.off_l2_acts_sf) + ((Uint64(expert) * (self.intermediate // 128) + ntile) * self.rows + start + ep_token) * 4, Float32)
+                        if cutlass.const_expr(self.preweighted_routed_sf):
+                            activation_scale_out[0] = preweight_routed_sf(scale, output_secondary_value)
+                        else:
+                            activation_scale_out[0] = scale * Float32(64)
+                    low = f32x2_to_e4m3x2_bits(values[0] * inverse, values[1] * inverse)
+                    high = f32x2_to_e4m3x2_bits(values[2] * inverse, values[3] * inverse)
+                    activation_out = cell(base, Uint64(self.off_l2_acts) + (Uint64(expert) * self.rows + start + ep_token) * self.intermediate + ntile * 128 + lane * 4, Uint32)
+                    activation_out[0] = Uint32(low) | (Uint32(high) << 16)
+            else:
+                peer_table = cute.make_tensor(peers, cute.make_layout((self.ranks,)))
+                for ep_j in cutlass.range(math_tid, valid * 32, 256):
+                    ep_token, ep_col = ep_j // 32, (ep_j % 32) * 8
+                    meta = Uint64(self.off_route_meta) + (Uint64(expert) * self.rows + start + ep_token) * 12
+                    source = cell(base, meta, Uint32)[0]
+                    source_token = cell(base, meta + 4, Uint32)[0]
+                    slot = cell(base, meta + 8, Uint32)[0]
+                    remote = Uint64(peer_table[source])
+                    skew = Uint32((ep_token % 8) // 2 * 8)
+                    # DeepGEMM-style column-bit swizzle: address each LDS128
+                    # independently; the logical eight values and STG128 stay intact.
+                    values_lo = load_shared_4(epi_slab + ep_token * 1024 + (ep_col ^ skew ^ ((ep_col & 32) >> 3)) * 4)
+                    values_hi = load_shared_4(epi_slab + ep_token * 1024 + ((ep_col + 4) ^ skew ^ (((ep_col + 4) & 32) >> 3)) * 4)
+                    values8 = (*values_lo, *values_hi)
+                    destination = remote + Uint64(self.off_combine) + ((Uint64(source_token) * self.topk + slot) * self.hidden + ntile * 256 + ep_col) * 2
+                    store_bf16_8(destination, values8)
+            sync_math()
         else:
-            peer_table = cute.make_tensor(peers, cute.make_layout((self.ranks,)))
-            for ep_j in cutlass.range(math_tid, valid * 32, 256):
-                ep_token, ep_col = ep_j // 32, (ep_j % 32) * 8
-                meta = Uint64(self.off_route_meta) + (Uint64(expert) * self.rows + start + ep_token) * 12
-                source = cell(base, meta, Uint32)[0]
-                source_token = cell(base, meta + 4, Uint32)[0]
-                slot = cell(base, meta + 8, Uint32)[0]
-                remote = Uint64(peer_table[source])
-                skew = Uint32((ep_token % 8) // 2 * 8)
-                # DeepGEMM-style column-bit swizzle: address each LDS128
-                # independently; the logical eight values and STG128 stay intact.
-                values_lo = load_shared_4(epi_slab + ep_token * 1024 + (ep_col ^ skew ^ ((ep_col & 32) >> 3)) * 4)
-                values_hi = load_shared_4(epi_slab + ep_token * 1024 + ((ep_col + 4) ^ skew ^ (((ep_col + 4) & 32) >> 3)) * 4)
-                values8 = (*values_lo, *values_hi)
-                destination = remote + Uint64(self.off_combine) + ((Uint64(source_token) * self.topk + slot) * self.hidden + ntile * 256 + ep_col) * 2
-                store_bf16_8(destination, values8)
-        sync_math()
+            # M32 writes and drains the epilogue slab in two 16-row batches so a
+            # smaller slab can coexist with a fourth weight stage. Every row keeps
+            # its values, amax reduction and store order, so results are identical.
+            epi_batches = n // self.epilogue_rows
+            groups_per_batch = (n // 8) // epi_batches
+            for batch in cutlass.range_constexpr(epi_batches):
+                batch_row = Uint32(batch * self.epilogue_rows)
+                # Rows beyond `valid` stay untouched; the unsigned difference
+                # wraps to a huge value when this batch is empty.
+                batch_valid = valid - batch_row
+                if batch_valid > Uint32(n):
+                    batch_valid = Uint32(0)
+                batch_valid = cute.math.min(batch_valid, Uint32(self.epilogue_rows))
+                sync_math()
+                for h in cutlass.range_constexpr(2):
+                    output_half = Uint32(wg * 2 + h)
+                    for batch_group in cutlass.range_constexpr(groups_per_batch):
+                        group = batch * groups_per_batch + batch_group
+                        token = Uint32(batch_group * 8 + 2 * (lane % 4))
+                        row = Uint32(warp * 16 + lane // 4)
+                        # XOR token-pair bits into columns, as in swizzled staging.
+                        skew = Uint32((token % 8) // 2 * 8)
+                        # L1 needs row XOR only; L2 also permutes vector chunks.
+                        if cutlass.const_expr(l1):
+                            shared_cell(epi_slab, (token * 256 + ((output_half * 64 + row) ^ skew)) * 4, Float32)[0] = final[h, group * 4]
+                            shared_cell(epi_slab, ((token + 1) * 256 + ((output_half * 64 + row) ^ skew)) * 4, Float32)[0] = final[h, group * 4 + 1]
+                            shared_cell(epi_slab, (token * 256 + ((output_half * 64 + row + 8) ^ skew)) * 4, Float32)[0] = final[h, group * 4 + 2]
+                            shared_cell(epi_slab, ((token + 1) * 256 + ((output_half * 64 + row + 8) ^ skew)) * 4, Float32)[0] = final[h, group * 4 + 3]
+                        else:
+                            shared_cell(epi_slab, (token * 256 + ((output_half * 64 + row) ^ skew ^ (((output_half * 64 + row) & 32) >> 3))) * 4, Float32)[0] = final[h, group * 4]
+                            shared_cell(epi_slab, ((token + 1) * 256 + ((output_half * 64 + row) ^ skew ^ (((output_half * 64 + row) & 32) >> 3))) * 4, Float32)[0] = final[h, group * 4 + 1]
+                            shared_cell(epi_slab, (token * 256 + ((output_half * 64 + row + 8) ^ skew ^ (((output_half * 64 + row + 8) & 32) >> 3))) * 4, Float32)[0] = final[h, group * 4 + 2]
+                            shared_cell(epi_slab, ((token + 1) * 256 + ((output_half * 64 + row + 8) ^ skew ^ (((output_half * 64 + row + 8) & 32) >> 3))) * 4, Float32)[0] = final[h, group * 4 + 3]
+                sync_math()
+                if cutlass.const_expr(l1):
+                    output_secondary_value = Float32(1)
+                    if cutlass.const_expr(self.preweighted_routed_sf):
+                        output_secondary_value = cute.make_tensor(output_secondary, cute.make_layout((self.local,)))[expert]
+                    for ep_local in cutlass.range(math_tid // 32, batch_valid, 8):
+                        ep_token = batch_row + ep_local
+                        values = cute.make_rmem_tensor((4,), Float32)
+                        amax = Float32(0)
+                        weight = cell(base, Uint64(self.off_route_weight) + (Uint64(expert) * self.rows + start + ep_token) * 4, Float32)[0]
+                        skew = Uint32((ep_token % 8) // 2 * 8)
+                        raw = load_shared_8(epi_slab + ep_local * 1024 + ((lane * 4) ^ skew) * 4, True)
+                        for ep_j in cutlass.range_constexpr(4):
+                            gate = cute.math.min(raw[ep_j], clamp)
+                            up = cute.math.min(cute.math.max(raw[ep_j + 4], -clamp), clamp)
+                            sigmoid = cute.math.rcp(Float32(1) + cute.math.exp(-gate, fastmath=self.fast_math))
+                            values[ep_j] = gate * sigmoid * up * weight
+                            amax = cute.math.max(amax, abs_f32(values[ep_j]))
+                        for shift in cutlass.range_constexpr(5):
+                            amax = cute.math.max(amax, cute.arch.shuffle_sync_bfly(amax, 16 >> shift))
+                        scale = cute.math.max(amax, Float32(1e-10)) * Float32(1.0 / 448.0)
+                        inverse = cute.math.rcp(scale)
+                        if lane == 0:
+                            activation_scale_out = cell(base, Uint64(self.off_l2_acts_sf) + ((Uint64(expert) * (self.intermediate // 128) + ntile) * self.rows + start + ep_token) * 4, Float32)
+                            if cutlass.const_expr(self.preweighted_routed_sf):
+                                activation_scale_out[0] = preweight_routed_sf(scale, output_secondary_value)
+                            else:
+                                activation_scale_out[0] = scale * Float32(64)
+                        low = f32x2_to_e4m3x2_bits(values[0] * inverse, values[1] * inverse)
+                        high = f32x2_to_e4m3x2_bits(values[2] * inverse, values[3] * inverse)
+                        activation_out = cell(base, Uint64(self.off_l2_acts) + (Uint64(expert) * self.rows + start + ep_token) * self.intermediate + ntile * 128 + lane * 4, Uint32)
+                        activation_out[0] = Uint32(low) | (Uint32(high) << 16)
+                else:
+                    peer_table = cute.make_tensor(peers, cute.make_layout((self.ranks,)))
+                    for ep_j in cutlass.range(math_tid, batch_valid * 32, 256):
+                        ep_local, ep_col = ep_j // 32, (ep_j % 32) * 8
+                        ep_token = batch_row + ep_local
+                        meta = Uint64(self.off_route_meta) + (Uint64(expert) * self.rows + start + ep_token) * 12
+                        source = cell(base, meta, Uint32)[0]
+                        source_token = cell(base, meta + 4, Uint32)[0]
+                        slot = cell(base, meta + 8, Uint32)[0]
+                        remote = Uint64(peer_table[source])
+                        skew = Uint32((ep_token % 8) // 2 * 8)
+                        # DeepGEMM-style column-bit swizzle: address each LDS128
+                        # independently; the logical eight values and STG128 stay intact.
+                        values_lo = load_shared_4(epi_slab + ep_local * 1024 + (ep_col ^ skew ^ ((ep_col & 32) >> 3)) * 4)
+                        values_hi = load_shared_4(epi_slab + ep_local * 1024 + ((ep_col + 4) ^ skew ^ (((ep_col + 4) & 32) >> 3)) * 4)
+                        values8 = (*values_lo, *values_hi)
+                        destination = remote + Uint64(self.off_combine) + ((Uint64(source_token) * self.topk + slot) * self.hidden + ntile * 256 + ep_col) * 2
+                        store_bf16_8(destination, values8)
+                sync_math()
         return data_iter + Uint32(k_size // 128)
 
     @cute.jit
@@ -979,6 +1104,13 @@ class SM90GCMoERoleKernel:
                 result = self._math_persistent_tile(base, peers, slab, data_iter, expert, ntile, start, valid, secondary, output_secondary, clamp, 8, l1)
             else:
                 result = self._math_persistent_tile(base, peers, slab, data_iter, expert, ntile, start, valid, secondary, output_secondary, clamp, 16, l1)
+        elif cutlass.const_expr(self.max_m == 24):
+            if valid <= 8:
+                result = self._math_persistent_tile(base, peers, slab, data_iter, expert, ntile, start, valid, secondary, output_secondary, clamp, 8, l1)
+            elif valid <= 16:
+                result = self._math_persistent_tile(base, peers, slab, data_iter, expert, ntile, start, valid, secondary, output_secondary, clamp, 16, l1)
+            else:
+                result = self._math_persistent_tile(base, peers, slab, data_iter, expert, ntile, start, valid, secondary, output_secondary, clamp, 24, l1)
         elif cutlass.const_expr(self.max_m == 32):
             if valid <= 8:
                 result = self._math_persistent_tile(base, peers, slab, data_iter, expert, ntile, start, valid, secondary, output_secondary, clamp, 8, l1)
@@ -1009,7 +1141,7 @@ class SM90GCMoERoleKernel:
         alloc = cutlass.utils.SmemAllocator()
         slab = cute.recast_ptr(alloc.allocate(self.smem, 1024), dtype=Uint8)
         if tid < self.stages:
-            cute.arch.mbarrier_init(cute.recast_ptr(slab + self.full_offset + tid * 8, dtype=Uint64), 129 if self.max_m == 64 else 65)
+            cute.arch.mbarrier_init(cute.recast_ptr(slab + self.full_offset + tid * 8, dtype=Uint64), 257 if self.max_m == 64 else 65)
             cute.arch.mbarrier_init(cute.recast_ptr(slab + self.empty_offset + tid * 8, dtype=Uint64), 8)
         if tid < 2:
             cute.arch.mbarrier_init(cute.recast_ptr(slab + self.task_full_offset + tid * 8, dtype=Uint64), 1)

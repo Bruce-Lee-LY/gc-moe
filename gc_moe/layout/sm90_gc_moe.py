@@ -77,6 +77,15 @@ class SM90GCBufferLayout:
         object.__setattr__(self, 'nbytes', align(cursor))
 
 
+def get_role_pipeline_geometry(tile_m: int, policy: str) -> tuple[int, int]:
+    """Pair pipeline depth and epilogue rows for host and kernel budgets."""
+    if policy == 'legacy':
+        return (5 if tile_m == 64 else (3 if tile_m == 32 else 4)), tile_m
+    if policy == 'pipelined':
+        return (5 if tile_m in (8, 64) else 4), (16 if tile_m == 32 else tile_m)
+    raise ValueError(f'unknown SM90 schedule policy: {policy}')
+
+
 @dataclass(frozen=True)
 class SharedStorageLayout:
     routed_x_offset: int
@@ -89,24 +98,34 @@ class SharedStorageLayout:
     task_empty_offset: int
     task_record_offset: int
     command_offset: int
+    epilogue_rows: int
 
 
 @lru_cache(maxsize=32)
 def get_role_shared_layout(tile_m: int, warp_specialized: bool,
-                           routed_n_factor: int, stage_count_override: int = 0) -> SharedStorageLayout:
+                           routed_n_factor: int, stage_count_override: int = 0,
+                           *, policy: str) -> SharedStorageLayout:
+    # Each N256 weight stream is 16384B FP4 + 512B 4-bit exponents.
+    # Keep 512B padding per stream before the activation region: the wgmma
+    # 128B-swizzle descriptor requires a 1024B-aligned matrix base.
     routed_x = 17408 * routed_n_factor
     stage_m = 8 if routed_n_factor == 2 else (tile_m if warp_specialized else 64)
     sf_stage = routed_x + stage_m * 128
     stage = align(sf_stage + stage_m * 4, 1024)
-    stages = 5 if tile_m == 64 else (3 if tile_m == 32 else 4)
+    stages, epilogue_rows = get_role_pipeline_geometry(tile_m, policy)
+    if routed_n_factor == 2:
+        # The legacy N512 M8 branch shares a fixed 73 856 B budget.
+        stages = 4
     if stage_count_override:
         if not (stage_count_override == 6 and tile_m == 64
                 and warp_specialized and routed_n_factor == 1):
             raise ValueError('stage override requires the routed M64 pipeline')
         stages = stage_count_override
+    # Pipelined M32 trades half of its epilogue slab for a fourth weight stage;
+    # legacy M32 retains three stages and the full 32-row epilogue.
     full = stages * stage
     empty = full + stages * 8
     task_full = empty + stages * 8
     return SharedStorageLayout(routed_x, sf_stage, stage, stages, full, empty,
                                task_full, task_full + 16, task_full + 64,
-                               task_full + 160)
+                               task_full + 160, epilogue_rows)

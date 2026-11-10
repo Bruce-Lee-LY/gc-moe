@@ -10,7 +10,7 @@ experts (SE), with FP8 activations, packed FP4 routed weights, FP8 shared
 weights and BF16 outputs.
 
 GPU kernels are JIT compiled on first use. Installation builds a Python wheel;
-it does not compile CUDA kernels. The current package version is `0.5.1`.
+it does not compile CUDA kernels. The current package version is `0.5.2`.
 
 ## Performance
 
@@ -147,7 +147,7 @@ assembler compatible with the generated PTX.
 For editable development, use `python -m pip install -e .` instead of installing
 the wheel. Wheel versions include the Git revision for a clean tree, or
 `+local` for a dirty tree or a source copy without Git metadata. Set
-`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.5.1` version.
+`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.5.2` version.
 
 ## Interfaces
 

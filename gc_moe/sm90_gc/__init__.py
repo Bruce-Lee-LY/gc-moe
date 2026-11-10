@@ -93,7 +93,8 @@ def _transform(raw, scale_2=None, paired=False):
                                or scale_2.device != packed.device):
         raise ValueError('secondary checkpoint scale must be FP32 [E] on the weight device')
     data = torch.empty((e, n // 256, k // 128, 4, 256, 16), device=packed.device, dtype=torch.int8)
-    offsets = torch.empty((e, n // 256, k // 128, 256, 4), device=packed.device, dtype=torch.uint8)
+    # Two 4-bit relative exponents per byte: 512B per (ntile, kb) weight stage.
+    offsets = torch.empty((e, n // 256, k // 128, 128, 4), device=packed.device, dtype=torch.uint8)
     secondary = torch.empty(e, device=packed.device, dtype=torch.float32)
     lut = torch.tensor(_DOWNSCALE, dtype=torch.uint8, device='cpu',
                        pin_memory=True).to(packed.device, non_blocking=True)
@@ -129,7 +130,11 @@ def _transform(raw, scale_2=None, paired=False):
         data[expert].copy_(vectors.reshape(data[expert].shape).view(torch.int8))
         sf_vectors = relative.reshape(n // 256, 4, 4, 2, 8, k // 128, 4)
         sf_vectors = sf_vectors.permute(0, 5, 1, 2, 4, 3, 6).contiguous()
-        offsets[expert].copy_(sf_vectors.reshape(offsets[expert].shape))
+        # Pack adjacent exponents (even byte -> low nibble, odd -> high nibble).
+        # relative is in [1, 12] by construction, so this is lossless.
+        flat = sf_vectors.reshape(n // 256, k // 128, 1024)
+        nibbles = (flat[..., 0::2] & 0x0F) | (flat[..., 1::2] << 4)
+        offsets[expert].copy_(nibbles.reshape(offsets[expert].shape))
         secondary[expert] = torch.exp2(base.float() - 128) * (1 if scale_2 is None else scale_2[expert])
     return data, offsets, secondary
 

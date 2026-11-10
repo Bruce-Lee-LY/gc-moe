@@ -135,10 +135,10 @@ def tile_s2g_2d(desc_gmem: cute.Pointer, src_smem: cute.Pointer,
 
 @dsl_user_op
 def tma_store_fence(*, loc=None, ip=None) -> None:
-    """Publish completed STSM/shared stores to the async TMA proxy.
+    """Publish completed generic shared writes to the async proxy.
 
-    Call only after the epilogue warp group's shared-memory synchronization
-    and before issuing ``tile_s2g_2d`` on its elected TMA store lane.
+    Call after copy/store completion and the required thread synchronization,
+    before an async TMA store or WGMMA reads the shared stage.
     """
     llvm.inline_asm(None, [], 'fence.proxy.async.shared::cta;', '',
                     has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
