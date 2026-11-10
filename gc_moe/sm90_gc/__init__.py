@@ -92,9 +92,11 @@ def _transform(raw, scale_2=None, paired=False):
     if scale_2 is not None and (scale_2.shape != (e,) or scale_2.dtype != torch.float32
                                or scale_2.device != packed.device):
         raise ValueError('secondary checkpoint scale must be FP32 [E] on the weight device')
-    data = torch.empty((e, n // 256, k // 128, 4, 256, 16), device=packed.device, dtype=torch.int8)
-    # Two 4-bit relative exponents per byte: 512B per (ntile, kb) weight stage.
-    offsets = torch.empty((e, n // 256, k // 128, 128, 4), device=packed.device, dtype=torch.uint8)
+    # One contiguous stage record: unchanged FP4 bytes, then 512B of packed
+    # relative exponents. Views only organize transform writes, with no copy.
+    record = torch.empty((e, n // 256, k // 128, 16896), device=packed.device, dtype=torch.int8)
+    data = record[..., :16384].view(e, n // 256, k // 128, 4, 256, 16)
+    offsets = record[..., 16384:].view(torch.uint8).view(e, n // 256, k // 128, 128, 4)
     secondary = torch.empty(e, device=packed.device, dtype=torch.float32)
     lut = torch.tensor(_DOWNSCALE, dtype=torch.uint8, device='cpu',
                        pin_memory=True).to(packed.device, non_blocking=True)
@@ -136,7 +138,7 @@ def _transform(raw, scale_2=None, paired=False):
         nibbles = (flat[..., 0::2] & 0x0F) | (flat[..., 1::2] << 4)
         offsets[expert].copy_(nibbles.reshape(offsets[expert].shape))
         secondary[expert] = torch.exp2(base.float() - 128) * (1 if scale_2 is None else scale_2[expert])
-    return data, offsets, secondary
+    return record, secondary
 
 
 def transform_weights_for_gc_moe_sm90(l1_weights, l2_weights,

@@ -240,12 +240,17 @@ class _ChildGraph:
                 params.kernel.blockDimY = params.kernel.blockDimZ = 1
                 params.kernel.sharedMemBytes = binary.smem_bytes
                 params.kernel.kernelParams = arguments[index].pointer
-                # Dispatch is an independent root. Compute dependencies retire
-                # shared work or order routed after split shared L2 has started.
-                # Device acquires still protect every dispatch publication.
-                # Finalize/cleanup always joins every local producer.
+                # In the primary context, compute roots wait until every
+                # dispatch CTA has started, without waiting for completion.
+                # Existing shared dependencies carry this order transitively.
+                # Device acquires still protect every dispatch publication;
+                # finalize/cleanup always joins every local producer.
                 prerequisites = getattr(binary, 'wait_for', ())
                 launch_edges = getattr(binary, 'launch_after', ())
+                if (owner.primary_ctx_roles and binary.role in (2, 4, 5)
+                        and not prerequisites and not launch_edges):
+                    launch_edges = ((1, cu.CU_GRAPH_KERNEL_NODE_PORT_LAUNCH_ORDER, 0,
+                                     cu.CUgraphDependencyType.CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC),)
                 launch_roles = tuple(edge[0] for edge in launch_edges)
                 if any(role not in role_nodes for role in (*prerequisites, *launch_roles)):
                     raise ValueError('kernel dependency must reference an earlier graph node')

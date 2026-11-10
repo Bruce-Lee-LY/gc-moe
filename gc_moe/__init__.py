@@ -38,4 +38,4 @@ __all__ = [
     'transform_weights_for_gc_moe',
 ]
 
-__version__ = '0.6.0'
+__version__ = '0.6.1'

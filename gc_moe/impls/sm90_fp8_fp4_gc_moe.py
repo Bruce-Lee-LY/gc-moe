@@ -100,8 +100,9 @@ def wait_count(ptr: cute.Pointer, target: Uint32):
 
 class SM90GCMoERoleKernel:
     def __init__(self, config, layout, role, schedule, has_stats, routed_n_factor=1,
-                 routed_stage_count=0):
+                 routed_stage_count=0, w1_is_record=False, w2_is_record=False):
         self.role = role
+        self.w1_is_record, self.w2_is_record = w1_is_record, w2_is_record
         self.direct_route_scan = 0 < config.bound <= 2
         self.ranks, self.local = config.ranks, config.experts // config.ranks
         self.capacity, self.topk = config.capacity, config.topk
@@ -428,14 +429,21 @@ class SM90GCMoERoleKernel:
         k_size = self.hidden if l1 else self.intermediate
         n_size = 2 * self.intermediate if l1 else self.hidden
         input_offset = self.off_l1_acts if l1 else self.off_l2_acts
+        is_record = self.w1_is_record if l1 else self.w2_is_record
+        weight_stride = 16896 if is_record else 16384
+        offset_stride = 16896 if is_record else 512
         stage_base = stage * self.stage_bytes
         if tid == 0:
             bar = cute.recast_ptr(slab + self.smem - 128 + stage * 8, dtype=Uint64)
             cute.arch.mbarrier_arrive_and_expect_tx(bar, 16896 * self.routed_n_factor)
             for sub in cutlass.range_constexpr(self.routed_n_factor):
                 index = (Uint64(expert) * (n_size // 256) + ntile * self.routed_n_factor + sub) * (k_size // 128) + kb
-                bulk_g2s_1d(slab + stage_base + sub * 16384, weights + index * 16384, Uint32(16384), bar)
-                bulk_g2s_1d(slab + stage_base + 16384 * self.routed_n_factor + sub * 512, offsets + index * 512, Uint32(512), bar)
+                if cutlass.const_expr(is_record and self.role == 2 and self.routed_n_factor == 1):
+                    bulk_g2s_1d(slab + stage_base, weights + index * weight_stride, Uint32(16896), bar)
+                else:
+                    # N512 groups both payloads before both exponent blocks.
+                    bulk_g2s_1d(slab + stage_base + sub * 16384, weights + index * weight_stride, Uint32(16384), bar)
+                    bulk_g2s_1d(slab + stage_base + 16384 * self.routed_n_factor + sub * 512, offsets + index * offset_stride, Uint32(512), bar)
         for j in cutlass.range(tid, n * 8, 256):
             row, k = Uint32(j // 8), Uint32((j % 8) * 16)
             size = Uint32(0)
@@ -571,12 +579,18 @@ class SM90GCMoERoleKernel:
         if tid == (0 if self.max_m == 64 else 64):
             k_size = self.hidden if l1 else self.intermediate
             n_size = 2 * self.intermediate if l1 else self.hidden
+            is_record = self.w1_is_record if l1 else self.w2_is_record
+            weight_stride = 16896 if is_record else 16384
+            offset_stride = 16896 if is_record else 512
             stage_base = stage * self.stage_bytes
             full = cute.recast_ptr(slab + self.full_offset + stage * 8, dtype=Uint64)
             cute.arch.mbarrier_arrive_and_expect_tx(full, 16896)
             index = (Uint64(expert) * (n_size // 256) + ntile) * (k_size // 128) + kb
-            bulk_g2s_1d(slab + stage_base, weights + index * 16384, Uint32(16384), full)
-            bulk_g2s_1d(slab + stage_base + 16384, offsets + index * 512, Uint32(512), full)
+            if cutlass.const_expr(is_record and self.role == 2 and self.routed_n_factor == 1):
+                bulk_g2s_1d(slab + stage_base, weights + index * weight_stride, Uint32(16896), full)
+            else:
+                bulk_g2s_1d(slab + stage_base, weights + index * weight_stride, Uint32(16384), full)
+                bulk_g2s_1d(slab + stage_base + 16384, offsets + index * offset_stride, Uint32(512), full)
 
     @cute.jit
     def _stage_activation(self, base: Uint64, slab: cute.Pointer, expert: Uint32,

@@ -86,7 +86,7 @@ _POINTER_TYPES = (Uint8, Uint64, BFloat16, Uint8, Uint8, Float32,
                   Uint8, Uint8, Float32, Uint32, Uint8, Float32, Uint8, Float32)
 
 
-def _role_specs(config, layout, schedule, has_stats):
+def _role_specs(config, layout, schedule, has_stats, weight_records=(False, False)):
     routed = get_routed_role_config(config, schedule)
     shared = get_shared_role_config(schedule) if config.shared_experts else None
     split = bool(config.shared_experts and schedule.split_shared)
@@ -111,7 +111,8 @@ def _role_specs(config, layout, schedule, has_stats):
                                            role_schedule.grids[2]))
         kernel = SM90GCMoERoleKernel(role_config, layout, role, role_schedule, has_stats,
                                     routed_n_factor=routed.n_factor if role == 2 else 1,
-                                    routed_stage_count=routed.stage_count_override if role == 2 else 0)
+                                    routed_stage_count=routed.stage_count_override if role == 2 else 0,
+                                    w1_is_record=weight_records[0], w2_is_record=weight_records[1])
         wait_for = ((4,) if split and (role == 2 or (role == 5 and not stream_shared)) else
                     ((4,) if config.shared_experts and role == 2 and schedule.tile_m >= 32 else ()))
         launch = (role, role_schedule.smem[index], role_schedule.threads[index],
@@ -176,8 +177,9 @@ def prepare_role_binaries(config, y, w1, w2, buffer, stats=None, context=None,
     # CUDA addresses. Resident JIT code does not need filesystem scans on each
     # call. CuTe resolves its compiler environment at initialization; identity
     # is audited on preparation/compilation misses, not by rescanning os.environ.
+    weight_records = (len(w1) == 2, len(w2) == 2)
     key = (config, buffer.layout, stats is not None, context.dispatch_sms,
-           context.compute_sms, context.schedule_policy)
+           context.compute_sms, context.schedule_policy, weight_records)
     prepared = _CACHE.get(key)
     if prepared is None:
         with COMPILE_LOCK:
@@ -185,15 +187,22 @@ def prepare_role_binaries(config, y, w1, w2, buffer, stats=None, context=None,
             if prepared is None:
                 schedule = get_sm90_role_config(config, context)
                 identity = _compiler_identity('sm_90a')
-                specs = _role_specs(config, buffer.layout, schedule, stats is not None)
+                specs = _role_specs(config, buffer.layout, schedule, stats is not None,
+                                    weight_records)
                 binaries = _get_or_compile_binaries(_binary_key(identity, specs), identity, specs)
                 prepared = _Prepared(binaries)
                 _CACHE[key] = prepared
+    routed_addresses = []
+    for weight, is_record in zip((w1, w2), weight_records):
+        if is_record:
+            payload = weight[0].data_ptr()
+            routed_addresses.extend((payload, payload + 16384, weight[1].data_ptr()))
+        else:
+            routed_addresses.extend(t.data_ptr() for t in weight)
+    shared_addresses = ([t.data_ptr() for pair in (shared_l1_weights, shared_l2_weights)
+                         for t in pair] if config.shared_experts else [0, 0, 0, 0])
     addresses = [buffer.buffer.data_ptr(), buffer.peer_table.data_ptr(), y.data_ptr(),
-                 *(t.data_ptr() for t in (*w1, *w2)), 0 if stats is None else stats.data_ptr(),
-                 *(t.data_ptr() for pair in (shared_l1_weights, shared_l2_weights) for t in pair)
-                 ] if config.shared_experts else [buffer.buffer.data_ptr(), buffer.peer_table.data_ptr(), y.data_ptr(),
-                 *(t.data_ptr() for t in (*w1, *w2)), 0 if stats is None else stats.data_ptr(), 0, 0, 0, 0]
+                 *routed_addresses, 0 if stats is None else stats.data_ptr(), *shared_addresses]
     arguments = [*(ctypes.c_void_p(p) for p in addresses),
                  ctypes.c_uint32(buffer.rank_idx), ctypes.c_uint32(config.tokens),
                  ctypes.c_float(config.clamp)]
