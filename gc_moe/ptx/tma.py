@@ -19,6 +19,13 @@ from .ld_st import (
 
 
 @dsl_user_op
+def global_async_proxy_fence(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], 'fence.proxy.async.global;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT,
+                    loc=loc, ip=ip)
+
+
+@dsl_user_op
 def generic_tensormap_ptr(param_ptr: cute.Pointer,
                           *, loc=None, ip=None) -> cute.Pointer:
     """Convert a selected by-value TensorMap parameter to a generic pointer.
@@ -92,6 +99,59 @@ def tile_g2s_2cta_2d(dst_smem: cute.Pointer, desc_gmem: cute.Pointer,
         'mbarrier::complete_tx::bytes.L2::cache_hint '
         '[$0], [$1, {$3, $4}], [$2], $5;',
         'r,l,r,r,r,l,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def tile_g2s_2d(dst_smem: cute.Pointer, desc_gmem: cute.Pointer,
+                mbar_smem: cute.Pointer, inner: Uint32, outer: Uint32,
+                cache_hint: Uint64, *, loc=None, ip=None) -> None:
+    """Single-CTA 2D TensorMap load (SM120, no cluster)."""
+    llvm.inline_asm(
+        None, [dst_smem.toint(loc=loc, ip=ip).ir_value(),
+               desc_gmem.toint(loc=loc, ip=ip).ir_value(),
+               mbar_smem.toint(loc=loc, ip=ip).ir_value(),
+               inner.ir_value(loc=loc, ip=ip), outer.ir_value(loc=loc, ip=ip),
+               cache_hint.ir_value(loc=loc, ip=ip)],
+        'cp.async.bulk.tensor.2d.shared::cluster.global.'
+        'mbarrier::complete_tx::bytes.L2::cache_hint '
+        '[$0], [$1, {$3, $4}], [$2], $5;',
+        'r,l,r,r,r,l,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def tile_g2s_4d(dst_smem: cute.Pointer, desc_gmem: cute.Pointer,
+                mbar_smem: cute.Pointer, k: Uint32, n: Uint32,
+                domain: Uint32, expert: Uint32, cache_hint: Uint64,
+                *, loc=None, ip=None) -> None:
+    """Single-CTA 4D TensorMap load, including FP4->8bit SMEM unpack (SM120)."""
+    llvm.inline_asm(
+        None, [dst_smem.toint(loc=loc, ip=ip).ir_value(),
+               desc_gmem.toint(loc=loc, ip=ip).ir_value(),
+               mbar_smem.toint(loc=loc, ip=ip).ir_value(),
+               k.ir_value(loc=loc, ip=ip), n.ir_value(loc=loc, ip=ip),
+               domain.ir_value(loc=loc, ip=ip), expert.ir_value(loc=loc, ip=ip),
+               cache_hint.ir_value(loc=loc, ip=ip)],
+        'cp.async.bulk.tensor.4d.shared::cluster.global.'
+        'mbarrier::complete_tx::bytes.L2::cache_hint '
+        '[$0], [$1, {$3, $4, $5, $6}], [$2], $7;',
+        'r,l,r,r,r,r,r,l,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def prefetch_g2s_4d(desc_gmem: cute.Pointer, k: Uint32, n: Uint32,
+                    domain: Uint32, expert: Uint32,
+                    *, loc=None, ip=None) -> None:
+    """Fire-and-forget 4D TensorMap L2 prefetch."""
+    llvm.inline_asm(
+        None, [desc_gmem.toint(loc=loc, ip=ip).ir_value(),
+               k.ir_value(loc=loc, ip=ip), n.ir_value(loc=loc, ip=ip),
+               domain.ir_value(loc=loc, ip=ip), expert.ir_value(loc=loc, ip=ip)],
+        'cp.async.bulk.prefetch.tensor.4d.L2.global.tile '
+        '[$0, {$1, $2, $3, $4}];',
+        'l,r,r,r,r,~{memory}', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
 
 

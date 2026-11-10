@@ -360,6 +360,39 @@ def copy_global_2x16(dst: Uint64, src: Uint64, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def ld_global_16(src: Uint64, *, loc=None, ip=None) -> tuple[Uint32, Uint32, Uint32, Uint32]:
+    """Load half of a split peer copy: one 16-byte remote vector.
+
+    Separating the load from its matching store lets a warp issue a batch of
+    PCIe reads before stalling on the first completion; the fused copy form
+    serializes one round trip per sixteen bytes.
+    """
+    words = llvm.inline_asm(
+        ir.Type.parse('!llvm.struct<(i32,i32,i32,i32)>'),
+        [src.ir_value(loc=loc, ip=ip)],
+        'ld.global.v4.b32 {$0, $1, $2, $3}, [$4];',
+        '=r,=r,=r,=r,l', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+    return tuple(Uint32(llvm.extractvalue(T.i32(), words, [i]))
+                 for i in range(4))
+
+
+@dsl_user_op
+def st_global_16(dst: Uint64, value_0: Uint32, value_1: Uint32,
+                 value_2: Uint32, value_3: Uint32, *, loc=None, ip=None):
+    """Store half of a split peer copy: one 16-byte local vector."""
+    llvm.inline_asm(
+        None, [dst.ir_value(loc=loc, ip=ip),
+               value_0.ir_value(loc=loc, ip=ip),
+               value_1.ir_value(loc=loc, ip=ip),
+               value_2.ir_value(loc=loc, ip=ip),
+               value_3.ir_value(loc=loc, ip=ip)],
+        'st.global.v4.b32 [$0], {$1, $2, $3, $4};',
+        'l,r,r,r,r,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
 def load_shared_8(ptr: cute.Pointer, paired: cutlass.Constexpr,
                    *, loc=None, ip=None):
     offset = 512 if paired else 16
