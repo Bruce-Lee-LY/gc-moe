@@ -19,6 +19,9 @@ MAX_SHARED_L2_BLOCKS = 1 << 15
 # Accumulator barriers reserved here; the compute role indexes them by
 # tile.epilogue_stages, so the two depths must agree.
 ACCUM_BARRIER_STAGES = 2
+# Role 3 uses one dispatch warpgroup and two combine warpgroups.
+COMBINE_WARPS = 8
+FINALIZE_THREADS = (4 + COMBINE_WARPS) * 32
 
 
 def align(value: int, multiple: int) -> int:
@@ -96,7 +99,7 @@ def get_role_shared_layout(role: int, block_m: int, num_experts: int,
     reserve('data_empty', stages * 8, 8)
     reserve('accum_full', ACCUM_BARRIER_STAGES * 8, 8)
     reserve('accum_empty', ACCUM_BARRIER_STAGES * 8, 8)
-    reserve('combine_bars', 8 * 8, 8)
+    reserve('combine_bars', COMBINE_WARPS * 8, 8)
     reserve('task_full', 2 * 8, 8)
     reserve('task_empty', 2 * 8, 8)
     reserve('tmem_ptr', 4, 4)

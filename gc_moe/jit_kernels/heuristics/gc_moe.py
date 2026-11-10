@@ -9,6 +9,8 @@ from struct import pack, unpack
 
 from ...layout.gc_moe import (
     CANDIDATE_BLOCK_M,
+    COMBINE_WARPS,
+    FINALIZE_THREADS,
     SharedStorageLayout,
     align,
     ceil_div,
@@ -149,7 +151,7 @@ def get_role_config(role: int, block_m: int, num_experts: int,
     # dispatch warps. Its JIT separately widens role1 and fixes its stages=2.
     budget_dispatch = (1024 if role == 2 else
                        align(num_experts * 4, 1024) + align(4 * pull_bytes, 1024))
-    budget_barriers = (4 + 4 + 8 + 4) * 8
+    budget_barriers = (4 + 4 + COMBINE_WARPS + 4) * 8
     budget_fixed = budget_dispatch + smem_cd + smem_amax + budget_barriers + 2 * 32 + 4
     budget_stages = (SMEM_CAPACITY - budget_fixed) // stage
     if budget_stages < 2:
@@ -160,11 +162,12 @@ def get_role_config(role: int, block_m: int, num_experts: int,
     # count distinct from the launch allocation retained by the reference.
     actual_dispatch = (1024 if role == 2 else align(num_experts * 4, 1024) +
                        align(dispatch_warps * pull_bytes, 1024))
-    actual_barriers = (dispatch_warps + 4 + 8 + 4) * 8
+    actual_barriers = (dispatch_warps + 4 + COMBINE_WARPS + 4) * 8
     fixed = actual_dispatch + smem_cd + smem_amax + actual_barriers + 2 * 32 + 4
     if role != 1 and fixed + stages * stage > dynamic_smem:
         raise ValueError('role shared-storage footprint exceeds launch allocation')
-    threads = dispatch_threads if role == 1 else 384
+    threads = (dispatch_threads if role == 1 else
+               FINALIZE_THREADS if role == 3 else 384)
     shared_layout = get_role_shared_layout(
         role, block_m, num_experts, pull_bytes, stages,
         store_m_l1=store1, store_m_l2=store2, dispatch_warps=dispatch_warps,
@@ -200,11 +203,11 @@ def get_combine_geometry(hidden: int, slots: int, reusable_bytes: int,
             continue
         chunk_bytes = 2 * hidden // chunks
         if chunk_bytes % 512 == 0:
-            scratch_bytes = slots * 8 * chunk_bytes
+            scratch_bytes = slots * COMBINE_WARPS * chunk_bytes
             if scratch_bytes <= reusable_bytes:
                 break
     else:
         raise ValueError('role3 combine scratch exceeds reusable shared memory')
-    if scratch_bytes + 8 * 8 > launch_bytes:
+    if scratch_bytes + COMBINE_WARPS * 8 > launch_bytes:
         raise ValueError('role3 compact combine allocation exceeds launch shared memory')
     return chunks, chunk_bytes, chunk_bytes // 512

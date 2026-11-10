@@ -33,6 +33,8 @@ from ..common.math import (
 from ..common.tma_copy import load_mixed_k128_tma, use_small_tile_path
 from ..layout.gc_moe import (
     ACCUM_BARRIER_STAGES,
+    COMBINE_WARPS,
+    FINALIZE_THREADS,
     GCBufferLayout,
     MAX_RANKS,
     SIGNAL_OFFSETS,
@@ -326,7 +328,7 @@ class GCMoERoleKernel:
         role_registers = (
             self.dispatch_warps * 32 * dispatch_registers if role == 1 else
             128 * self.non_epi_registers + 256 * self.epi_registers if role == 2 else
-            128 * dispatch_registers + 256 * self.epi_registers)
+            128 * dispatch_registers + (COMBINE_WARPS * 32) * self.epi_registers)
         if role_registers > 64512:
             raise ValueError('role register allocation exceeds the SM budget')
         self.pull_bytes = role_config.pull_bytes
@@ -339,7 +341,8 @@ class GCMoERoleKernel:
             self.finalize_sms = min(
                 compute_sms,
                 max(min(compute_sms, local_experts + 1),
-                    (num_tokens * self.combine_chunks + 7) // 8))
+                    (num_tokens * self.combine_chunks + (COMBINE_WARPS - 1)) //
+                    COMBINE_WARPS))
         self.shared_layout = role_config.shared_layout
         layout = GCBufferLayout(num_ranks, num_ranks * local_experts, capacity, topk,
                                 hidden, intermediate, ring_tokens, sf_ring_tokens,
@@ -403,31 +406,36 @@ class GCMoERoleKernel:
                     cute.arch.mbarrier_init(bars + index, 1)
             cute.arch.mbarrier_init_fence()
         elif physical_warp == 2:
-            if elect_one_sync():
-                if cutlass.const_expr(self.role == 2):
-                    cta_rank, _, _ = cute.arch.block_in_cluster_idx()
-                    data_full = cute.recast_ptr(slab + self.shared_layout.data_full, dtype=Uint64)
-                    data_empty = cute.recast_ptr(slab + self.shared_layout.data_empty, dtype=Uint64)
-                    for index in cutlass.range_constexpr(self.math_stages):
-                        if cta_rank == 0:
-                            cute.arch.mbarrier_init(data_full + index, 4)
-                        cute.arch.mbarrier_init(data_empty + index, 1)
-                    accum_full = cute.recast_ptr(slab + self.shared_layout.accum_full, dtype=Uint64)
-                    accum_empty = cute.recast_ptr(slab + self.shared_layout.accum_empty, dtype=Uint64)
-                    for index in cutlass.range_constexpr(self.accum_stages):
-                        cute.arch.mbarrier_init(accum_full + index, 1)
-                        if cta_rank == 0:
-                            cute.arch.mbarrier_init(accum_empty + index, TASK_EMPTY_CONSUMERS)
-                    full = cute.recast_ptr(slab + self.shared_layout.task_full, dtype=Uint64)
-                    empty = cute.recast_ptr(slab + self.shared_layout.task_empty, dtype=Uint64)
-                    for index in cutlass.range_constexpr(2):
-                        cute.arch.mbarrier_init(full + index, 1)
-                        if cta_rank == 0:
-                            cute.arch.mbarrier_init(empty + index, TASK_EMPTY_CONSUMERS)
-                elif cutlass.const_expr(self.role == 3):
-                    combine = cute.recast_ptr(slab + self.shared_layout.combine_bars, dtype=Uint64)
-                    for index in cutlass.range_constexpr(8):
-                        cute.arch.mbarrier_init(combine + index, 1)
+            # CuTe 4.8.1's single-thread-per-CTA docstring is conservative
+            # for disjoint barriers; the wrapper does not elect a lane.
+            # Each object below has exactly one initializer. Every such
+            # lane executes the init fence before the cluster rendezvous
+            # publishes initialization to consumers. The constructor's
+            # math_stages <= 32 bound keeps all stages within one warp.
+            if cutlass.const_expr(self.role == 2):
+                cta_rank, _, _ = cute.arch.block_in_cluster_idx()
+                data_full = cute.recast_ptr(slab + self.shared_layout.data_full, dtype=Uint64)
+                data_empty = cute.recast_ptr(slab + self.shared_layout.data_empty, dtype=Uint64)
+                if lane < self.math_stages:
+                    if cta_rank == 0:
+                        cute.arch.mbarrier_init(data_full + lane, 4)
+                    cute.arch.mbarrier_init(data_empty + lane, 1)
+                accum_full = cute.recast_ptr(slab + self.shared_layout.accum_full, dtype=Uint64)
+                accum_empty = cute.recast_ptr(slab + self.shared_layout.accum_empty, dtype=Uint64)
+                if lane < self.accum_stages:
+                    cute.arch.mbarrier_init(accum_full + lane, 1)
+                    if cta_rank == 0:
+                        cute.arch.mbarrier_init(accum_empty + lane, TASK_EMPTY_CONSUMERS)
+                full = cute.recast_ptr(slab + self.shared_layout.task_full, dtype=Uint64)
+                empty = cute.recast_ptr(slab + self.shared_layout.task_empty, dtype=Uint64)
+                if lane < 2:
+                    cute.arch.mbarrier_init(full + lane, 1)
+                    if cta_rank == 0:
+                        cute.arch.mbarrier_init(empty + lane, TASK_EMPTY_CONSUMERS)
+            elif cutlass.const_expr(self.role == 3):
+                combine = cute.recast_ptr(slab + self.shared_layout.combine_bars, dtype=Uint64)
+                if lane < COMBINE_WARPS:
+                    cute.arch.mbarrier_init(combine + lane, 1)
             cute.arch.mbarrier_init_fence()
         elif physical_warp == 3:
             if cutlass.const_expr(self.role == 2):
@@ -588,8 +596,8 @@ class GCMoERoleKernel:
             peer = epi_warp
             while peer < Uint32(self.num_ranks):
                 wait_sys_u64_eq(ready + peer * 2, ready_epoch, rank_idx, peer)
-                peer += Uint32(8)
-            sync_aligned(256, 2)
+                peer += Uint32(COMBINE_WARPS)
+            sync_aligned(COMBINE_WARPS * 32, 2)
         if cutlass.const_expr(self.finalize_output):
             # One warp owns a token chunk. Every routed slot of the chunk is
             # fetched into its own plane under a single barrier so the
@@ -664,7 +672,7 @@ class GCMoERoleKernel:
                                     Uint64(chunk_offset)
                                 bulk_g2s_1d(
                                     combine_smem +
-                                    (Uint32(slot_of[g]) * Uint32(8) + epi_warp) *
+                                    (Uint32(slot_of[g]) * Uint32(COMBINE_WARPS) + epi_warp) *
                                     Uint32(chunk_bytes), src,
                                     Uint32(chunk_bytes), bar)
                     cute.arch.sync_warp()
@@ -676,7 +684,7 @@ class GCMoERoleKernel:
                 for g in cutlass.range_constexpr(combine_slots):
                     if ((mask >> Uint32(slot_of[g])) & Uint32(1)) != Uint32(0):
                         load_words = cute.recast_ptr(
-                            combine_smem + (Uint32(slot_of[g]) * Uint32(8) + epi_warp) *
+                            combine_smem + (Uint32(slot_of[g]) * Uint32(COMBINE_WARPS) + epi_warp) *
                             Uint32(chunk_bytes), dtype=Uint32)
                         for j in cutlass.range_constexpr(u4_per_lane):
                             words = ld_shared_u32x4(
@@ -711,7 +719,7 @@ class GCMoERoleKernel:
                     bulk_s2g_1d(dst, store_smem, Uint32(chunk_bytes))
                     tma_store_arrive()
                 cute.arch.sync_warp()
-                token_chunk += Uint32(self.finalize_sms * 8)
+                token_chunk += Uint32(self.finalize_sms * COMBINE_WARPS)
 
 
     @cute.kernel
@@ -1910,7 +1918,7 @@ class GCMoERoleKernel:
             # (including its combine warps) has passed this load and join.
             ready_epoch = Uint64(ld_volatile_u32(
                 signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4)) + Uint64(1)
-            sync_unaligned(384, 1)
+            sync_unaligned(FINALIZE_THREADS, 1)
             expert_counts = cute.make_rmem_tensor(
                 ((self.local_experts + 31) // 32,), Uint32)
             recv_off = SIGNAL_OFFSETS['expert_recv_count_sum'] // 4
@@ -1988,25 +1996,25 @@ class GCMoERoleKernel:
                     self.kernel(signals, peer_ptrs, rank_idx, num_tokens, tensor_maps,
                                 y_out, stats).launch(
                         grid=(self.finalize_sms, 1, 1),
-                        block=(384, 1, 1),
-                        max_number_threads=(384, 1, 1), min_blocks_per_mp=1)
+                        block=(FINALIZE_THREADS, 1, 1),
+                        max_number_threads=(FINALIZE_THREADS, 1, 1), min_blocks_per_mp=1)
                 else:
                     self.kernel(signals, peer_ptrs, rank_idx, num_tokens, tensor_maps,
                                 y_out, stats,
                                 activation_clamp, activation_alpha).launch(
                         grid=(self.finalize_sms, 1, 1),
-                        block=(384, 1, 1),
-                        max_number_threads=(384, 1, 1), min_blocks_per_mp=1)
+                        block=(FINALIZE_THREADS, 1, 1),
+                        max_number_threads=(FINALIZE_THREADS, 1, 1), min_blocks_per_mp=1)
             else:
                 if cutlass.const_expr(activation_clamp is None and activation_alpha is None):
                     self.kernel(signals, peer_ptrs, rank_idx, num_tokens).launch(
                         grid=(self.finalize_sms, 1, 1),
-                        block=(384, 1, 1),
-                        max_number_threads=(384, 1, 1), min_blocks_per_mp=1)
+                        block=(FINALIZE_THREADS, 1, 1),
+                        max_number_threads=(FINALIZE_THREADS, 1, 1), min_blocks_per_mp=1)
                 else:
                     self.kernel(signals, peer_ptrs, rank_idx, num_tokens,
                                 None, None, None,
                                 activation_clamp, activation_alpha).launch(
                         grid=(self.finalize_sms, 1, 1),
-                        block=(384, 1, 1),
-                        max_number_threads=(384, 1, 1), min_blocks_per_mp=1)
+                        block=(FINALIZE_THREADS, 1, 1),
+                        max_number_threads=(FINALIZE_THREADS, 1, 1), min_blocks_per_mp=1)
