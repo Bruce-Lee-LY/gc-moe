@@ -221,8 +221,9 @@ SM120 (compute capability 12.0) has separate interfaces.
 | `sm120_fp8_fp4_gc_moe` | Write SM120 routed and optional fused shared output into `y`. |
 | `SM120GCSymmBuffer` | Own SM120 input views, peer addresses and workspace storage. |
 
-The input contract and examples below describe SM100. The same packed-weight
-preparation and shared-input scale staging work with the SM120 entry points.
+The SM120 entry points use the SM100 weight formats described below, including
+packed `torch.int32` UE8M0 scales for both routed and shared experts.
+Shared-input scale staging also uses the same layout.
 If supplying `num_tokens_bound`, use the same positive bound on all ranks and
 cover every rank's token count. Valid expert IDs within each token must be
 distinct. If repeated IDs exhaust a source's capacity for an expert, SM120

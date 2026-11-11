@@ -17,7 +17,7 @@ from gc_moe.apis.sm120_gc_moe import validate_call
 from gc_moe.layout.sm120_gc_moe import SM120GCBufferLayout
 from tests.test_sm120_gc_moe import (
     build_full_weights, build_shared_weights, build_tokens, cast_grouped_weights_to_fp4,
-    cast_tokens_to_fp8, dequantize_activation, make_shared_input_sf,
+    cast_tokens_to_fp8, dequantize_activation, make_shared_input_sf, pack_ue8m0_weight_scales,
     reference_processed_moe_forward, reference_shared_forward,
 )
 
@@ -41,8 +41,21 @@ def main():
     assert e % world == 0
     raw = tuple(cast_grouped_weights_to_fp4(w) for w in build_full_weights(e, i, h, device))
     local = e // world
-    routed = gc_moe.transform_weights_for_gc_moe_sm120(*[
-        tuple(t[rank * local:(rank + 1) * local].contiguous() for t in pair) for pair in raw])
+    routed_inputs = [
+        (payload[rank * local:(rank + 1) * local].contiguous(),
+         pack_ue8m0_weight_scales(codes[rank * local:(rank + 1) * local]))
+        for payload, codes in raw
+    ]
+    routed = gc_moe.transform_weights_for_gc_moe_sm120(*routed_inputs)
+    payload, scales = routed_inputs[0]
+    for dtype in (torch.float32, torch.uint8):
+        try:
+            gc_moe.transform_weights_for_gc_moe_sm120(
+                (payload, scales.to(dtype)), routed_inputs[1])
+        except ValueError as error:
+            assert 'packed int32 UE8M0' in str(error)
+        else:
+            raise AssertionError(f'accepted routed scales with dtype {dtype}')
     buffer = gc_moe.get_symm_buffer_for_gc_moe_sm120(
         dist.group.WORLD, e, capacity, 1, h, i, num_shared_experts=3)
     # All routed views remain byte-for-byte at their original offsets.
@@ -52,30 +65,28 @@ def main():
     weights = {}
     for count, block_n, gran_k in ((1, 128, 128), (2, 32, 32), (3, 1, 32)):
         original = build_shared_weights(count * i, h, device)
-        # 1: both packed UE8M0; 2: mixed formats; 3: both arbitrary FP32.
         cast_shared = per_token_cast_to_fp8 if block_n == 1 else per_block_cast_to_fp8
-        quant = tuple(cast_shared(w, gran_k=gran_k, use_ue8m0=count == 1 or (count == 2 and j == 0))
-                      for j, w in enumerate(original))
+        quant = tuple(cast_shared(w, gran_k=gran_k, use_ue8m0=True) for w in original)
         recipe = (1, 128, 128) if gran_k == 128 else (1, 1, 32)
-        shared_input = quant
-        if block_n != recipe[1]:
-            shared_input = tuple((data, sf.repeat_interleave(block_n, dim=0)) for data, sf in quant)
-        transformed = gc_moe.transform_weights_for_gc_moe_sm120(*shared_input, shared_recipe=recipe)
-        assert tuple(p[1].dtype for p in transformed) == {
-            1: (torch.int32, torch.int32), 2: (torch.int32, torch.float32),
-            3: (torch.float32, torch.float32)}[count]
+        packed = [
+            (data, pack_ue8m0_weight_scales(
+                ((sf.contiguous().view(torch.int32) >> 23).to(torch.uint8))
+                .repeat_interleave(block_n, dim=0)))
+            for data, sf in quant
+        ]
+        transformed = gc_moe.transform_weights_for_gc_moe_sm120(*packed, shared_recipe=recipe)
         if count == 1:
-            packed = []
-            for data, sf in quant:
-                codes = (sf.contiguous().view(torch.int32) >> 23).to(torch.uint8)
-                codes = codes.repeat_interleave(recipe[1], dim=0)
-                codes = torch.nn.functional.pad(codes, (0, -codes.size(1) % 4), value=127)
-                packed.append((data, codes.view(torch.int32).t().contiguous().t()))
-            control = gc_moe.transform_weights_for_gc_moe_sm120(*packed)
-            for (payload, sf), (control_payload, control_sf) in zip(transformed, control):
-                assert torch.equal(payload.view(torch.uint8), control_payload.view(torch.uint8))
-                assert torch.equal(sf, control_sf)
-            transformed = control
+            control = gc_moe.transform_weights_for_gc_moe(*[
+                (data, sf.t().contiguous().t()) for data, sf in packed])
+            for pair, expected in zip(transformed, control):
+                assert torch.equal(pair[0].view(torch.uint8), expected[0].view(torch.uint8))
+                assert torch.equal(pair[1], expected[1])
+            try:
+                gc_moe.transform_weights_for_gc_moe_sm120(*quant, shared_recipe=recipe)
+            except ValueError as error:
+                assert 'packed int32 UE8M0' in str(error)
+            else:
+                raise AssertionError('accepted FP32 shared scales')
         weights[count] = (quant, transformed, recipe)
 
     # Reject malformed shared arguments before any CUDA launch.
@@ -89,6 +100,7 @@ def main():
         (valid[0], (torch.empty((h // 64, 8, 64, 128), dtype=torch.uint8, device=device),
                     valid[1][1]), 'workspace exceeded'),
         (valid[0], (valid[1][0], valid[1][1][:, :0]), 'invalid scale shape'),
+        (valid[0], (valid[1][0], valid[1][1].float()), 'FP32 shared scale'),
     )
     for w1, w2, label in negative:
         try:
@@ -125,9 +137,25 @@ def main():
         if (count, tokens) == (1, 1) and not asymmetric:
             bound = None
         y = torch.empty_like(ref)
-        gc_moe.sm120_fp8_fp4_gc_moe(y, *routed, buffer, activation_clamp=10.,
-                             num_tokens_bound=bound, **kwargs)
+
+        def launch(y=y, bound=bound, kwargs=kwargs):
+            gc_moe.sm120_fp8_fp4_gc_moe(y, *routed, buffer, activation_clamp=10.,
+                                      num_tokens_bound=bound, **kwargs)
+
+        replay = launch
+        captured_output = None
+        if args.mode == 'graph':
+            # Capture the first call for this configuration without an eager warm-up.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                launch()
+            replay = graph.replay
+            replay()
+            captured_output = y.clone()
+        launch()
         torch.cuda.synchronize()
+        if captured_output is not None:
+            assert torch.equal(y, captured_output)
         def cosine(a, b):
             return float(torch.nn.functional.cosine_similarity(
                 a.float().flatten(), b.float().flatten(), dim=0)) if a.numel() else 1.
@@ -137,16 +165,16 @@ def main():
         dist.all_reduce(metrics, op=dist.ReduceOp.MIN)
         assert metrics[0] >= .99 and metrics[1] >= .99999 and metrics[2] == 1, metrics
         expected = y.clone()
-        def launch(y=y, bound=bound, kwargs=kwargs):
-            gc_moe.sm120_fp8_fp4_gc_moe(y, *routed, buffer, activation_clamp=10.,
-                                 num_tokens_bound=bound, **kwargs)
+        if (count, tokens) == (1, 256):
+            # SM100 applies the BF16-rounded clamp in both expert paths.
+            for fast_math in (False, True):
+                gc_moe.sm120_fp8_fp4_gc_moe(y, *routed, buffer, activation_clamp=.5,
+                                          num_tokens_bound=bound, fast_math=fast_math, **kwargs)
+                shared_expected = buffer.shared_y[:tokens].clone()
+                gc_moe.sm120_fp8_fp4_gc_moe(y, *routed, buffer, activation_clamp=.501,
+                                          num_tokens_bound=bound, fast_math=fast_math, **kwargs)
+                assert torch.equal(buffer.shared_y[:tokens], shared_expected)
 
-        replay = launch
-        if args.mode == 'graph':
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                launch()
-            replay = graph.replay
         captures.append((replay, y, expected, qx, sf, routes, route_w))
         records.append(dict(case=index, shared_experts=count, local_tokens=tokens,
             asymmetric=asymmetric, processed_cos_min=float(metrics[0]),

@@ -71,6 +71,12 @@ def cast_grouped_weights_to_fp4(weights: torch.Tensor) -> Tuple[torch.Tensor, to
     return payload, codes
 
 
+def pack_ue8m0_weight_scales(codes: torch.Tensor) -> torch.Tensor:
+    """Pack four per-row scale bytes into each int32 word."""
+    padded = torch.nn.functional.pad(codes, (0, -codes.size(-1) % 4), value=127)
+    return padded.contiguous().view(torch.int32)
+
+
 def dequantize_mxfp4(packed: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
     """Exact real-arithmetic dequantization of the packed MXFP4 weights."""
     p = packed.view(torch.uint8)
@@ -483,7 +489,10 @@ def main(*, shared=False, readiness=False):
         if shared_n != shared_recipe[1]:
             shared_input = tuple((data, scale.repeat_interleave(shared_n, dim=0))
                                  for data, scale in shared_quant)
-        w1, w2 = gc_moe.transform_weights_for_gc_moe_sm120(*shared_input, shared_recipe=shared_recipe)
+        packed_shared = tuple((data, pack_ue8m0_weight_scales(codes))
+                              for data, codes in shared_reference)
+        w1, w2 = gc_moe.transform_weights_for_gc_moe_sm120(
+            *packed_shared, shared_recipe=shared_recipe)
         shared_kwargs = dict(shared_l1_weights=w1, shared_l2_weights=w2, shared_recipe=shared_recipe)
 
     cake_layer = None

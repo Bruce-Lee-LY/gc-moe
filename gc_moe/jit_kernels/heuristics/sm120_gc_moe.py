@@ -5,8 +5,9 @@ from math import isqrt
 
 from ...impls.sm120_fp8_fp4_gc_moe import (
     MMA_SF_STAGE_BYTES, MMA_TILE_K, MMA_TILE_M, RELAY_SMEM_BYTES,
+    shared_gemm_stage_bytes,
 )
-from ...layout.sm120_gc_moe import PACKED_MIN_ROWS_PER_EXPERT
+from ...layout.sm120_gc_moe import BATCHED_MIN_ROWS_PER_EXPERT
 
 
 def _role2_smem(tile_n, stages, slots, compact_w, gmem_handoff, shared_chunks):
@@ -57,12 +58,12 @@ class SM120RoleConfig:
     compact_w: bool
     shared_chunks: bool
     bf16_handoff: bool
-    packed_bf16: bool
+    batched_returns: bool
     relay_ctas: int
     mirror_metadata: bool
     pull_engine: bool
     dispatch_cache: bool
-    parallel_shared: bool
+    shared_tile_n: int
 
 
 @lru_cache(maxsize=256)
@@ -73,24 +74,30 @@ def _get_sm120_role_config(config, layout, dispatch_sms: int, compute_sms: int,
     # All finalize CTAs can wait for block 0 to publish peer completion.
     combine_grid = min(compute_sms * 2,
                        max(1, (combine_bound * config.hidden + 2047) // 2048))
-    # Wire format depends only on the common bound and workspace geometry.
-    packed_bf16 = (not direct_scan and 'packed_bf16' in layout.views
-                   and config.bound * config.topk >= PACKED_MIN_ROWS_PER_EXPERT * layout.local)
-    mirror_metadata = packed_bf16 and 'packed_scales_in' in layout.views
-    relay = (packed_bf16 and 'relay_output' in layout.views
+    # The return schedule depends only on the common bound and workspace geometry.
+    batched_returns = (not direct_scan and 'batched_routes_in' in layout.views
+                   and config.bound * config.topk >= BATCHED_MIN_ROWS_PER_EXPERT * layout.local)
+    mirror_metadata = batched_returns and 'batched_scales_in' in layout.views
+    relay = (batched_returns and 'relay_output' in layout.views
              and (not mirror_metadata or config.shared_experts > 0))
-    tokens = config.bound if packed_bf16 else config.tokens
+    tokens = config.bound if batched_returns else config.tokens
     rows = (tokens * config.topk + layout.local - 1) // layout.local
-    bf16_handoff = packed_bf16 or (config.ranks > 1 and config.tokens >= 32)
+    bf16_handoff = batched_returns or (config.ranks > 1 and config.tokens >= 32)
     tile_n = _select_tile_n(rows, bf16_handoff)
     stages = 4 if tile_n == 16 else 2
     gmem_handoff = bf16_handoff and tile_n >= 32
     compact_w = tile_n in (48, 80, 96)
     shared_chunks = gmem_handoff and tile_n >= 48
     slots = 2 if gmem_handoff else 1
-    if packed_bf16:
+    if batched_returns:
         combine_grid = min(config.capacity, compute_sms * 4)
     role2_smem = _role2_smem(tile_n, stages, slots, compact_w, gmem_handoff, shared_chunks)
+    shared_tile_n = 0
+    if config.shared_experts and config.tokens:
+        shared_tile_n = (8 if config.tokens <= 8 else 16 if config.tokens <= 16
+                         else 32 if config.tokens <= 32 else 64)
+        stage_bytes = shared_gemm_stage_bytes(shared_tile_n)
+        role2_smem = max(role2_smem, 2 * stage_bytes + 16)
     if relay:
         role2_smem = max(role2_smem, RELAY_SMEM_BYTES)
 
@@ -113,8 +120,8 @@ def _get_sm120_role_config(config, layout, dispatch_sms: int, compute_sms: int,
     reg_cap = ((65536 // (threads * ctas)) & ~15) if ctas >= 2 else 0
     l2_dedicated = 1
     if tile_n >= 64 or gmem_handoff:
-        l2_dedicated = 6 if tile_n == 80 and not packed_bf16 else 4
-    if packed_bf16 and not relay and config.shared_experts == 0:
+        l2_dedicated = 6 if tile_n == 80 and not batched_returns else 4
+    if batched_returns and not relay and config.shared_experts == 0:
         l2_dedicated = 3
     compute_grid = compute_sms * ctas
     if gmem_handoff and not shared_chunks:
@@ -124,23 +131,22 @@ def _get_sm120_role_config(config, layout, dispatch_sms: int, compute_sms: int,
     if relay and compute_grid <= l2_dedicated:
         raise ValueError('SM120 compute partition cannot accommodate return copiers')
     relay_ctas = min(config.ranks, compute_grid - l2_dedicated) if relay else 0
-    cache_rows = config.ranks * config.capacity
-    cache_bytes = (cache_rows * 4 + 127) // 128 * 128 + cache_rows * 8
+    cache_bytes = config.ranks * config.capacity * 8
     # Shared handoff leaves the global pool free for immutable input rows.
     dispatch_cache = (pull_engine and shared_chunks and config.topk >= config.ranks
-                      and (tile_n == 80 or (packed_bf16 and tile_n == 48))
+                      and (tile_n == 80 or (batched_returns and tile_n == 48))
                       and cache_bytes <= layout.views['handoff'].nbytes)
     return SM120RoleConfig(
         grids=(dispatch_ctas, compute_grid, combine_grid),
-        threads=(256, threads, 256 if packed_bf16 else 384),
-        smem=(role1_smem, role2_smem, max(64, 4 * config.topk) if packed_bf16 else 0),
+        threads=(256, threads, 256 if batched_returns else 384),
+        smem=(role1_smem, role2_smem, max(64, 4 * config.topk) if batched_returns else 0),
         tile_n=tile_n, mma_stages=stages, reg_cap=reg_cap,
         l2_dedicated=l2_dedicated, combine_slots=slots,
         gmem_handoff=gmem_handoff, compact_w=compact_w, shared_chunks=shared_chunks,
-        bf16_handoff=bf16_handoff, packed_bf16=packed_bf16,
+        bf16_handoff=bf16_handoff, batched_returns=batched_returns,
         relay_ctas=relay_ctas, mirror_metadata=mirror_metadata,
         pull_engine=pull_engine, dispatch_cache=dispatch_cache,
-        parallel_shared=mirror_metadata and config.shared_experts == 1,
+        shared_tile_n=shared_tile_n,
     )
 
 
