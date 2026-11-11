@@ -35,7 +35,7 @@ import torch.distributed as dist
 from benchmarks.benchmark_gc_moe import _collect_throughput_workload, _collect_weight_storage
 from tests.test_sm120_gc_moe import (
     build_shared_weights, build_tokens, cast_grouped_weights_to_fp4,
-    cast_tokens_to_fp8, make_shared_input_sf,
+    cast_tokens_to_fp8, make_shared_input_sf, pack_ue8m0_weight_scales,
 )
 
 DEFAULT_TOKENS_PER_RANK: List[int] = [
@@ -337,6 +337,8 @@ def main(*, shared=False):
         parser.error('the cutedsl baseline arm has no matching shared expert')
     if num_shared > 1 and 'cake' in arms:
         parser.error('use --arms gc to time more than one shared expert')
+    if 'cake' in arms and (not args.fast_math or not args.activation_clamp.is_integer()):
+        parser.error('Cake comparison requires fast math and an integer clamp')
 
     flashinfer = None
     if 'baseline' in arms or 'cake' in arms:
@@ -447,11 +449,19 @@ def main(*, shared=False):
         import gc_moe
         if rank == 0:
             print("Building GC MoE operator ...")
-        gc_weights = gc_moe.transform_weights_for_gc_moe_sm120(*routed)
+        packed_routed = tuple((payload, pack_ue8m0_weight_scales(codes))
+                              for payload, codes in routed)
+        gc_weights = gc_moe.transform_weights_for_gc_moe_sm120(*packed_routed)
         if shared is not None:
             shared_recipe = (1, 128, 128) if args.shared_weight_gran_k == 128 else (1, 1, 32)
+            packed_shared = tuple(
+                (payload, pack_ue8m0_weight_scales(
+                    ((scale.contiguous().view(torch.int32) >> 23).to(torch.uint8))
+                    .repeat_interleave(shared_recipe[1], dim=0)))
+                for payload, scale in shared
+            )
             shared_weights = gc_moe.transform_weights_for_gc_moe_sm120(
-                *shared, shared_recipe=shared_recipe)
+                *packed_shared, shared_recipe=shared_recipe)
             shared_kwargs = dict(shared_l1_weights=shared_weights[0],
                                  shared_l2_weights=shared_weights[1], shared_recipe=shared_recipe)
         gc_buffer = gc_moe.get_symm_buffer_for_gc_moe_sm120(

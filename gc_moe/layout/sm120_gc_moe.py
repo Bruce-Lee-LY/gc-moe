@@ -9,8 +9,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 
 
-PACKED_BF16_ROW_BYTES = 96
-PACKED_MIN_ROWS_PER_EXPERT = 32
+BATCHED_MIN_ROWS_PER_EXPERT = 32
 MAX_RELAY_BYTES = 256 * 1024 * 1024
 
 
@@ -77,7 +76,8 @@ class SM120GCBufferLayout:
         reserve('l1_acts_sf', (local, hidden // 128, rows), 'int32', 4)
         reserve('l2_acts', (local, rows, intermediate), 'float8_e4m3fn', 1)
         reserve('l2_acts_sf', (local, intermediate // 128, rows), 'int32', 4)
-        # One cell contains 64 routed positions by 64 BF16 columns.
+        # The direct path uses 64-by-64 BF16 cells. Relay returns use
+        # position-major rows in the same arena.
         posblocks = align(capacity * topk, 64) // 64
         colblocks = hidden // 64
         reserve('combine', (posblocks * colblocks * 64 * 64 * 2,), 'uint8', 1)
@@ -95,17 +95,13 @@ class SM120GCBufferLayout:
         # the command publisher.
         reserve('counts', (local, ranks), 'int32', 4)
         reserve('expert_arrive', (local,), 'int32', 4)
-        if ranks > 1 and capacity * topk >= PACKED_MIN_ROWS_PER_EXPERT * local:
-            # Both formats can be used by successive calls on this workspace.
-            # Keep the ordinary BF16 arena as the exact fallback for packed rows.
-            reserve('packed_bf16', (posblocks * colblocks * 64 * PACKED_BF16_ROW_BYTES,),
-                    'uint8', 1)
-            reserve('packed_routes_out', (capacity * topk,), 'int32', 4)
-            reserve('packed_routes_in', (ranks, capacity * topk), 'int32', 4)
+        if ranks > 1 and capacity * topk >= BATCHED_MIN_ROWS_PER_EXPERT * local:
+            reserve('batched_routes_out', (capacity * topk,), 'int32', 4)
+            reserve('batched_routes_in', (ranks, capacity * topk), 'int32', 4)
             if topk < ranks:
-                reserve('packed_scales_in', (ranks, capacity, hidden // 128), 'int32', 4)
-                reserve('packed_weights_in', (ranks, capacity, topk), 'float32', 4)
-            relay_shape = (ranks, capacity * topk, colblocks * PACKED_BF16_ROW_BYTES)
+                reserve('batched_scales_in', (ranks, capacity, hidden // 128), 'int32', 4)
+                reserve('batched_weights_in', (ranks, capacity, topk), 'float32', 4)
+            relay_shape = (ranks, capacity * topk, hidden * 2)
             # At least one expected route per token and destination makes
             # batched returns worthwhile. Shared work can also hide the copy.
             if ((topk >= ranks or shared_experts)
@@ -117,6 +113,7 @@ class SM120GCBufferLayout:
         # Append shared storage so every routed offset remains identical.
         if shared_experts:
             shared_i = shared_experts * intermediate
+            reserve('shared_fc1_done', ((capacity + 7) // 8,), 'int32', 4)
             reserve('shared_l2_acts', (capacity, shared_i), 'float8_e4m3fn', 1)
             reserve('shared_l2_acts_sf', (capacity, shared_i // 128), 'int32', 4)
             reserve('shared_y', (capacity, hidden), 'bfloat16', 2)

@@ -155,9 +155,8 @@ class _KernelArgs:
         return b"".join(ctypes.string_at(ctypes.addressof(x), ctypes.sizeof(x)) for x in self.values)
 
 
-def _child_key(binaries: Sequence[RoleBinary], arguments: Sequence[_KernelArgs],
-               parallel_shared: bool) -> bytes:
-    key = hashlib.sha256(bytes((parallel_shared,)))
+def _child_key(binaries: Sequence[RoleBinary], arguments: Sequence[_KernelArgs]) -> bytes:
+    key = hashlib.sha256()
     for binary, role_args in zip(binaries, arguments):
         key.update(len(role_args.signature).to_bytes(4, 'little'))
         key.update(role_args.signature)
@@ -197,12 +196,10 @@ def _runtime_locked(function):
 
 class _ChildGraph:
     def __init__(self, owner: 'GreenContextPair', binaries: Sequence[RoleBinary],
-                 arguments: Sequence[_KernelArgs], parallel_shared: bool):
+                 arguments: Sequence[_KernelArgs]):
         roles = tuple(binary.role for binary in binaries)
-        if roles not in ((1, 2, 3), (1, 4, 5, 2, 3)):
-            raise ValueError('expected SM120 dispatch, optional shared, routed and finalize roles')
-        if parallel_shared and len(roles) != 5:
-            raise ValueError('parallel shared mode requires shared expert roles')
+        if roles != (1, 2, 3):
+            raise ValueError('expected SM120 dispatch, compute and finalize roles')
         if len(arguments) != len(binaries):
             raise ValueError('expected one argument vector per role')
         self.graph = None
@@ -235,11 +232,7 @@ class _ChildGraph:
                 edge_data = None
                 if binary.role == 3:
                     dependencies = list(nodes.values())
-                elif binary.role == 5:
-                    dependencies = [nodes[4]]
-                elif binary.role == 2 and len(roles) == 5 and not parallel_shared:
-                    dependencies = [nodes[5]]
-                elif owner.primary_ctx_roles and binary.role in (2, 4):
+                elif owner.primary_ctx_roles and binary.role == 2:
                     # Give every dispatch CTA a seat before compute starts.
                     # Routed still acquires each expert's data from dispatch.
                     dependencies = [nodes[1]]
@@ -344,13 +337,12 @@ class GreenContextPair:
             self.device))
 
     def _check_kernel(self, binary: RoleBinary, kernel):
-        if binary.role in (1, 2, 3):
-            active = _ok(cu.cuOccupancyMaxActiveBlocksPerMultiprocessor(
-                cu.CUfunction(int(kernel)), binary.threads, binary.smem_bytes))
-            sms = self.dispatch_sms if binary.role == 1 else self.compute_sms
-            if binary.grid > active * sms:
-                raise RuntimeError(f'SM120 role {binary.role} requires {binary.grid} resident CTAs, '
-                                   f'but the partition can hold {active * sms}')
+        active = _ok(cu.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            cu.CUfunction(int(kernel)), binary.threads, binary.smem_bytes))
+        sms = self.dispatch_sms if binary.role == 1 else self.compute_sms
+        if binary.grid > active * sms:
+            raise RuntimeError(f'SM120 role {binary.role} requires {binary.grid} resident CTAs, '
+                               f'but the partition can hold {active * sms}')
 
     @_runtime_locked
     def _get_loaded_kernel(self, binary: RoleBinary) -> _LoadedKernel:
@@ -385,7 +377,7 @@ class GreenContextPair:
 
     @_runtime_locked
     def launch(self, binaries: Sequence[RoleBinary], arguments: Sequence,
-               stream: int | None = None, *, parallel_shared: bool = False) -> None:
+               stream: int | None = None) -> None:
         if _RUNTIME_STATE != 'open':
             raise RuntimeError(f"kernel runtime is {_RUNTIME_STATE}")
         if self._state != 'open':
@@ -407,10 +399,10 @@ class GreenContextPair:
         else:
             common = _KernelArgs(arguments)
             args = (common,) * len(binaries)
-        key = _child_key(binaries, args, parallel_shared)
+        key = _child_key(binaries, args)
         graph = self.graphs.get(key)
         if graph is None:
-            graph = _ChildGraph(self, binaries, args, parallel_shared)
+            graph = _ChildGraph(self, binaries, args)
             try:
                 self.graphs[key] = graph
             except Exception:

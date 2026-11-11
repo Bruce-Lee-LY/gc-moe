@@ -72,10 +72,10 @@ def validate_call(y, w1, w2, buffer, stats, recipe, activation, clamp,
             if (not isinstance(pair, (tuple, list)) or len(pair) != 2
                     or not all(isinstance(t, torch.Tensor) for t in pair)):
                 raise ValueError(f'{name} requires the transformed data/scale pair')
-        if shared_l2_weights[0].ndim not in (3, 4):
+        if shared_l2_weights[0].ndim != 3:
             raise ValueError('shared W2 requires the transformed SM120 tile layout')
         shared_w2 = shared_l2_weights[0]
-        shared_i = shared_w2.shape[0 if shared_w2.ndim == 3 else 1] * 128
+        shared_i = shared_w2.shape[0] * 128
         if shared_i <= 0 or shared_i % buffer.intermediate_hidden:
             raise ValueError('shared intermediate must contain whole shared experts')
         shared_experts = shared_i // buffer.intermediate_hidden
@@ -85,24 +85,12 @@ def validate_call(y, w1, w2, buffer, stats, recipe, activation, clamp,
         for name, pair, n, k in (
                 ('shared W1', shared_l1_weights, 2 * shared_i, buffer.hidden),
                 ('shared W2', shared_l2_weights, buffer.hidden, shared_i)):
-            if not isinstance(pair, (tuple, list)) or len(pair) != 2:
-                raise ValueError(f'{name} requires the transformed data/scale pair')
-            packed_sf = isinstance(pair[1], torch.Tensor) and pair[1].dtype == torch.int32
-            if packed_sf:
-                payload, sf = pair
-                if (payload.shape != (k // 128, n, 128) or payload.dtype != torch.float8_e4m3fn
-                        or not payload.is_contiguous() or sf.stride() != (1, n)
-                        or sf.shape != (n, (k + packed_gran_k - 1) // packed_gran_k)
-                        or any(t.device != device or t.data_ptr() % 16 for t in pair)):
-                    raise ValueError(f'invalid {name} SM100 packed weight layout')
-                continue
-            for tensor, shape, dtype in zip(pair, ((n // 64, k // 128, 64, 128),
-                                                    (n // 64, k // 128, 64, 4)),
-                                               (torch.uint8, torch.float32)):
-                if (not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != shape
-                        or tensor.dtype != dtype or tensor.device != device
-                        or not tensor.is_contiguous() or tensor.data_ptr() % 16):
-                    raise ValueError(f'invalid {name} SM120 tile layout; transform weights first')
+            payload, sf = pair
+            if (payload.shape != (k // 128, n, 128) or payload.dtype != torch.float8_e4m3fn
+                    or sf.dtype != torch.int32 or not payload.is_contiguous()
+                    or sf.stride() != (1, n) or sf.shape != (n, (k + packed_gran_k - 1) // packed_gran_k)
+                    or any(t.device != device or t.data_ptr() % 16 for t in pair)):
+                raise ValueError(f'invalid {name} SM100 packed weight layout')
     return ValidatedCall(buffer.group.size(), buffer.num_experts,
                           buffer.num_max_tokens_per_rank, buffer.num_topk,
                           buffer.hidden, buffer.intermediate_hidden,

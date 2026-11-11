@@ -1,4 +1,4 @@
-"""SM120 role preparation and pointer ABI; compiler utilities are shared with GC MoE."""
+"""SM120 role preparation and by-value TensorMap launch arguments."""
 from __future__ import annotations
 
 import ctypes
@@ -11,7 +11,7 @@ import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Uint8, Uint32, Uint64
 from cutlass.cute.runtime import make_ptr
 
-from ...impls.sm120_fp8_fp4_gc_moe import SM120GCMoERoleKernel, SM120SharedExpertGemm
+from ...impls.sm120_fp8_fp4_gc_moe import SM120GCMoERoleKernel
 from ...runtime.sm120_gc_moe import RoleBinary, get_context
 from ...runtime.jit import (
     COMPILE_LOCK,
@@ -34,9 +34,6 @@ _CACHE: dict[tuple, _Prepared] = {}
 _BINARY_CACHE: dict[tuple, tuple[RoleBinary, ...]] = {}
 # Encoded TensorMaps plus every tensor whose address they embed.
 _MAP_CACHE: dict[tuple, tuple] = {}
-_SHARED_BINARIES: dict[tuple, tuple[RoleBinary, ...]] = {}
-_SHARED_PREPARED: dict[tuple, tuple[RoleBinary, ...]] = {}
-_SHARED_BINDINGS: dict[tuple, tuple] = {}
 
 
 def _compiler_identity(target: str) -> CompilerIdentity:
@@ -53,16 +50,17 @@ def _assemble_sm120_ptx(ptx, dump_dir, basename, identity):
                         ptxas_options=identity.ptxas_options)
 
 
-def _assemble_role_ptx(ptx, role, dump_dir, identity, reg_cap=0, threads=0):
+def _assemble_role_ptx(ptx, role, dump_dir, identity, reg_cap=0, threads=0,
+                       shared_maps=False):
     ptx = _clean_cute_ptx(ptx)
     formals = _entry_formals(ptx)
-    if len(formals) != 15:
-        raise RuntimeError('SM120 CuTe launch ABI must have twelve pointers and three scalars')
+    pointer_count = len(_POINTER_TYPES)
+    if len(formals) != pointer_count + 3:
+        raise RuntimeError('SM120 CuTe launch ABI has an unexpected formal count')
     for ordinal, formal in enumerate(formals):
-        # Map formals 7-10 need 128-byte alignment for tensormap prefetch.
-        align = 128 if 7 <= ordinal <= 10 else 16
-        kind = (r'\.u64\s+\.ptr\s+\.global\s+\.align\s+' + str(align) if ordinal < 12
-                else r'\.u32' if ordinal < 14 else r'\.f32')
+        align = 128 if ordinal in _MAP_FORMALS else 16
+        kind = (r'\.u64\s+\.ptr\s+\.global\s+\.align\s+' + str(align) if ordinal < pointer_count
+                else r'\.u32' if ordinal < pointer_count + 2 else r'\.f32')
         if re.search(kind + r'\s+\S+_param_' + str(ordinal) + r',?\s*$', formal) is None:
             raise RuntimeError(f'SM120 CuTe launch formal {ordinal} changed type or order')
     if role == 2:
@@ -70,6 +68,8 @@ def _assemble_role_ptx(ptx, role, dump_dir, identity, reg_cap=0, threads=0):
             raise RuntimeError('SM120 CuTe compute lost its block-scaled MMA')
         if 'cp.async.bulk.tensor' not in ptx:
             raise RuntimeError('SM120 CuTe compute lost its TensorMap loads')
+        ordinals = _MAP_FORMALS if shared_maps else _MAP_FORMALS[:4]
+        ptx = _pass_tensor_maps_by_value(ptx, formals, ordinals)
     if role == 3 and threads == 384:
         # Match the two-resident-CTA finalize grid used by the scheduler.
         ptx, rewritten = re.subn(
@@ -119,15 +119,35 @@ def _entry_formals(ptx: str) -> list[str]:
         raise RuntimeError('CuTe kernel entry formals changed')
     return lines
 
+
+def _pass_tensor_maps_by_value(ptx, formals, ordinals):
+    """Use the entry parameter's generic address at each TMA instruction."""
+    for ordinal in ordinals:
+        formal = formals[ordinal]
+        name = formal.rstrip().rstrip(',').split()[-1]
+        load = re.compile(r'(?m)^([ \t]*)ld\.param\.(?:u64|b64)[ \t]+(%rd[0-9]+),[ \t]*\['
+                          + re.escape(name) + r'\];[ \t]*$')
+        uses = re.findall(r'(?<![A-Za-z0-9_.$])' + re.escape(name) + r'(?![A-Za-z0-9_.$])', ptx)
+        if len(uses) != 2 or len(list(load.finditer(ptx))) != 1:
+            raise RuntimeError(f'SM120 CuTe TensorMap formal {ordinal} changed uses')
+        comma = ',' if formal.rstrip().endswith(',') else ''
+        ptx = ptx.replace(formal, f'    .param .align 128 .b8 {name}[128]{comma}', 1)
+        ptx = load.sub(lambda m: f'{m[1]}cvta.param::entry.u64 {m[2]}, {name};', ptx, count=1)
+    return ptx
+
+
 _POINTER_TYPES = (Uint8, Uint64, BFloat16, Uint8, Uint32,
-                  Uint8, Uint32, Uint8, Uint8, Uint8, Uint8, Uint32)
+                  Uint8, Uint32, Uint8, Uint8, Uint8, Uint8, Uint32,
+                  Uint8, Uint8, Uint8, Uint8, Uint8)
+_MAP_FORMALS = (7, 8, 9, 10, 14, 15)
 
 
-def _role_specs(config, layout, schedule, has_stats, primary_ctx):
+def _role_specs(config, layout, schedule, has_stats, primary_ctx, shared_layout):
     specs = []
     for role in (1, 2, 3):
         kernel = SM120GCMoERoleKernel(config, layout, role, schedule, has_stats,
-                                    launch_dependents=primary_ctx and role == 1)
+                                    launch_dependents=primary_ctx and role == 1,
+                                    shared_layout=shared_layout)
         specs.append((kernel, (role, schedule.smem[role - 1],
                                schedule.threads[role - 1],
                                schedule.grids[role - 1])))
@@ -137,7 +157,7 @@ def _role_specs(config, layout, schedule, has_stats, primary_ctx):
 def _compile_roles(specs, identity):
     pointers = []
     for ordinal, dtype in enumerate(_POINTER_TYPES):
-        align = 128 if 7 <= ordinal <= 10 else 16
+        align = 128 if ordinal in _MAP_FORMALS else 16
         pointers.append(make_ptr(dtype, 0, cute.AddressSpace.gmem, assumed_align=align))
     pointers = tuple(pointers)
     binaries = []
@@ -145,10 +165,10 @@ def _compile_roles(specs, identity):
         role = launch[0]
         cubin = compile_kernel(
             kernel, (*pointers, Uint32(0), Uint32(0), Float32(0)), identity,
-            lambda ptx, dump_dir, reg_cap=kernel.reg_cap,
-                   threads=kernel.threads:
+            lambda ptx, dump_dir, reg_cap=kernel.reg_cap, threads=kernel.threads,
+                   shared_maps=kernel.shared_tile_n > 0:
                 _assemble_role_ptx(ptx, role, dump_dir, identity,
-                                   reg_cap, threads))
+                                   reg_cap, threads, shared_maps))
         binaries.append(RoleBinary(role, cubin, *launch[1:]))
     return tuple(binaries)
 
@@ -184,8 +204,8 @@ def _make_compact_weight_desc(payload):
         (segment, 64, 1, 1), 64)
 
 
-def _get_map_storage(config, buffer, w1, w2, device, tile_n, compact_w=False):
-    """Encode the four role2 TensorMaps once per live pointer set.
+def _get_map_values(buffer, w1, w2, tile_n, compact_w, shared_weights):
+    """Encode the role 2 TensorMaps once per live pointer set.
 
     The descriptors embed global base addresses, so the cache pins the
     workspace and weight tensors to keep those addresses stable.
@@ -193,7 +213,8 @@ def _get_map_storage(config, buffer, w1, w2, device, tile_n, compact_w=False):
     layout = buffer.layout
     local, rows = layout.local, layout.rows
     key = (buffer.buffer.data_ptr(), w1[0].data_ptr(), w1[1].data_ptr(),
-           w2[0].data_ptr(), w2[1].data_ptr(), config, tile_n, compact_w)
+           w2[0].data_ptr(), w2[1].data_ptr(), tile_n, compact_w,
+           tuple(t.data_ptr() for pair in shared_weights for t in pair))
     cached = _MAP_CACHE.get(key)
     if cached is not None:
         return cached[0]
@@ -208,34 +229,46 @@ def _get_map_storage(config, buffer, w1, w2, device, tile_n, compact_w=False):
     # N x 128 E4M3 bytes and expect_tx matches the kernel's stage budget.
     specs = (
         w1_desc,
-        make_tma_2d_desc(buffer.l1_acts.view(local * rows, config.hidden),
-                         config.hidden, local * rows, 128, tile_n,
-                         config.hidden, 128),
+        make_tma_2d_desc(buffer.l1_acts.view(local * rows, layout.hidden),
+                         layout.hidden, local * rows, 128, tile_n,
+                         layout.hidden, 128),
         w2_desc,
-        make_tma_2d_desc(buffer.l2_acts.view(local * rows, config.intermediate),
-                         config.intermediate, local * rows, 128, tile_n,
-                         config.intermediate, 128),
+        make_tma_2d_desc(buffer.l2_acts.view(local * rows, layout.intermediate),
+                         layout.intermediate, local * rows, 128, tile_n,
+                         layout.intermediate, 128),
     )
-    payloads = []
-    for spec in specs:
+    shared_specs = []
+    for payload, _ in shared_weights:
+        blocks, weight_rows, _ = payload.shape
+        shared_specs.append(make_tma_2d_desc(
+            payload, 128, blocks * weight_rows, 128, 64, 128, 128))
+    maps = []
+    for spec in (*specs, *shared_specs):
         descriptor = spec.encode()
         payload = ctypes.string_at(descriptor.getPtr(), 128)
         if len(payload) != 128:
             raise RuntimeError('SM120 TensorMap is not 128 bytes')
-        payloads.append(payload)
-    map_storage = torch.empty(512, dtype=torch.uint8, device=device)
-    map_storage.copy_(torch.frombuffer(bytearray(b''.join(payloads)), dtype=torch.uint8))
-    _MAP_CACHE[key] = (map_storage, buffer, w1, w2)
-    return map_storage
+        maps.append((ctypes.c_uint8 * 128).from_buffer_copy(payload))
+    map_values = tuple(maps)
+    _MAP_CACHE[key] = (map_values, buffer, w1, w2, shared_weights)
+    return map_values
 
 
-def prepare_role_binaries(config, y, w1, w2, buffer, stats=None, context=None):
+def prepare_role_binaries(config, y, w1, w2, buffer, stats=None, context=None,
+                          shared_weights=()):
     if torch.cuda.get_device_capability(y.device) != (12, 0):
         raise ValueError('SM120 CuTe GC requires compute capability 12.0')
     if context is None:
         context = get_context()
     schedule = get_sm120_role_config(config, context, buffer.layout)
-    key = (config, buffer.layout, schedule, stats is not None, context.primary_ctx_roles)
+    shared_layout = None
+    if schedule.shared_tile_n:
+        k128 = tuple(sf.shape[1] != weight.shape[0] for weight, sf in shared_weights)
+        block_m = get_block_m_for_gc_moe(
+            config.ranks, config.experts, config.capacity, config.tokens, config.topk)
+        shared_layout = (k128, block_m, buffer.shared_l1_acts_sf.shape[0])
+    key = (config, buffer.layout, schedule, stats is not None,
+           context.primary_ctx_roles, shared_layout)
     prepared = _CACHE.get(key)
     if prepared is None:
         with COMPILE_LOCK:
@@ -243,39 +276,38 @@ def prepare_role_binaries(config, y, w1, w2, buffer, stats=None, context=None):
             if prepared is None:
                 identity = _compiler_identity('sm_120a')
                 specs = _role_specs(config, buffer.layout, schedule, stats is not None,
-                                    context.primary_ctx_roles)
+                                    context.primary_ctx_roles, shared_layout)
                 binaries = _get_or_compile_binaries(_binary_key(identity, specs), identity, specs)
                 prepared = _Prepared(binaries)
                 _CACHE[key] = prepared
-    tile_n = schedule.tile_n
-    map_storage = _get_map_storage(config, buffer, w1, w2, y.device, tile_n,
-                                    schedule.compact_w)
-    map_base = map_storage.data_ptr()
+    map_values = _get_map_values(buffer, w1, w2, schedule.tile_n,
+                                 schedule.compact_w, shared_weights)
     addresses = [buffer.buffer.data_ptr(), buffer.peer_table.data_ptr(), y.data_ptr(),
                  w1[0].data_ptr(), w1[1].data_ptr(),
                  w2[0].data_ptr(), w2[1].data_ptr(),
-                 map_base, map_base + 128, map_base + 256, map_base + 384,
+                 0, 0, 0, 0,
                  0 if stats is None else stats.data_ptr()]
-    arguments = [*(ctypes.c_void_p(p) for p in addresses),
-                 ctypes.c_uint32(buffer.rank_idx), ctypes.c_uint32(config.tokens),
-                 ctypes.c_float(config.clamp)]
-    return prepared.binaries, arguments
+    if shared_weights:
+        addresses.extend(sf.data_ptr() for _, sf in shared_weights)
+        addresses.extend((0, 0, buffer.shared_l1_acts_sf.data_ptr()))
+    else:
+        addresses.extend((0,) * 5)
+    common = tuple(ctypes.c_void_p(p) for p in addresses) + (
+        ctypes.c_uint32(buffer.rank_idx), ctypes.c_uint32(config.tokens), ctypes.c_float(config.clamp))
+    compute = list(common)
+    ordinals = _MAP_FORMALS if schedule.shared_tile_n else _MAP_FORMALS[:4]
+    for ordinal, value in zip(ordinals, map_values):
+        compute[ordinal] = value
+    return prepared.binaries, (common, compute, common)
 
 
 def launch_sm120_gc_moe(config, y, w1, w2, buffer, stats,
                        shared_w1=None, shared_w2=None):
     context = get_context()
+    shared_weights = (shared_w1, shared_w2) if config.shared_experts else ()
     binaries, arguments = prepare_role_binaries(
-        config, y, w1, w2, buffer, stats, context)
-    parallel_shared = False
-    if config.shared_experts:
-        shared_binaries, shared_arguments = _prepare_shared_binaries(
-            config, buffer, shared_w1, shared_w2)
-        schedule = get_sm120_role_config(config, context, buffer.layout)
-        parallel_shared = schedule.parallel_shared
-        binaries = (binaries[0], *shared_binaries, binaries[1], binaries[2])
-        arguments = (arguments, *shared_arguments, arguments, arguments)
-    context.launch(binaries, arguments, parallel_shared=parallel_shared)
+        config, y, w1, w2, buffer, stats, context, shared_weights)
+    context.launch(binaries, arguments)
 
 
 def release_workspace(buffer):
@@ -286,74 +318,3 @@ def release_workspace(buffer):
     for key in tuple(_MAP_CACHE):
         if key[0] == address:
             _MAP_CACHE.pop(key, None)
-    for key, binding in tuple(_SHARED_BINDINGS.items()):
-        if binding[0] is buffer:
-            _SHARED_BINDINGS.pop(key, None)
-
-
-def _prepare_shared_binaries(config, buffer, w1, w2):
-    tile_n = (8 if config.tokens <= 8 else 16 if config.tokens <= 16
-              else 32 if config.tokens <= 32 else 64)
-    shared_i = config.intermediate * config.shared_experts
-    block_m = get_block_m_for_gc_moe(
-        config.ranks, config.experts, config.capacity, config.tokens, config.topk)
-    input_sf_rows = buffer.shared_l1_acts_sf.shape[0]
-    packed = tuple(pair[1].dtype == torch.int32 for pair in (w1, w2))
-    k128 = tuple(is_packed and pair[1].shape[1] != pair[0].shape[0]
-                 for is_packed, pair in zip(packed, (w1, w2)))
-    shape_key = (config.hidden, shared_i, config.tokens,
-                 config.fast_math, tile_n, packed, k128, block_m, input_sf_rows)
-    binaries = _SHARED_PREPARED.get(shape_key)
-    if binaries is None:
-        binaries = _compile_shared_binaries(shape_key)
-    tensors = ((*w1, buffer.x, buffer.shared_l1_acts_sf, buffer.shared_l2_acts, buffer.shared_l2_acts_sf),
-               (*w2, buffer.shared_l2_acts, buffer.shared_l2_acts_sf,
-                buffer.shared_y, buffer.shared_l2_acts_sf))
-    # Captured child nodes embed these addresses; retain their allocations.
-    pointer_key = tuple(t.data_ptr() for role in tensors for t in role)
-    binding = _SHARED_BINDINGS.get(pointer_key)
-    if binding is None:
-        maps = tuple(_make_weight_map(role[0]) if is_packed else None
-                     for role, is_packed in zip(tensors, packed))
-        binding = (buffer, w1, w2, maps)
-        _SHARED_BINDINGS[pointer_key] = binding
-    arguments = tuple([*(ctypes.c_void_p(t.data_ptr()) for t in role),
-                        ctypes.c_void_p(0 if desc is None else desc.data_ptr()),
-                        ctypes.c_float(config.clamp)] for role, desc in zip(tensors, binding[3]))
-    return binaries, arguments
-
-
-def _make_weight_map(payload):
-    blocks, rows, _ = payload.shape
-    desc = make_tma_2d_desc(payload, 128, blocks * rows, 128, 64, 128, 128).encode()
-    storage = torch.empty(128, dtype=torch.uint8, device=payload.device)
-    storage.copy_(torch.frombuffer(bytearray(ctypes.string_at(desc.getPtr(), 128)), dtype=torch.uint8))
-    return storage
-
-
-def _compile_shared_binaries(shape_key):
-    hidden, intermediate, tokens, fast_math, tile_n, packed, k128, block_m, input_sf_rows = shape_key
-    identity = compiler_identity('sm_120a', SM120SharedExpertGemm.__call__,
-                                  Path(__file__).resolve().parents[2],
-                                  'gc_moe_sm120_shared')
-    key = (identity, *shape_key)
-    with COMPILE_LOCK:
-        binaries = _SHARED_BINARIES.get(key)
-        if binaries is None:
-            pointers = tuple(make_ptr(Uint8, 0, cute.AddressSpace.gmem, assumed_align=16)
-                             for _ in range(7))
-            compiled = []
-            for index, role in enumerate((4, 5)):
-                first = index == 0
-                kernel = SM120SharedExpertGemm(hidden, intermediate,
-                    tokens, first=first, tile_n=tile_n, fast_math=fast_math,
-                    ue8m0_weights=packed[index], k128_weights=k128[index],
-                    input_block_m=block_m, input_sf_rows=input_sf_rows)
-                cubin = compile_kernel(kernel, (*pointers, Float32(0)), identity,
-                    lambda ptx, out: _assemble_sm120_ptx(
-                        _clean_cute_ptx(ptx), out, 'sm120_shared', identity))
-                compiled.append(RoleBinary(role, cubin, kernel.smem, 128, kernel.grid))
-            binaries = tuple(compiled)
-            _SHARED_BINARIES[key] = binaries
-        _SHARED_PREPARED[shape_key] = binaries
-    return binaries
