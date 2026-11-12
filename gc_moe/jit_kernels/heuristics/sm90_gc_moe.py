@@ -58,6 +58,13 @@ def _get_sm90_role_config(config, dispatch_sms: int, compute_sms: int, policy: s
     else:
         tile_m = 8 if config.bound <= 16 else 16
     workers = (1 if tile_m == 64 else 2) if pipelined else (3 if tile_m == 8 else 2)
+    # Small-bound routed decode (T=1/2) runs one CTA per SM so each CTA owns
+    # the SM's whole TMA stream. Packing the two adjacent K128 weight records
+    # of one task into a single stage halves the per-stage fixed cost; the
+    # 198 912 B budget also makes two CTAs physically unable to co-reside, so
+    # the grid size and the resource both enforce the single resident CTA.
+    deepen_small_ring = (high_sm and small_pipelined and config.bound <= 2
+                         and config.shared_experts == 0)
     small_shared = has_shared and small_pipelined
     if small_shared:
         # A shared branch uses the same compute SM budget as routed work.
@@ -65,9 +72,14 @@ def _get_sm90_role_config(config, dispatch_sms: int, compute_sms: int, policy: s
     elif has_shared and pipelined and tile_m == 24:
         # M24 shares the compute context with the complete shared branch.
         workers = 1
+    if deepen_small_ring:
+        workers = 1
     if pipelined:
         stage_bytes = (17408 + tile_m * 132 + 1023) // 1024 * 1024
         stages, epilogue_rows = get_role_pipeline_geometry(tile_m, policy)
+        if deepen_small_ring:
+            stage_bytes = (17408 * 2 + tile_m * 132 * 2 + 1023) // 1024 * 1024
+            stages = 5
         compute_smem = (stages * stage_bytes + 1024 + epilogue_rows * 1024
                         + (0 if tile_m == 64 else 256))
     else:
@@ -142,6 +154,7 @@ class RoutedRoleConfig:
     schedule: SM90RoleConfig
     n_factor: int
     stage_count_override: int = 0
+    k_pack: int = 1
 
 
 @lru_cache(maxsize=256)
@@ -154,6 +167,19 @@ def get_routed_role_config(config, schedule):
         return RoutedRoleConfig(replace(schedule,
                                        smem=(schedule.smem[0], routed_smem,
                                              schedule.smem[2])), 1, 6)
+
+    if (config.shared_experts == 0 and 0 < config.bound <= 2
+            and schedule.policy == 'pipelined' and schedule.tile_m == 8
+            and schedule.threads[1] == 384):
+        # Same small-bound class as the role geometry: one resident CTA per
+        # SM, with two adjacent K128 weight records packed into every stage of
+        # a five-slot ring (kernel stage indexing is generic).
+        stage_bytes = (17408 * 2 + schedule.tile_m * 132 * 2 + 1023) // 1024 * 1024
+        _, epilogue_rows = get_role_pipeline_geometry(schedule.tile_m, schedule.policy)
+        routed_smem = 5 * stage_bytes + 1024 + epilogue_rows * 1024 + 256
+        return RoutedRoleConfig(replace(schedule,
+                                       smem=(schedule.smem[0], routed_smem,
+                                             schedule.smem[2])), 1, 5, 2)
 
     if (config.shared_experts > 0 and schedule.threads[1] == 256
             and schedule.tile_m == 8 and config.hidden % 512 == 0

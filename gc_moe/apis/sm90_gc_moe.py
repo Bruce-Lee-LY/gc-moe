@@ -42,16 +42,11 @@ def validate_call(y, w1, w2, buffer, stats, recipe, activation, clamp,
     local = buffer.num_experts // buffer.group.size()
     for name, weight, n, k in (('routed W1', w1, 2 * buffer.intermediate_hidden, buffer.hidden),
                                ('routed W2', w2, buffer.hidden, buffer.intermediate_hidden)):
-        if not isinstance(weight, (tuple, list)) or len(weight) not in (2, 3):
-            raise ValueError(f'{name} needs the record/secondary or data/offset/secondary tuple from '
+        if not isinstance(weight, (tuple, list)) or len(weight) != 2:
+            raise ValueError(f'{name} needs the record/secondary pair from '
                              'transform_weights_for_gc_moe_sm90')
-        if len(weight) == 2:
-            shapes = ((local, n // 256, k // 128, 16896), (local,))
-            dtypes = (torch.int8, torch.float32)
-        else:
-            shapes = ((local, n // 256, k // 128, 4, 256, 16),
-                      (local, n // 256, k // 128, 128, 4), (local,))
-            dtypes = (torch.int8, torch.uint8, torch.float32)
+        shapes = ((local, n // 256, k // 128, 16896), (local,))
+        dtypes = (torch.int8, torch.float32)
         for tensor, shape, dtype in zip(weight, shapes, dtypes):
             if (not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != shape
                     or tensor.dtype != dtype or tensor.device != device

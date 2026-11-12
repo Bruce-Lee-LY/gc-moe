@@ -104,22 +104,30 @@ class SharedStorageLayout:
 @lru_cache(maxsize=32)
 def get_role_shared_layout(tile_m: int, warp_specialized: bool,
                            routed_n_factor: int, stage_count_override: int = 0,
+                           routed_k_pack: int = 1,
                            *, policy: str) -> SharedStorageLayout:
     # Each N256 weight stream is 16384B FP4 + 512B 4-bit exponents.
     # Keep 512B padding per stream before the activation region: the wgmma
     # 128B-swizzle descriptor requires a 1024B-aligned matrix base.
-    routed_x = 17408 * routed_n_factor
+    if routed_k_pack not in (1, 2):
+        raise ValueError('routed K packing must cover one or two K128 records')
+    routed_x = 17408 * routed_n_factor * routed_k_pack
     stage_m = 8 if routed_n_factor == 2 else (tile_m if warp_specialized else 64)
-    sf_stage = routed_x + stage_m * 128
-    stage = align(sf_stage + stage_m * 4, 1024)
+    sf_stage = routed_x + stage_m * 128 * routed_k_pack
+    stage = align(sf_stage + stage_m * 4 * routed_k_pack, 1024)
     stages, epilogue_rows = get_role_pipeline_geometry(tile_m, policy)
     if routed_n_factor == 2:
         # The legacy N512 M8 branch shares a fixed 73 856 B budget.
         stages = 4
     if stage_count_override:
-        if not (stage_count_override == 6 and tile_m == 64
-                and warp_specialized and routed_n_factor == 1):
-            raise ValueError('stage override requires the routed M64 pipeline')
+        qualified = ((stage_count_override == 6 and tile_m == 64
+                      and warp_specialized and routed_n_factor == 1
+                      and routed_k_pack == 1)
+                     or (stage_count_override == 5 and tile_m == 8
+                         and warp_specialized and routed_n_factor == 1
+                         and routed_k_pack == 2))
+        if not qualified:
+            raise ValueError('stage override requires a qualified routed pipeline')
         stages = stage_count_override
     # Pipelined M32 trades half of its epilogue slab for a fourth weight stage;
     # legacy M32 retains three stages and the full 32-row epilogue.

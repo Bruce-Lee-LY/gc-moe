@@ -100,9 +100,8 @@ def wait_count(ptr: cute.Pointer, target: Uint32):
 
 class SM90GCMoERoleKernel:
     def __init__(self, config, layout, role, schedule, has_stats, routed_n_factor=1,
-                 routed_stage_count=0, w1_is_record=False, w2_is_record=False):
+                 routed_stage_count=0, routed_k_pack=1):
         self.role = role
-        self.w1_is_record, self.w2_is_record = w1_is_record, w2_is_record
         self.direct_route_scan = 0 < config.bound <= 2
         self.ranks, self.local = config.ranks, config.experts // config.ranks
         self.capacity, self.topk = config.capacity, config.topk
@@ -145,12 +144,27 @@ class SM90GCMoERoleKernel:
                 and self.hidden % 512 == 0 and self.intermediate % 256 == 0)):
             raise ValueError('invalid SM90 routed N factor for the role geometry')
         self.routed_n_factor = routed_n_factor
+        # Packing two K128 records into one stage is a scheduling change only:
+        # both records are already adjacent weight records in global memory.
+        if routed_k_pack not in (1, 2):
+            raise ValueError('invalid SM90 routed K packing')
+        if routed_k_pack == 2 and (self.hidden % 256 or self.intermediate % 256):
+            # Each tile must split into whole K256 stages.
+            raise ValueError('SM90 routed K packing requires even K128 counts')
+        if routed_k_pack == 2 and (self.routed_n_factor != 1 or routed_stage_count != 5):
+            raise ValueError('SM90 routed K packing requires N256 and a five-stage override')
+        self.routed_k_pack = routed_k_pack
         if routed_stage_count:
-            if not (routed_stage_count == 6 and role == 2 and self.max_m == 64
-                    and self.preweighted_routed_sf and self.early_routed_count):
-                raise ValueError('stage override requires the qualified routed M64 role')
+            qualified = ((routed_stage_count == 6 and role == 2 and self.max_m == 64
+                          and self.preweighted_routed_sf and self.early_routed_count)
+                         or (routed_stage_count == 5 and role == 2
+                             and self.max_m == 8 and self.warp_specialized
+                             and routed_k_pack == 2))
+            if not qualified:
+                raise ValueError('stage override requires a qualified routed role')
         shared_layout = get_role_shared_layout(self.max_m, self.warp_specialized,
                                                self.routed_n_factor, routed_stage_count,
+                                               self.routed_k_pack,
                                                policy=schedule.policy)
         for name in shared_layout.__dataclass_fields__:
             setattr(self, name, getattr(shared_layout, name))
@@ -159,6 +173,9 @@ class SM90GCMoERoleKernel:
         resource_role = 1 if role in (4, 5) else role - 1
         self.grid, self.threads = schedule.grids[resource_role], schedule.threads[resource_role]
         self.smem = schedule.smem[resource_role]
+        if self.routed_k_pack == 2 and (
+                self.full_offset + 1024 + self.epilogue_rows * 1024 + 256 > self.smem):
+            raise ValueError('SM90 routed K packing requires complete stages, control space and epilogue')
         if self.routed_n_factor == 2 and 2 * self.stage_bytes + 128 > self.smem:
             raise ValueError('SM90 routed N512 requires two complete stages and control space')
         if role in (4, 5):
@@ -429,21 +446,18 @@ class SM90GCMoERoleKernel:
         k_size = self.hidden if l1 else self.intermediate
         n_size = 2 * self.intermediate if l1 else self.hidden
         input_offset = self.off_l1_acts if l1 else self.off_l2_acts
-        is_record = self.w1_is_record if l1 else self.w2_is_record
-        weight_stride = 16896 if is_record else 16384
-        offset_stride = 16896 if is_record else 512
         stage_base = stage * self.stage_bytes
         if tid == 0:
             bar = cute.recast_ptr(slab + self.smem - 128 + stage * 8, dtype=Uint64)
             cute.arch.mbarrier_arrive_and_expect_tx(bar, 16896 * self.routed_n_factor)
             for sub in cutlass.range_constexpr(self.routed_n_factor):
                 index = (Uint64(expert) * (n_size // 256) + ntile * self.routed_n_factor + sub) * (k_size // 128) + kb
-                if cutlass.const_expr(is_record and self.role == 2 and self.routed_n_factor == 1):
-                    bulk_g2s_1d(slab + stage_base, weights + index * weight_stride, Uint32(16896), bar)
+                if cutlass.const_expr(self.routed_n_factor == 1):
+                    bulk_g2s_1d(slab + stage_base, weights + index * 16896, Uint32(16896), bar)
                 else:
-                    # N512 groups both payloads before both exponent blocks.
-                    bulk_g2s_1d(slab + stage_base + sub * 16384, weights + index * weight_stride, Uint32(16384), bar)
-                    bulk_g2s_1d(slab + stage_base + 16384 * self.routed_n_factor + sub * 512, offsets + index * offset_stride, Uint32(512), bar)
+                    # N512 stages both record payloads before their exponent blocks.
+                    bulk_g2s_1d(slab + stage_base + sub * 16384, weights + index * 16896, Uint32(16384), bar)
+                    bulk_g2s_1d(slab + stage_base + 16384 * self.routed_n_factor + sub * 512, offsets + index * 16896, Uint32(512), bar)
         for j in cutlass.range(tid, n * 8, 256):
             row, k = Uint32(j // 8), Uint32((j % 8) * 16)
             size = Uint32(0)
@@ -574,23 +588,25 @@ class SM90GCMoERoleKernel:
     @cute.jit
     def _stage_weights(self, slab: cute.Pointer, expert: Uint32, ntile: Uint32,
                         kb: Uint32, stage: Uint32, weights: cute.Pointer,
-                        offsets: cute.Pointer, l1: cutlass.Constexpr):
+                        l1: cutlass.Constexpr):
         tid, _, _ = cute.arch.thread_idx()
         if tid == (0 if self.max_m == 64 else 64):
             k_size = self.hidden if l1 else self.intermediate
             n_size = 2 * self.intermediate if l1 else self.hidden
-            is_record = self.w1_is_record if l1 else self.w2_is_record
-            weight_stride = 16896 if is_record else 16384
-            offset_stride = 16896 if is_record else 512
             stage_base = stage * self.stage_bytes
             full = cute.recast_ptr(slab + self.full_offset + stage * 8, dtype=Uint64)
-            cute.arch.mbarrier_arrive_and_expect_tx(full, 16896)
-            index = (Uint64(expert) * (n_size // 256) + ntile) * (k_size // 128) + kb
-            if cutlass.const_expr(is_record and self.role == 2 and self.routed_n_factor == 1):
-                bulk_g2s_1d(slab + stage_base, weights + index * weight_stride, Uint32(16896), full)
+            if cutlass.const_expr(self.routed_k_pack == 2):
+                # One bulk request carries both adjacent K128 records: the
+                # second record's payload and exponents stay contiguous.
+                cute.arch.mbarrier_arrive_and_expect_tx(full, 33792)
+                index = ((Uint64(expert) * (n_size // 256) + ntile) * (k_size // 128)
+                         + Uint64(kb) * 2)
+                bulk_g2s_1d(slab + stage_base, weights + index * 16896,
+                            Uint32(33792), full)
             else:
-                bulk_g2s_1d(slab + stage_base, weights + index * weight_stride, Uint32(16384), full)
-                bulk_g2s_1d(slab + stage_base + 16384, offsets + index * offset_stride, Uint32(512), full)
+                cute.arch.mbarrier_arrive_and_expect_tx(full, 16896)
+                index = (Uint64(expert) * (n_size // 256) + ntile) * (k_size // 128) + kb
+                bulk_g2s_1d(slab + stage_base, weights + index * 16896, Uint32(16896), full)
 
     @cute.jit
     def _stage_activation(self, base: Uint64, slab: cute.Pointer, expert: Uint32,
@@ -626,24 +642,47 @@ class SM90GCMoERoleKernel:
                 copy_commit()
                 copy_arrive(full)
         else:
-            for j in cutlass.range(tid, n * 8, 64):
-                row, k = Uint32(j // 8), Uint32((j % 8) * 16)
-                size = Uint32(0)
-                if row < valid:
-                    size = Uint32(16)
-                address = base + Uint64(input_offset) + ((Uint64(expert) * self.rows + start + row) * k_size + kb * 128 + k)
-                src = cute.make_ptr(Uint8, address, cute.AddressSpace.gmem, assumed_align=16)
-                copy_async_16(slab + stage_base + self.routed_x_offset + canonical_offset(row, k), src, size)
-            if tid < n:
-                sf_size = Uint32(0)
-                if tid < valid:
-                    sf_size = Uint32(4)
-                sf_offset = self.off_l1_acts_sf if l1 else self.off_l2_acts_sf
-                sf_address = base + Uint64(sf_offset) + ((Uint64(expert) * (k_size // 128) + kb) * self.rows + start + tid) * 4
-                sf_src = cute.make_ptr(Uint8, sf_address, cute.AddressSpace.gmem, assumed_align=4)
-                copy_async_4(slab + stage_base + self.sf_stage_offset + tid * 4, sf_src, sf_size)
-            copy_commit()
-            copy_arrive(full)
+            if cutlass.const_expr(self.routed_k_pack == 2):
+                # Both K128 halves share one commit group and one arrival, so
+                # the stage barrier still completes exactly once per stage.
+                for sub in cutlass.range_constexpr(2):
+                    for j in cutlass.range(tid, n * 8, 64):
+                        row, k = Uint32(j // 8), Uint32((j % 8) * 16)
+                        size = Uint32(0)
+                        if row < valid:
+                            size = Uint32(16)
+                        address = base + Uint64(input_offset) + ((Uint64(expert) * self.rows + start + row) * k_size + (kb * Uint32(2) + Uint32(sub)) * 128 + k)
+                        src = cute.make_ptr(Uint8, address, cute.AddressSpace.gmem, assumed_align=16)
+                        copy_async_16(slab + stage_base + self.routed_x_offset + sub * (self.max_m * 128) + canonical_offset(row, k), src, size)
+                    if tid < n:
+                        sf_size = Uint32(0)
+                        if tid < valid:
+                            sf_size = Uint32(4)
+                        sf_offset = self.off_l1_acts_sf if l1 else self.off_l2_acts_sf
+                        sf_address = base + Uint64(sf_offset) + ((Uint64(expert) * (k_size // 128) + kb * Uint32(2) + Uint32(sub)) * self.rows + start + tid) * 4
+                        sf_src = cute.make_ptr(Uint8, sf_address, cute.AddressSpace.gmem, assumed_align=4)
+                        copy_async_4(slab + stage_base + self.sf_stage_offset + sub * (self.max_m * 4) + tid * 4, sf_src, sf_size)
+                copy_commit()
+                copy_arrive(full)
+            else:
+                for j in cutlass.range(tid, n * 8, 64):
+                    row, k = Uint32(j // 8), Uint32((j % 8) * 16)
+                    size = Uint32(0)
+                    if row < valid:
+                        size = Uint32(16)
+                    address = base + Uint64(input_offset) + ((Uint64(expert) * self.rows + start + row) * k_size + kb * 128 + k)
+                    src = cute.make_ptr(Uint8, address, cute.AddressSpace.gmem, assumed_align=16)
+                    copy_async_16(slab + stage_base + self.routed_x_offset + canonical_offset(row, k), src, size)
+                if tid < n:
+                    sf_size = Uint32(0)
+                    if tid < valid:
+                        sf_size = Uint32(4)
+                    sf_offset = self.off_l1_acts_sf if l1 else self.off_l2_acts_sf
+                    sf_address = base + Uint64(sf_offset) + ((Uint64(expert) * (k_size // 128) + kb) * self.rows + start + tid) * 4
+                    sf_src = cute.make_ptr(Uint8, sf_address, cute.AddressSpace.gmem, assumed_align=4)
+                    copy_async_4(slab + stage_base + self.sf_stage_offset + tid * 4, sf_src, sf_size)
+                copy_commit()
+                copy_arrive(full)
 
     @cute.jit
     def _bucket_tile(self, base: Uint64, peers: cute.Pointer, slab: cute.Pointer,
@@ -746,7 +785,7 @@ class SM90GCMoERoleKernel:
     def _load_persistent_tile(self, base: Uint64, slab: cute.Pointer,
                                data_iter: Uint32, expert: Uint32, ntile: Uint32,
                                start: Uint32, valid: Uint32, weights: cute.Pointer,
-                               offsets: cute.Pointer, epoch: Uint32, l1: cutlass.Constexpr):
+                               epoch: Uint32, l1: cutlass.Constexpr):
         tid, _, _ = cute.arch.thread_idx()
         k_size = self.hidden if l1 else self.intermediate
         load_m = Uint32(64)
@@ -769,7 +808,7 @@ class SM90GCMoERoleKernel:
                 if tid == 0 and iteration >= self.stages:
                     cute.arch.mbarrier_wait(cute.recast_ptr(slab + self.empty_offset + stage * 8, dtype=Uint64), Uint32((iteration // self.stages - 1) % 2))
                 sync_loader()
-                self._stage_weights(slab, expert, ntile, Uint32(kb), stage, weights, offsets, l1)
+                self._stage_weights(slab, expert, ntile, Uint32(kb), stage, weights, l1)
                 if cutlass.const_expr(self.early_routed_count and l1):
                     # M64 keeps one128thread loader. Only first W can overlap
                     # input publication; no whole independent W-stream claim.
@@ -779,33 +818,40 @@ class SM90GCMoERoleKernel:
                         sync_loader()
                 self._stage_activation(base, slab, expert, start, valid, Uint32(kb), stage, load_m, l1)
         else:
+            if cutlass.const_expr(self.routed_k_pack == 2):
+                # One stage per K256 block: the ring advances by one slot per
+                # pair of K128 records (per-tile increments stay even).
+                blocks = k_size // 256
+                iter_base = data_iter // 2
+            else:
+                blocks = k_size // 128
+                iter_base = data_iter
             if tid < 64:
                 if cutlass.const_expr(self.early_routed_count and l1):
                     if tid == 0:
                         wait_epoch(self._field(base, 'expert_ready', Uint32) + expert, epoch, False)
                     sync_activation()
-                for kb in cutlass.range(k_size // 128):
-                    iteration = data_iter + Uint32(kb)
+                for kb in cutlass.range(blocks):
+                    iteration = iter_base + Uint32(kb)
                     stage = iteration % self.stages
                     if tid == 0 and iteration >= self.stages:
                         cute.arch.mbarrier_wait(cute.recast_ptr(slab + self.empty_offset + stage * 8, dtype=Uint64), Uint32((iteration // self.stages - 1) % 2))
                     sync_activation()
                     self._stage_activation(base, slab, expert, start, valid, Uint32(kb), stage, load_m, l1)
             else:
-                for weight_kb in cutlass.range(k_size // 128):
-                    weight_iter = data_iter + Uint32(weight_kb)
+                for weight_kb in cutlass.range(blocks):
+                    weight_iter = iter_base + Uint32(weight_kb)
                     weight_stage = weight_iter % self.stages
                     if tid == 64 and weight_iter >= self.stages:
                         cute.arch.mbarrier_wait(cute.recast_ptr(slab + self.empty_offset + weight_stage * 8, dtype=Uint64), Uint32((weight_iter // self.stages - 1) % 2))
                     sync_weight()
-                    self._stage_weights(slab, expert, ntile, Uint32(weight_kb), weight_stage, weights, offsets, l1)
+                    self._stage_weights(slab, expert, ntile, Uint32(weight_kb), weight_stage, weights, l1)
         sync_loader()
         return data_iter + Uint32(k_size // 128)
 
     @cute.jit
     def _produce_tasks(self, base: Uint64, slab: cute.Pointer, epoch: Uint32,
-                        w1: cute.Pointer, s1: cute.Pointer,
-                        w2: cute.Pointer, s2: cute.Pointer):
+                        w1: cute.Pointer, w2: cute.Pointer):
         command = cute.make_tensor(cute.recast_ptr(slab + self.command_offset, dtype=Uint32), cute.make_layout((3,)))
         is_l1, running = True, True
         task_iter, data_iter = Uint32(0), Uint32(0)
@@ -832,10 +878,10 @@ class SM90GCMoERoleKernel:
                     task_iter += Uint32(1)
                     if is_l1:
                         data_iter = self._load_persistent_tile(base, slab, data_iter,
-                                      expert, ntile, Uint32(start), valid, w1, s1, epoch, True)
+                                      expert, ntile, Uint32(start), valid, w1, epoch, True)
                     else:
                         data_iter = self._load_persistent_tile(base, slab, data_iter,
-                                      expert, ntile, Uint32(start), valid, w2, s2, epoch, False)
+                                      expert, ntile, Uint32(start), valid, w2, epoch, False)
         self._publish_task(slab, task_iter, Uint32(0), Uint32(0), Uint32(0),
                            Uint32(0), Uint32(0), Uint32(0))
 
@@ -856,60 +902,128 @@ class SM90GCMoERoleKernel:
         if cutlass.const_expr(not self.preweighted_routed_sf):
             secondary_value = cute.make_tensor(secondary, cute.make_layout((self.local,)))[expert]
         row = Uint32(warp * 16 + lane // 4)
-        first_stage = Uint32(data_iter % self.stages)
-        if lane == 0:
-            cute.arch.mbarrier_wait(cute.recast_ptr(slab + self.full_offset + first_stage * 8, dtype=Uint64), Uint32((data_iter // self.stages) % 2))
-        cute.arch.sync_warp()
-        tma_store_fence()
-        initial_word = slab + first_stage * self.stage_bytes + Uint32(wg * 8192 + warp * 1024 + lane * 16)
-        initial_scale = slab + first_stage * self.stage_bytes + Uint32(16384 + wg * 256 + warp * 32 + (lane // 4) * 4)
-        frag0 = decode_fragment_nib4(initial_word, initial_scale)
-        for kb in cutlass.range(k_size // 128):
-            iteration = data_iter + Uint32(kb)
-            stage = Uint32(iteration % self.stages)
-            descriptor = smem_descriptor(slab + stage * self.stage_bytes + self.routed_x_offset)
-            raw0 = wgmma_rs_issue(frag0, descriptor, n)
-            word_ptr = slab + stage * self.stage_bytes + Uint32(wg * 8192 + warp * 1024 + lane * 16)
-            scale_ptr = slab + stage * self.stage_bytes + Uint32(16384 + wg * 256 + warp * 32 + (lane // 4) * 4)
-            frag1 = decode_fragment_nib4(word_ptr + 4096, scale_ptr + 128)
-            scales = cute.make_rmem_tensor((n // 4,), Float32)
-            for group in cutlass.range_constexpr(n // 8):
-                token = Uint32(group * 8 + 2 * (lane % 4))
-                raw_sf = load_scale_pair(slab + stage * self.stage_bytes + Uint32(self.sf_stage_offset) + token * 4)
-                if cutlass.const_expr(self.preweighted_routed_sf):
-                    scale0, scale1 = raw_sf[0], raw_sf[1]
-                else:
-                    scale0 = raw_sf[0] * secondary_value
-                    scale1 = raw_sf[1] * secondary_value
-                scales[group * 2], scales[group * 2 + 1] = scale0, scale1
-            part0 = wgmma_rs_wait(raw0)
-            for group in cutlass.range_constexpr(n // 8):
-                final[0, group * 4] = cute.math.fma(part0[group * 4], scales[group * 2], final[0, group * 4])
-                final[0, group * 4 + 1] = cute.math.fma(part0[group * 4 + 1], scales[group * 2 + 1], final[0, group * 4 + 1])
-                final[0, group * 4 + 2] = cute.math.fma(part0[group * 4 + 2], scales[group * 2], final[0, group * 4 + 2])
-                final[0, group * 4 + 3] = cute.math.fma(part0[group * 4 + 3], scales[group * 2 + 1], final[0, group * 4 + 3])
-            raw1 = wgmma_rs_issue(frag1, descriptor, n)
-            if kb + 1 < k_size // 128:
-                next_stage = Uint32((iteration + 1) % self.stages)
-                if lane == 0:
-                    cute.arch.mbarrier_wait(cute.recast_ptr(slab + self.full_offset + next_stage * 8, dtype=Uint64), Uint32(((iteration + 1) // self.stages) % 2))
-                cute.arch.sync_warp()
-                # Activation uses non-bulk cp.async (generic proxy); publish
-                # each completed stage before WGMMA reads it in the async proxy.
-                tma_store_fence()
-                next_word = slab + next_stage * self.stage_bytes + Uint32(wg * 8192 + warp * 1024 + lane * 16)
-                next_scale = slab + next_stage * self.stage_bytes + Uint32(16384 + wg * 256 + warp * 32 + (lane // 4) * 4)
-                frag0 = decode_fragment_nib4(next_word, next_scale)
-            part1 = wgmma_rs_wait(raw1)
-            for group in cutlass.range_constexpr(n // 8):
-                final[1, group * 4] = cute.math.fma(part1[group * 4], scales[group * 2], final[1, group * 4])
-                final[1, group * 4 + 1] = cute.math.fma(part1[group * 4 + 1], scales[group * 2 + 1], final[1, group * 4 + 1])
-                final[1, group * 4 + 2] = cute.math.fma(part1[group * 4 + 2], scales[group * 2], final[1, group * 4 + 2])
-                final[1, group * 4 + 3] = cute.math.fma(part1[group * 4 + 3], scales[group * 2 + 1], final[1, group * 4 + 3])
-            tma_store_fence()
-            cute.arch.sync_warp()
+        if cutlass.const_expr(self.routed_k_pack == 2):
+            # One stage holds two adjacent K128 records: the slot advances on
+            # even K128 indices, the second record drains it. The full wait and
+            # the empty release follow exactly those two positions.
+            first_iter = data_iter // 2
+            first_slot = Uint32(first_iter % self.stages)
             if lane == 0:
-                cute.arch.mbarrier_arrive(cute.recast_ptr(slab + self.empty_offset + stage * 8, dtype=Uint64))
+                cute.arch.mbarrier_wait(cute.recast_ptr(slab + self.full_offset + first_slot * 8, dtype=Uint64), Uint32((first_iter // self.stages) % 2))
+            cute.arch.sync_warp()
+            tma_store_fence()
+            initial_word = slab + first_slot * self.stage_bytes + Uint32(wg * 8192 + warp * 1024 + lane * 16)
+            initial_scale = slab + first_slot * self.stage_bytes + Uint32(16384 + wg * 256 + warp * 32 + (lane // 4) * 4)
+            frag0 = decode_fragment_nib4(initial_word, initial_scale)
+            for kb in cutlass.range(k_size // 128):
+                iteration = data_iter + Uint32(kb)
+                slot = Uint32(iteration // 2 % self.stages)
+                half = Uint32(kb % 2)
+                stage_base = slab + slot * self.stage_bytes
+                descriptor = smem_descriptor(stage_base + self.routed_x_offset + half * Uint32(self.max_m * 128))
+                raw0 = wgmma_rs_issue(frag0, descriptor, n)
+                word_ptr = stage_base + half * Uint32(16896) + Uint32(wg * 8192 + warp * 1024 + lane * 16)
+                scale_ptr = stage_base + half * Uint32(16896) + Uint32(16384 + wg * 256 + warp * 32 + (lane // 4) * 4)
+                frag1 = decode_fragment_nib4(word_ptr + 4096, scale_ptr + 128)
+                scales = cute.make_rmem_tensor((n // 4,), Float32)
+                for group in cutlass.range_constexpr(n // 8):
+                    token = Uint32(group * 8 + 2 * (lane % 4))
+                    raw_sf = load_scale_pair(stage_base + Uint32(self.sf_stage_offset) + half * Uint32(self.max_m * 4) + token * 4)
+                    if cutlass.const_expr(self.preweighted_routed_sf):
+                        scale0, scale1 = raw_sf[0], raw_sf[1]
+                    else:
+                        scale0 = raw_sf[0] * secondary_value
+                        scale1 = raw_sf[1] * secondary_value
+                    scales[group * 2], scales[group * 2 + 1] = scale0, scale1
+                part0 = wgmma_rs_wait(raw0)
+                for group in cutlass.range_constexpr(n // 8):
+                    final[0, group * 4] = cute.math.fma(part0[group * 4], scales[group * 2], final[0, group * 4])
+                    final[0, group * 4 + 1] = cute.math.fma(part0[group * 4 + 1], scales[group * 2 + 1], final[0, group * 4 + 1])
+                    final[0, group * 4 + 2] = cute.math.fma(part0[group * 4 + 2], scales[group * 2], final[0, group * 4 + 2])
+                    final[0, group * 4 + 3] = cute.math.fma(part0[group * 4 + 3], scales[group * 2 + 1], final[0, group * 4 + 3])
+                raw1 = wgmma_rs_issue(frag1, descriptor, n)
+                if kb + 1 < k_size // 128:
+                    next_half = Uint32((kb + 1) % 2)
+                    next_iter = iteration + Uint32(1)
+                    next_slot = Uint32(next_iter // 2 % self.stages)
+                    if next_half == 0:
+                        # First record of the next stage: its copies finish once.
+                        if lane == 0:
+                            cute.arch.mbarrier_wait(cute.recast_ptr(slab + self.full_offset + next_slot * 8, dtype=Uint64), Uint32((next_iter // 2 // self.stages) % 2))
+                        cute.arch.sync_warp()
+                        # Activation uses non-bulk cp.async (generic proxy); publish
+                        # each completed stage before WGMMA reads it in the async proxy.
+                        tma_store_fence()
+                    next_word = slab + next_slot * self.stage_bytes + next_half * Uint32(16896) + Uint32(wg * 8192 + warp * 1024 + lane * 16)
+                    next_scale = slab + next_slot * self.stage_bytes + next_half * Uint32(16896) + Uint32(16384 + wg * 256 + warp * 32 + (lane // 4) * 4)
+                    frag0 = decode_fragment_nib4(next_word, next_scale)
+                part1 = wgmma_rs_wait(raw1)
+                for group in cutlass.range_constexpr(n // 8):
+                    final[1, group * 4] = cute.math.fma(part1[group * 4], scales[group * 2], final[1, group * 4])
+                    final[1, group * 4 + 1] = cute.math.fma(part1[group * 4 + 1], scales[group * 2 + 1], final[1, group * 4 + 1])
+                    final[1, group * 4 + 2] = cute.math.fma(part1[group * 4 + 2], scales[group * 2], final[1, group * 4 + 2])
+                    final[1, group * 4 + 3] = cute.math.fma(part1[group * 4 + 3], scales[group * 2 + 1], final[1, group * 4 + 3])
+                if half == 1:
+                    # Second record drained the whole stage.
+                    tma_store_fence()
+                    cute.arch.sync_warp()
+                    if lane == 0:
+                        cute.arch.mbarrier_arrive(cute.recast_ptr(slab + self.empty_offset + slot * 8, dtype=Uint64))
+        else:
+            first_stage = Uint32(data_iter % self.stages)
+            if lane == 0:
+                cute.arch.mbarrier_wait(cute.recast_ptr(slab + self.full_offset + first_stage * 8, dtype=Uint64), Uint32((data_iter // self.stages) % 2))
+            cute.arch.sync_warp()
+            tma_store_fence()
+            initial_word = slab + first_stage * self.stage_bytes + Uint32(wg * 8192 + warp * 1024 + lane * 16)
+            initial_scale = slab + first_stage * self.stage_bytes + Uint32(16384 + wg * 256 + warp * 32 + (lane // 4) * 4)
+            frag0 = decode_fragment_nib4(initial_word, initial_scale)
+            for kb in cutlass.range(k_size // 128):
+                iteration = data_iter + Uint32(kb)
+                stage = Uint32(iteration % self.stages)
+                descriptor = smem_descriptor(slab + stage * self.stage_bytes + self.routed_x_offset)
+                raw0 = wgmma_rs_issue(frag0, descriptor, n)
+                word_ptr = slab + stage * self.stage_bytes + Uint32(wg * 8192 + warp * 1024 + lane * 16)
+                scale_ptr = slab + stage * self.stage_bytes + Uint32(16384 + wg * 256 + warp * 32 + (lane // 4) * 4)
+                frag1 = decode_fragment_nib4(word_ptr + 4096, scale_ptr + 128)
+                scales = cute.make_rmem_tensor((n // 4,), Float32)
+                for group in cutlass.range_constexpr(n // 8):
+                    token = Uint32(group * 8 + 2 * (lane % 4))
+                    raw_sf = load_scale_pair(slab + stage * self.stage_bytes + Uint32(self.sf_stage_offset) + token * 4)
+                    if cutlass.const_expr(self.preweighted_routed_sf):
+                        scale0, scale1 = raw_sf[0], raw_sf[1]
+                    else:
+                        scale0 = raw_sf[0] * secondary_value
+                        scale1 = raw_sf[1] * secondary_value
+                    scales[group * 2], scales[group * 2 + 1] = scale0, scale1
+                part0 = wgmma_rs_wait(raw0)
+                for group in cutlass.range_constexpr(n // 8):
+                    final[0, group * 4] = cute.math.fma(part0[group * 4], scales[group * 2], final[0, group * 4])
+                    final[0, group * 4 + 1] = cute.math.fma(part0[group * 4 + 1], scales[group * 2 + 1], final[0, group * 4 + 1])
+                    final[0, group * 4 + 2] = cute.math.fma(part0[group * 4 + 2], scales[group * 2], final[0, group * 4 + 2])
+                    final[0, group * 4 + 3] = cute.math.fma(part0[group * 4 + 3], scales[group * 2 + 1], final[0, group * 4 + 3])
+                raw1 = wgmma_rs_issue(frag1, descriptor, n)
+                if kb + 1 < k_size // 128:
+                    next_stage = Uint32((iteration + 1) % self.stages)
+                    if lane == 0:
+                        cute.arch.mbarrier_wait(cute.recast_ptr(slab + self.full_offset + next_stage * 8, dtype=Uint64), Uint32(((iteration + 1) // self.stages) % 2))
+                    cute.arch.sync_warp()
+                    # Activation uses non-bulk cp.async (generic proxy); publish
+                    # each completed stage before WGMMA reads it in the async proxy.
+                    tma_store_fence()
+                    next_word = slab + next_stage * self.stage_bytes + Uint32(wg * 8192 + warp * 1024 + lane * 16)
+                    next_scale = slab + next_stage * self.stage_bytes + Uint32(16384 + wg * 256 + warp * 32 + (lane // 4) * 4)
+                    frag0 = decode_fragment_nib4(next_word, next_scale)
+                part1 = wgmma_rs_wait(raw1)
+                for group in cutlass.range_constexpr(n // 8):
+                    final[1, group * 4] = cute.math.fma(part1[group * 4], scales[group * 2], final[1, group * 4])
+                    final[1, group * 4 + 1] = cute.math.fma(part1[group * 4 + 1], scales[group * 2 + 1], final[1, group * 4 + 1])
+                    final[1, group * 4 + 2] = cute.math.fma(part1[group * 4 + 2], scales[group * 2], final[1, group * 4 + 2])
+                    final[1, group * 4 + 3] = cute.math.fma(part1[group * 4 + 3], scales[group * 2 + 1], final[1, group * 4 + 3])
+                tma_store_fence()
+                cute.arch.sync_warp()
+                if lane == 0:
+                    cute.arch.mbarrier_arrive(cute.recast_ptr(slab + self.empty_offset + stage * 8, dtype=Uint64))
         # Tiles no wider than the slab keep the original epilogue verbatim;
         # only a wider tile is drained in several batches.
         if cutlass.const_expr(n <= self.epilogue_rows):
@@ -1149,8 +1263,8 @@ class SM90GCMoERoleKernel:
 
     @cute.jit
     def _compute_persistent(self, base: Uint64, peers: cute.Pointer, w1: cute.Pointer,
-                             s1: cute.Pointer, sec1: cute.Pointer, w2: cute.Pointer,
-                             s2: cute.Pointer, sec2: cute.Pointer, clamp: Float32):
+                             sec1: cute.Pointer, w2: cute.Pointer,
+                             sec2: cute.Pointer, clamp: Float32):
         tid, _, _ = cute.arch.thread_idx()
         alloc = cutlass.utils.SmemAllocator()
         slab = cute.recast_ptr(alloc.allocate(self.smem, 1024), dtype=Uint8)
@@ -1165,7 +1279,7 @@ class SM90GCMoERoleKernel:
         epoch = ld_acquire_gpu_u32(self._field(base, 'header', Uint32))
         if tid < 128:
             cute.arch.setmaxregister_decrease(32 if self.max_m <= 32 else 64)
-            self._produce_tasks(base, slab, epoch, w1, s1, w2, s2)
+            self._produce_tasks(base, slab, epoch, w1, w2)
             fence_sys()
             sync_tile()
         else:
@@ -1221,7 +1335,7 @@ class SM90GCMoERoleKernel:
                   s1: cute.Pointer, sec1: cute.Pointer, w2: cute.Pointer,
                   s2: cute.Pointer, sec2: cute.Pointer, clamp: Float32):
         if cutlass.const_expr(self.warp_specialized):
-            self._compute_persistent(base, peers, w1, s1, sec1, w2, s2, sec2, clamp)
+            self._compute_persistent(base, peers, w1, sec1, w2, sec2, clamp)
         else:
             self._compute_sync(base, peers, w1, s1, sec1, w2, s2, sec2, clamp)
 
