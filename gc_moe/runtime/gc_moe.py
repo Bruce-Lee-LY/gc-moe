@@ -39,6 +39,16 @@ def _get_env_int(name: str, default: int) -> int:
     return value
 
 
+def _get_requested_dispatch_sms(num_ranks: int,
+                                requested_dispatch_sms: int | None = None) -> int:
+    """Validate ranks; explicit SM requests bypass environment parsing."""
+    if isinstance(num_ranks, bool) or not isinstance(num_ranks, int) or num_ranks < 1:
+        raise ValueError('num_ranks must be a positive integer')
+    if requested_dispatch_sms is not None:
+        return requested_dispatch_sms
+    return _get_env_int('GC_MOE_DISPATCH_SMS', 8 if num_ranks <= 8 else 16)
+
+
 class _GreenResources:
     _UNSUPPORTED_RESOURCE = (cu.CUresult.CUDA_ERROR_INVALID_RESOURCE_TYPE,
                              cu.CUresult.CUDA_ERROR_NOT_SUPPORTED)
@@ -260,22 +270,25 @@ class _ChildGraph:
 
 
 class GreenContextPair:
-    """20/128 SM split on B300; exact partition is queried from CUDA.
+    """CUDA-aligned dispatch/compute partition for the SM100 role graph.
 
+    The default dispatch request is 8 SMs for <=8 ranks, otherwise 16;
+    GC_MOE_DISPATCH_SMS overrides it, and an explicit request takes precedence.
     GC_MOE_PRIMARY_CTX=1 binds all role kernels to the primary context and
     uses the split for grid sizes only.
     """
 
     @_runtime_locked
     def __init__(self, device_index: int | None = None,
-                 requested_dispatch_sms: int | None = None):
+                 requested_dispatch_sms: int | None = None, *,
+                 num_ranks: int = 1):
         if _RUNTIME_STATE != 'open':
             raise RuntimeError(f"kernel runtime is {_RUNTIME_STATE}")
+        requested_dispatch_sms = _get_requested_dispatch_sms(
+            num_ranks, requested_dispatch_sms)
         torch.cuda.init()
         self.primary_context = _ok(cu.cuCtxGetCurrent())
         self.primary_ctx_roles = _get_env_int('GC_MOE_PRIMARY_CTX', 0) != 0
-        if requested_dispatch_sms is None:
-            requested_dispatch_sms = _get_env_int('GC_MOE_DISPATCH_SMS', 16)
         if device_index is None:
             device_index = torch.cuda.current_device()
         self.device = _ok(cu.cuDeviceGet(device_index))
@@ -501,7 +514,7 @@ atexit.register(_close_runtime)
 
 class _ThreadContexts:
     def __init__(self):
-        self.contexts: dict[int, GreenContextPair] = {}
+        self.contexts: dict[tuple[int, int], GreenContextPair] = {}
 
     def __del__(self):
         # Thread-local destruction runs in the owning thread. Callers must
@@ -516,15 +529,19 @@ class _ThreadContexts:
                 _pin_failed_pair(pair)
 
 
-def get_context() -> GreenContextPair:
+def get_context(*, num_ranks: int) -> GreenContextPair:
+    requested_dispatch_sms = _get_requested_dispatch_sms(num_ranks)
     current = _ok(cu.cuCtxGetCurrent())
     holder = getattr(_THREAD_LOCAL, 'holder', None)
     if holder is None:
         holder = _THREAD_LOCAL.holder = _ThreadContexts()
     contexts = holder.contexts
-    key = int(current)
+    # Calls in different process groups may need different SM budgets even
+    # on the same CUDA context. Reuse only the same effective SM request.
+    key = (int(current), requested_dispatch_sms)
     if key not in contexts or contexts[key]._state == 'closed':
-        contexts[key] = GreenContextPair()
+        contexts[key] = GreenContextPair(
+            requested_dispatch_sms=requested_dispatch_sms, num_ranks=num_ranks)
     elif contexts[key]._state != 'open':
         raise RuntimeError(f"cached Green context pair is {contexts[key]._state}")
     return contexts[key]

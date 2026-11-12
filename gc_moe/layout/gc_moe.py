@@ -117,9 +117,11 @@ def _signal_offsets() -> dict[str, int]:
         # Persistent receive-generation parity: replay N reads/writes
         # generation parity & 1 of expert_recv_count/expert_recv_count_sum
         # (slot range [gen * count, (gen + 1) * count) inside each field's
-        # dual-generation region); role 3 flips this word once per replay
-        # after the finalize grid sync.  Lives in the header padding.
+        # dual-generation region); role 3 flips this word once per replay.
+        # Lives in the header padding.  Role 1 publishes the role 3 epoch
+        # at its entry, so role 3 reads it instead of a grid barrier.
         ('recv_parity', 1, 4),
+        ('role3_epoch', 1, 4),
         ('combine_ready_grid_idx', MAX_RANKS, 8),
         ('expert_send_count', MAX_EXPERTS, 8),
         ('expert_recv_count', 2 * MAX_EXPERTS, 8),

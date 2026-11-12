@@ -115,6 +115,11 @@ from ..scheduler.gc_moe import (
 )
 
 
+# A fixed small-decode floor, independent of the local expert count: 64 CTAs
+# provide up to 512 combine warps before clamping to the compute SM budget.
+SMALL_DECODE_FINALIZE_SMS = 64
+
+
 @cute.jit
 def _swiglu_pair(gate0_accum: Float32, gate1_accum: Float32,
                 up0_accum: Float32, up1_accum: Float32,
@@ -281,7 +286,9 @@ class GCMoERoleKernel:
         self.num_tokens = num_tokens
         self.hidden = hidden
         self.intermediate = intermediate
-        self.finalize_sms = min(compute_sms, 64) if num_tokens <= 128 else compute_sms
+        # Base grid; only role3 with finalize_output overrides it below.
+        self.finalize_sms = (min(compute_sms, SMALL_DECODE_FINALIZE_SMS)
+                             if num_tokens <= 128 else compute_sms)
         self.num_ranks = num_ranks
         self.local_experts = local_experts
         self.topk = topk
@@ -338,9 +345,11 @@ class GCMoERoleKernel:
                 raise ValueError('finalize requires host combine geometry')
             (self.combine_chunks, self.combine_chunk_bytes,
              self.combine_uint4_per_lane) = combine_geometry
+            # Size fused output work independently of the expert-cleanup grid.
             self.finalize_sms = min(
                 compute_sms,
-                max(min(compute_sms, local_experts + 1),
+                max(SMALL_DECODE_FINALIZE_SMS if num_tokens <= 128 else
+                    min(compute_sms, local_experts + 1),
                     (num_tokens * self.combine_chunks + (COMBINE_WARPS - 1)) //
                     COMBINE_WARPS))
         self.shared_layout = role_config.shared_layout
@@ -462,7 +471,8 @@ class GCMoERoleKernel:
             st_release_sys_u64(dst, ready_epoch)
         # Dual-buffered receive sums: this replay consumes the generation
         # selected by the persistent parity word; the bump below flips it
-        # for the next replay while this kernel clears the retired one.
+        # for the next replay, and role 1 of the replay that retires this
+        # generation clears it at entry.
         gen = Uint32(ready_epoch - Uint64(1)) & Uint32(1)
         recv_ptr = recv_ptr + gen * Uint32(self.local_experts * 2)
         # GCMoEScheduler::fetch_expert_recv_count: each lane keeps
@@ -488,18 +498,12 @@ class GCMoERoleKernel:
                 observed = ld_acquire_sys_u64(recv_ptr + expert_idx * 2)
             expert_counts[wave] = Uint32(observed)
         cute.arch.sync_warp()
-        # The grid barrier orders every CTA's cache completion before
-        # any CTA clears the global receive sums.
-        grid_sync(signals, Uint32(block), Uint32(tid),
-                  self.finalize_sms, 0, sync_participants=128)
-        # Every CTA consumed this replay's receive generation above; flip
-        # the persistent parity so the next replay publishes into the
-        # alternate generation.  Cross-rank ordering of the retired
-        # generation's clear against the next-next publish is carried by
-        # every rank's acquire of all expert sums in the intervening call,
-        # then the role1/role2 -> role3 graph dependencies. The all-rank
-        # count join imports every rank's prior cleanup before the retired
-        # bank can be reused. Zero-count experts must participate.
+        # All CTAs use the immutable role1 epoch, so block0 may flip parity
+        # without a grid-wide cache-completion barrier. The next dispatch
+        # clears this bank only after the entire local finalize grid ends.
+        # That clear precedes count publication; all-rank sum acquires in
+        # the intervening call order it before any peer can publish into
+        # the same bank again. Zero-count experts must join too.
         if block == Uint32(0) and tid == Uint32(0):
             red_gpu_add_u32(
                 signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4,
@@ -544,22 +548,11 @@ class GCMoERoleKernel:
                             Uint32(self.block_m)
                 pool_prefix = cute.arch.warp_redux_sync(own_blocks, 'add')
                 sync_dispatch_threads(128)
-                if tid // Uint32(32) == Uint32(0):
-                    st_global_u64(recv_ptr + local_expert * Uint32(2), Uint64(0))
-                elif tid // Uint32(32) == Uint32(1):
+                if tid // Uint32(32) == Uint32(1):
                     if elect_one_sync():
                         if cutlass.const_expr(self.has_stats):
                             red_gpu_add_s32(stats.iterator + local_expert, Int32(received))
                     cute.arch.sync_warp()
-                recv_rank = Uint32(tid)
-                while recv_rank < Uint32(self.num_ranks):
-                    recv_rank_idx = recv_rank * Uint32(self.local_experts) + local_expert
-                    st_global_u64(
-                        signals.iterator + SIGNAL_OFFSETS['expert_recv_count'] // 4 +
-                        gen * Uint32(self.num_ranks * self.local_experts * 2) +
-                        recv_rank_idx * Uint32(2), Uint64(0))
-                    recv_rank += Uint32(128)
-                cute.arch.sync_warp()
                 ring_idx = Uint32(tid)
                 while ring_idx < active_blocks:
                     ring_block = (pool_prefix + ring_idx) % Uint32(self.ring_blocks)
@@ -756,11 +749,37 @@ class GCMoERoleKernel:
             self._initialize_shared_storage(slab, Uint32(physical_warp), Uint32(lane))
             warpgroup_reg_dealloc(48 if self.local_experts <= 64 else 96)
             # Dual-buffered receive signals: replay N publishes and reads
-            # generation N % 2; role 3 flips the persistent parity word
-            # after consuming each replay, and clears only the retired
-            # generation, so no cross-rank tail barrier is needed.
-            gen = ld_volatile_u32(
-                signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4) & Uint32(1)
+            # generation parity & 1; role 3 flips the persistent parity
+            # word after consuming each replay, and the replay that retires
+            # a generation clears it here, so no cross-rank tail barrier is
+            # needed.  Role 3 reads the epoch published below instead of a
+            # grid barrier.
+            parity = ld_volatile_u32(
+                signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4)
+            retired = (parity + Uint32(1)) & Uint32(1)
+            gen = parity & Uint32(1)
+            if block == Uint32(0):
+                if tid == Uint32(0):
+                    # The normal role1 -> role3 graph completion dependency
+                    # makes this plain store visible; role3 never polls it
+                    # concurrently with this dispatch.
+                    signals[SIGNAL_OFFSETS['role3_epoch'] // 4] = parity + Uint32(1)
+                retired_sum = signals.iterator + \
+                    SIGNAL_OFFSETS['expert_recv_count_sum'] // 4 + \
+                    retired * Uint32(self.local_experts * 2)
+                for retired_iter in cutlass.range(
+                        Uint32(tid), Uint32(self.local_experts),
+                        self.dispatch_warps * 32, unroll_full=True):
+                    st_global_u64(
+                        retired_sum + Uint32(retired_iter) * Uint32(2), Uint64(0))
+                retired_recv = signals.iterator + \
+                    SIGNAL_OFFSETS['expert_recv_count'] // 4 + \
+                    retired * Uint32(self.num_ranks * self.local_experts * 2)
+                for retired_iter in cutlass.range(
+                        Uint32(tid), Uint32(self.num_ranks * self.local_experts),
+                        self.dispatch_warps * 32, unroll_full=True):
+                    st_global_u64(
+                        retired_recv + Uint32(retired_iter) * Uint32(2), Uint64(0))
             recv_ptr = signals.iterator + SIGNAL_OFFSETS['expert_recv_count_sum'] // 4 + \
                 gen * Uint32(self.local_experts * 2)
             send_ptr = signals.iterator + SIGNAL_OFFSETS['expert_send_count'] // 4
@@ -1913,11 +1932,10 @@ class GCMoERoleKernel:
                     combine_smem + self.shared_layout.combine_bars, dtype=Uint64)
                 self._initialize_shared_storage(
                     combine_smem, Uint32(physical_warp), Uint32(lane))
-            # Cache the full call epoch in every warp before the CTA join.
-            # Dispatch's later grid join cannot flip parity until every CTA
-            # (including its combine warps) has passed this load and join.
+            # Role 1 published this replay's epoch at its entry; every warp
+            # caches it before the CTA join so dispatch and combine agree.
             ready_epoch = Uint64(ld_volatile_u32(
-                signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4)) + Uint64(1)
+                signals.iterator + SIGNAL_OFFSETS['role3_epoch'] // 4))
             sync_unaligned(FINALIZE_THREADS, 1)
             expert_counts = cute.make_rmem_tensor(
                 ((self.local_experts + 31) // 32,), Uint32)

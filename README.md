@@ -469,7 +469,7 @@ ranks. Decode average speedup is the arithmetic mean of the per-point ratios
 | `GC_MOE_USE_LOCAL_VERSION` | `1` | Include a local revision in the wheel version; use `0` for the public version. |
 | `GC_MOE_WHEEL_CUDA_VERSION` | Unset | Append a user-provided CUDA label to the local wheel version. |
 | `GC_MOE_PTXAS` | `/usr/local/cuda/bin/ptxas` | Select the assembler used by the JIT. |
-| `GC_MOE_DISPATCH_SMS` | `16` | Request dispatch SMs; the driver determines the aligned dispatch/compute partition. |
+| `GC_MOE_DISPATCH_SMS` | `8` for ≤8 ranks; otherwise `16` | Override the SM100 dispatch SM request for the operator's communication group; the driver determines the aligned dispatch/compute partition. |
 | `GC_MOE_PRIMARY_CTX` | `0` | Run the role kernels in the primary context instead of Green contexts; the SM split then fixes grid sizes only. |
 | `GC_MOE_BALANCED_WORKQUEUES` | `1` | Request balanced Green workqueues when supported by the driver. |
 | `GC_MOE_NVLINK_BARRIER_TIMEOUT_SECS` | `3600` | Set the positive cross-rank barrier timeout in seconds. |

@@ -561,7 +561,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
     if config.shared_experts != sym_buffer.num_shared_experts:
         raise ValueError('configuration and symmetric-buffer shared experts disagree')
     if context is None:
-        context = get_context()
+        context = get_context(num_ranks=sym_buffer.group.size())
     device = sym_buffer.buffer.device
     weight_pairs = (l1_weights, l2_weights)
     if shared_l1_weights is not None:
@@ -720,7 +720,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
 
 def launch_gc_moe(config, y, l1_weights, l2_weights, sym_buffer,
                   shared_l1_weights, shared_l2_weights, stats) -> None:
-    context = get_context()
+    context = get_context(num_ranks=sym_buffer.group.size())
     binaries, arguments = prepare_role_binaries(
         config, y, l1_weights, l2_weights, sym_buffer,
         shared_l1_weights, shared_l2_weights, stats, context)
