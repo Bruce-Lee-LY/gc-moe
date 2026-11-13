@@ -9,15 +9,18 @@ The operator supports routed experts and optional fused shared
 experts (SE), with FP8 activations, packed FP4 routed weights, FP8 shared
 weights and BF16 outputs.
 
+The ZW-M890P backend uses the PPU SDK and runs MXFP4 activations and weights
+with BF16 outputs, including one optional fused shared expert.
+
 GPU kernels are JIT compiled on first use. Installation builds a Python wheel;
 it does not compile CUDA kernels. The current package version is `0.6.1`.
 
 ## Performance
 
-Decode latency comparing GC MoE with Mega MoE using CUDA Graph replay on eight
-or 32 GPUs. Each point uses 1–256 tokens per rank; total tokens equal eight or
-32 times the per-rank count. The figures use the measurements recorded in the
-linked reports.
+Each decode point uses 1–256 tokens per rank on eight or 32 devices. The
+NVIDIA measurements use CUDA Graph replay, and the PPU measurements use
+ordinary kernel launches. The linked reports record the baseline and timing
+protocol for each platform.
 
 ### Hopper
 
@@ -115,9 +118,59 @@ GLM5.2 and DSV4.1-Flash on eight NVIDIA RTX PRO 5000 72GB Blackwell GPUs.
 
 [Full RTX PRO 5000 SE accuracy and performance data](docs/pro5000_gc_moe_se.md).
 
+### PPU
+
+#### ZW-M890P
+
+GLM5.2 and DSV4.1-Flash on eight ZW-M890P devices. The routed baseline is
+PPU DeepGEMM MegaMoE. The SE baselines add a serial local shared FFN and
+output addition to GC MoE and MegaMoE. Routed-only GC MoE measures the
+extra latency from running the shared expert in the fused operator.
+
+##### Routed experts
+
+GC MoE is faster at 18 of 18 decode points, with a mean speedup of **1.0639×**
+over PPU MegaMoE.
+
+![GLM5.2 routed decode latency and speedup on eight ZW-M890P devices](docs/zw890p_glm52_gc_moe.png)
+
+![DSV4.1-Flash routed decode latency and speedup on eight ZW-M890P devices](docs/zw890p_dsv41_flash_gc_moe.png)
+
+[Full ZW-M890P routed accuracy and performance data](docs/zw890p_gc_moe.md).
+
+##### Fused shared expert
+
+Fused GC MoE is faster at all 18 decode points, with mean speedups of
+**1.1694×** over MegaMoE plus serial SE and **1.1058×** over GC MoE plus
+serial SE. The mean latency increase over routed-only GC MoE is **3.38%**.
+
+![GLM5.2 fused SE latency and speedup on eight ZW-M890P devices](docs/zw890p_glm52_gc_moe_se.png)
+
+![DSV4.1-Flash fused SE latency and speedup on eight ZW-M890P devices](docs/zw890p_dsv41_flash_gc_moe_se.png)
+
+[Full ZW-M890P fused SE accuracy and performance data](docs/zw890p_gc_moe_se.md).
+
+#### Packed-input API
+
+GC MoE on ZW-M890P consumes packed MXFP4 activations and K32 UE8M0
+scales and writes BF16 outputs. Allocate a symmetric workspace with
+`get_symm_buffer_for_gc_moe_ppu` and fill its `x`, `x_sf`, `topk_idx`
+and `topk_weights` views. Prepare the weight pairs with
+`transform_weights_for_gc_moe_ppu`, then call
+`ppu_fp4_fp4_gc_moe(y, w1, w2, workspace)`. Use the workspace creation
+stream and pass the same `num_tokens_bound` on every rank. The output row
+count specifies the local token count.
+
+Reserve one shared expert in the workspace and pass separate shared weight
+pairs to fuse the local shared expert. Shared weights accept K32 or K128
+UE8M0 scales.
+
 ## Quick start
 
 ### Requirements
+
+For ZW-M890P, use a Linux SAIL SDK environment with PPU PyTorch and DeepGEMM.
+The requirements below apply to the NVIDIA backends.
 
 - Linux and an NVIDIA Hopper or Blackwell GPU. The Hopper SM90 path uses
   `sm_90a` kernels and is validated on H20 and H100. The Blackwell SM100 path
@@ -164,8 +217,15 @@ first encounters a new configuration. The JIT uses the assembler at
 `/usr/local/cuda/bin/ptxas` by default. Set `GC_MOE_PTXAS` to select another
 assembler compatible with the generated PTX.
 
-For editable development, use `python -m pip install -e .` instead of installing
-the wheel. Wheel versions include the Git revision for a clean tree, or
+The wheel ships the Python package and PPU sources. Install the `cuda` extra
+to resolve NVIDIA runtime dependencies, or use the SAIL SDK Python environment
+for PPU. The PPU JIT builds with `hgcc` on the target host and caches libraries
+under `${XDG_CACHE_HOME:-~/.cache}/gc_moe/ppu`. Set `GC_MOE_JIT_CACHE_DIR` to
+override the cache root.
+
+For editable development, use `python -m pip install -e .` with dependencies
+already installed, or `python -m pip install -e '.[cuda]'` to resolve them for
+NVIDIA. Wheel versions include the Git revision for a clean tree, or
 `+local` for a dirty tree or a source copy without Git metadata. Set
 `GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.6.1` version.
 
@@ -438,6 +498,27 @@ bash scripts/run_sm90.sh 4 both --gc-only
 bash scripts/run_sm90_se.sh 4 both --gc-only
 ```
 
+Run the ZW-M890P tests with the PPU SDK and a PPU PyTorch and DeepGEMM environment.
+The PPU benchmarks prepare inputs and output views before timing. PPU uses
+eager device events around the public GC MoE API and the MegaMoE operator after
+pre-dispatch. Each eager GC MoE submission advances the workspace's communication
+generation. Add `--shared-expert` to compare fused GC MoE with both serial SE
+baselines and routed-only GC MoE. The `test` and `bench` stages each save per-model
+JSON results.
+The benchmark defaults to 10 warmup windows, 30 measured windows and 100
+requests per window. Workspace capacity defaults to the largest token count
+in the sweep. Both operators default to SwiGLU with clamp 10 and fast math.
+Use `--arms gc` for GC-only timing or
+`--shared-weight-gran-k 128` for K128 shared weights.
+
+```bash
+bash scripts/run_ppu.sh SDK_DIR bench
+bash scripts/run_ppu.sh SDK_DIR bench --shared-expert
+bash scripts/run_ppu.sh SDK_DIR test --case-category asymmetric
+bash scripts/run_ppu.sh SDK_DIR test --readiness --steps 30
+bash scripts/run_ppu.sh SDK_DIR test --shared-expert --readiness --steps 30
+```
+
 The SM120 benchmarks use FlashInfer Cake MegaMoE and optionally FlashInfer
 CuTe DSL W4A8 MegaMoE for routed experts. Pass `--arms gc` to the benchmark
 stage when FlashInfer is unavailable.
@@ -448,7 +529,7 @@ bash scripts/run_sm120.sh 8 bench --arms baseline,cake,gc
 bash scripts/run_sm120_se.sh 8 both
 ```
 
-Each accuracy or benchmark stage waits for all selected GPUs to be idle:
+The NVIDIA runner waits for all selected GPUs to be idle:
 utilization 0%, no compute processes and at least 51200 MiB free per GPU,
 observed over at least three samples and ten seconds. `GC_MOE_PYTHON_BIN` selects the
 test interpreter; its default is `/opt/conda310/bin/python`. Set `GC_MOE_RESULT_DIR`
@@ -456,7 +537,7 @@ to choose the raw JSON output directory; otherwise the script creates a new
 directory and prints its path. Use `bash scripts/run.sh --help` for the launch
 syntax; `scripts/run_se.sh` accepts the same options.
 
-Performance tests use CUDA Graph replay, with 10 warmup windows, 30 measured
+NVIDIA performance tests use CUDA Graph replay, with 10 warmup windows, 30 measured
 windows and 100 invocations per window by default. Each rank reports the median
 per-invocation CUDA-event latency; the final latency is the maximum across
 ranks. Decode average speedup is the arithmetic mean of the per-point ratios

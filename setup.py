@@ -54,12 +54,13 @@ if __name__ == '__main__':
             include=['gc_moe', 'gc_moe.*'],
             exclude=['*.__pycache__', '*.__pycache__.*'],
         ),
+        package_data={'gc_moe.impls.ppu': ['*.cu', '*.cuh', 'build.json']},
         python_requires='>=3.10',
-        install_requires=[
+        extras_require={'cuda': [
             'torch>=2.11.0,<2.12',
             'nvidia-cutlass-dsl==4.8.1',
             'cuda-python>=13.2,<14',
             'cuda-bindings>=13.2,<14',
-        ],
+        ]},
         zip_safe=False,
     )
