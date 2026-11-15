@@ -10,7 +10,6 @@ from cutlass import Float32, Int32, Uint8, Uint16, Uint32, Uint64
 from ..comm.gc_barrier import (
     DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS,
     grid_sync,
-    sync_dispatch_threads,
     wait_sys_u64_eq,
 )
 from ..common.math import (
@@ -245,6 +244,15 @@ def _load_w2_source_metadata(base: cute.Pointer, row_in_block: Uint32,
     return src_rank, src_token, topk_slot
 
 
+@cute.jit
+def _initialize_private_combine_bar(bar: cute.Pointer) -> None:
+    """Publish one warp-owned barrier before that warp's first use."""
+    if elect_one_sync():
+        cute.arch.mbarrier_init(bar, 1)
+        cute.arch.mbarrier_init_fence()
+    cute.arch.sync_warp()
+
+
 class GCMoERoleKernel:
     """Keep the role on the Python object so CuTe erases other role paths."""
 
@@ -456,9 +464,8 @@ class GCMoERoleKernel:
 
     @cute.jit
     def _role3_dispatch(self, signals: cute.Tensor, peer_ptrs: cute.Tensor,
-                        rank_idx: Uint32, tid: Uint32, lane: Uint32,
-                        block: Uint32, expert_counts: cute.Tensor,
-                        recv_ptr: cute.Pointer, stats: cute.Tensor,
+                        rank_idx: Uint32, tid: Uint32,
+                        block: Uint32, recv_ptr: cute.Pointer, stats: cute.Tensor,
                         ready_epoch: Uint64) -> None:
         # Publish completed peer FC2 stores even with no routed tokens.
         # Epochs distinguish late old publications without resetting ready.
@@ -475,29 +482,10 @@ class GCMoERoleKernel:
         # generation clears it at entry.
         gen = Uint32(ready_epoch - Uint64(1)) & Uint32(1)
         recv_ptr = recv_ptr + gen * Uint32(self.local_experts * 2)
-        # GCMoEScheduler::fetch_expert_recv_count: each lane keeps
-        # experts wave*32+lane in registers while combine reuses SMEM.
-        for wave in cutlass.range_constexpr(
-                (self.local_experts + 31) // 32):
-            expert_idx = Uint32(wave * 32) + lane
-            observed = Uint64(0)
-            if expert_idx < Uint32(self.local_experts):
-                wait_start = read_clock64()
-                while Uint32(observed >> 32) != Uint32(
-                        self.dispatch_sms * self.num_ranks):
-                    observed = ld_volatile_u64(
-                        recv_ptr + expert_idx * 2)
-                    if Uint64(read_clock64() - wait_start) >= Uint64(
-                            self.nvlink_timeout_secs * 2000000000):
-                        if block == Uint32(0):
-                            cute.printf(
-                                'GC recv-count timeout role=3 rank={} expert={} gen={} observed_hi={} expected={}',
-                                rank_idx, expert_idx, gen, Uint32(observed >> 32),
-                                self.dispatch_sms * self.num_ranks)
-                        device_trap()
-                observed = ld_acquire_sys_u64(recv_ptr + expert_idx * 2)
-            expert_counts[wave] = Uint32(observed)
-        cute.arch.sync_warp()
+        # Role1 acquired every expert sum, including zero-count experts,
+        # before publishing this summary. Normal graph completion dependencies
+        # also retire every role2 ring access before this footer executes.
+        pool_blocks = signals[SIGNAL_OFFSETS['routed_pool_blocks'] // 4]
         # All CTAs use the immutable role1 epoch, so block0 may flip parity
         # without a grid-wide cache-completion barrier. The next dispatch
         # clears this bank only after the entire local finalize grid ends.
@@ -532,39 +520,24 @@ class GCMoERoleKernel:
                         shared_block] = Uint32(0)
                 shared_block += Uint32(128)
             cute.arch.sync_warp()
-        else:
-            local_expert = Uint32(block - 1)
+        if cutlass.const_expr(self.has_stats):
+            local_expert = block * Uint32(128) + tid
             while local_expert < Uint32(self.local_experts):
                 received = Uint32(ld_global_u64(recv_ptr + local_expert * Uint32(2)))
-                active_blocks = (received + Uint32(self.block_m - 1)) // \
-                    Uint32(self.block_m)
-                own_blocks = Uint32(0)
-                for wave in cutlass.range_constexpr(
-                        (self.local_experts + 31) // 32):
-                    expert_idx = Uint32(wave * 32) + lane
-                    if expert_idx < local_expert:
-                        own_blocks += (expert_counts[wave] +
-                                       Uint32(self.block_m - 1)) // \
-                            Uint32(self.block_m)
-                pool_prefix = cute.arch.warp_redux_sync(own_blocks, 'add')
-                sync_dispatch_threads(128)
-                if tid // Uint32(32) == Uint32(1):
-                    if elect_one_sync():
-                        if cutlass.const_expr(self.has_stats):
-                            red_gpu_add_s32(stats.iterator + local_expert, Int32(received))
-                    cute.arch.sync_warp()
-                ring_idx = Uint32(tid)
-                while ring_idx < active_blocks:
-                    ring_block = (pool_prefix + ring_idx) % Uint32(self.ring_blocks)
-                    signals[SIGNAL_OFFSETS['l1_full_count'] // 4 + ring_block] = Uint32(0)
-                    signals[SIGNAL_OFFSETS['l1_empty_count'] // 4 + ring_block] = Uint32(0)
-                    st_global_u64(
-                        signals.iterator + SIGNAL_OFFSETS['l2_full_mask'] // 4 +
-                        ring_block * Uint32(2), Uint64(0))
-                    signals[SIGNAL_OFFSETS['l2_empty_count'] // 4 + ring_block] = Uint32(0)
-                    ring_idx += Uint32(128)
-                cute.arch.sync_warp()
-                local_expert += Uint32(self.finalize_sms - 1)
+                red_gpu_add_s32(stats.iterator + local_expert, Int32(received))
+                local_expert += Uint32(self.finalize_sms * 128)
+
+        # The padded expert ranges concatenate to [0,P). Modulo R, their
+        # used slots are exactly [0,min(P,R)); clear each of those slots once.
+        ring_block = block * Uint32(128) + tid
+        while ring_block < min(pool_blocks, Uint32(self.ring_blocks)):
+            signals[SIGNAL_OFFSETS['l1_full_count'] // 4 + ring_block] = Uint32(0)
+            signals[SIGNAL_OFFSETS['l1_empty_count'] // 4 + ring_block] = Uint32(0)
+            st_global_u64(
+                signals.iterator + SIGNAL_OFFSETS['l2_full_mask'] // 4 +
+                ring_block * Uint32(2), Uint64(0))
+            signals[SIGNAL_OFFSETS['l2_empty_count'] // 4 + ring_block] = Uint32(0)
+            ring_block += Uint32(self.finalize_sms * 128)
 
         # The former tail NVLink barrier (tag 2) is gone: the receive
         # signals are dual-buffered by recv_parity, so peers' next publish
@@ -612,6 +585,9 @@ class GCMoERoleKernel:
             bar = combine_bars + epi_warp
             phase = Uint32(0)
             token_chunk = epi_warp * Uint32(self.finalize_sms) + block
+            if cutlass.const_expr(self.shared_experts > 0):
+                if token_chunk < num_tokens * Uint32(combine_chunks):
+                    _initialize_private_combine_bar(bar)
             while token_chunk < num_tokens * Uint32(combine_chunks):
                 token = token_chunk // Uint32(combine_chunks)
                 chunk = token_chunk % Uint32(combine_chunks)
@@ -913,6 +889,16 @@ class GCMoERoleKernel:
                         recv_ptr + expert_idx * Uint32(2))
                 expert_counts[wave] = Uint32(observed)
             cute.arch.sync_warp()
+
+            if block == Uint32(0) and physical_warp == Uint32(0):
+                own_pool_blocks = Uint32(0)
+                for wave in cutlass.range_constexpr(
+                        (self.local_experts + 31) // 32):
+                    own_pool_blocks += (expert_counts[wave] +
+                                        Uint32(self.block_m - 1)) // Uint32(self.block_m)
+                total_pool_blocks = cute.arch.warp_redux_sync(own_pool_blocks, 'add')
+                if lane == Uint32(0):
+                    signals[SIGNAL_OFFSETS['routed_pool_blocks'] // 4] = total_pool_blocks
 
             # One global warp cursor traverses concatenated, unpadded expert
             # tokens; the pool-block prefix advances by each expert's padded
@@ -1918,8 +1904,8 @@ class GCMoERoleKernel:
                 if physical_warp == 4:
                     tmem_free_2cta(tptr[0], Uint32(self.tmem_cols))
         else:
-            # Both graph workers precede role 3. The whole CTA joins once;
-            # dispatch and combine warp groups then progress independently.
+            # Both graph workers precede role 3. Fused finalization uses
+            # warp-owned barriers; legacy paths retain the whole-CTA join.
             combine_smem = cute.recast_ptr(signals.iterator, dtype=Uint8)
             combine_bars = cute.recast_ptr(signals.iterator, dtype=Uint64)
             if cutlass.const_expr(self.finalize_output):
@@ -1930,21 +1916,23 @@ class GCMoERoleKernel:
                     combine_alloc.allocate(self.shared_layout.field_end, 1024), dtype=Uint8)
                 combine_bars = cute.recast_ptr(
                     combine_smem + self.shared_layout.combine_bars, dtype=Uint64)
-                self._initialize_shared_storage(
-                    combine_smem, Uint32(physical_warp), Uint32(lane))
-            # Role 1 published this replay's epoch at its entry; every warp
-            # caches it before the CTA join so dispatch and combine agree.
+                if cutlass.const_expr(self.shared_experts > 0):
+                    cute.arch.griddepcontrol_wait()
+                else:
+                    self._initialize_shared_storage(
+                        combine_smem, Uint32(physical_warp), Uint32(lane))
+            # Role 1's epoch remains immutable throughout this role-3 launch.
+            # Each warp caches it independently; the footer advances recv_parity.
             ready_epoch = Uint64(ld_volatile_u32(
                 signals.iterator + SIGNAL_OFFSETS['role3_epoch'] // 4))
-            sync_unaligned(FINALIZE_THREADS, 1)
-            expert_counts = cute.make_rmem_tensor(
-                ((self.local_experts + 31) // 32,), Uint32)
+            if cutlass.const_expr(not (self.finalize_output and self.shared_experts > 0)):
+                sync_unaligned(FINALIZE_THREADS, 1)
             recv_off = SIGNAL_OFFSETS['expert_recv_count_sum'] // 4
             recv_ptr = signals.iterator + recv_off
             if physical_warp < 4:
                 self._role3_dispatch(signals, peer_ptrs, rank_idx,
-                                     Uint32(tid), Uint32(lane), Uint32(block),
-                                     expert_counts, recv_ptr, stats, ready_epoch)
+                                     Uint32(tid), Uint32(block),
+                                     recv_ptr, stats, ready_epoch)
             else:
                 self._role3_combine(signals, rank_idx, num_tokens, y_out,
                                     block, physical_warp, lane,

@@ -122,6 +122,7 @@ def _signal_offsets() -> dict[str, int]:
         # at its entry, so role 3 reads it instead of a grid barrier.
         ('recv_parity', 1, 4),
         ('role3_epoch', 1, 4),
+        ('routed_pool_blocks', 1, 4),
         ('combine_ready_grid_idx', MAX_RANKS, 8),
         ('expert_send_count', MAX_EXPERTS, 8),
         ('expert_recv_count', 2 * MAX_EXPERTS, 8),
