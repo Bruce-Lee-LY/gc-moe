@@ -22,7 +22,18 @@ from .sm120_gc import (
     sm120_fp8_fp4_gc_moe,
 )
 
+from .apis.k3_gc_moe import (
+    K3_SITU_CONTRACT,
+    K3_SHARED_OUTPUT_CONTRACT,
+    prepare_k3_shared_gc,
+)
+from .gc.k3_shared import K3SharedWorkspace
+
 __all__ = [
+    'K3_SITU_CONTRACT',
+    'K3_SHARED_OUTPUT_CONTRACT',
+    'prepare_k3_shared_gc',
+    'K3SharedWorkspace',
     'SM90GCSymmBuffer',
     'get_symm_buffer_for_gc_moe_sm90',
     'transform_weights_for_gc_moe_sm90',
