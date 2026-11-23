@@ -198,3 +198,21 @@ def warp_inclusive_sum(value: Uint32, lane: Uint32) -> Uint32:
         if lane >= Uint32(offset):
             value += neighbor
     return value
+
+
+@dsl_user_op
+def fma_rn(a: Float32, b: Float32, c: Float32, *, loc=None, ip=None) -> Float32:
+    """Evaluate a single FP32 fused multiply-add with round-to-nearest."""
+    return Float32(llvm.inline_asm(
+        T.f32(), [x.ir_value(loc=loc, ip=ip) for x in (a, b, c)],
+        'fma.rn.f32 $0, $1, $2, $3;', '=f,f,f,f', has_side_effects=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT))
+
+
+@dsl_user_op
+def tanh_approx(a: Float32, *, loc=None, ip=None) -> Float32:
+    """Evaluate the native FP32 approximate hyperbolic tangent instruction."""
+    return Float32(llvm.inline_asm(
+        T.f32(), [a.ir_value(loc=loc, ip=ip)],
+        'tanh.approx.f32 $0, $1;', '=f,f', has_side_effects=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT))

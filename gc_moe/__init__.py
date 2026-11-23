@@ -8,6 +8,14 @@ from .gc import (
     transform_weights_for_gc_moe,
 )
 
+from .gc_k3 import (
+    GCK3SymmBuffer,
+    fp8_fp4_gc_moe_k3,
+    get_block_m_for_gc_moe_k3,
+    get_symm_buffer_for_gc_moe_k3,
+    transform_weights_for_gc_moe_k3,
+)
+
 from .sm90_gc import (
     SM90GCSymmBuffer,
     get_symm_buffer_for_gc_moe_sm90,
@@ -23,6 +31,16 @@ from .sm120_gc import (
 )
 
 __all__ = [
+    'GCSymmBuffer',
+    'fp8_fp4_gc_moe',
+    'get_block_m_for_gc_moe',
+    'get_symm_buffer_for_gc_moe',
+    'transform_weights_for_gc_moe',
+    'GCK3SymmBuffer',
+    'fp8_fp4_gc_moe_k3',
+    'get_block_m_for_gc_moe_k3',
+    'get_symm_buffer_for_gc_moe_k3',
+    'transform_weights_for_gc_moe_k3',
     'SM90GCSymmBuffer',
     'get_symm_buffer_for_gc_moe_sm90',
     'transform_weights_for_gc_moe_sm90',
@@ -31,11 +49,6 @@ __all__ = [
     'get_symm_buffer_for_gc_moe_sm120',
     'transform_weights_for_gc_moe_sm120',
     'sm120_fp8_fp4_gc_moe',
-    'GCSymmBuffer',
-    'fp8_fp4_gc_moe',
-    'get_block_m_for_gc_moe',
-    'get_symm_buffer_for_gc_moe',
-    'transform_weights_for_gc_moe',
 ]
 
-__version__ = '0.6.2'
+__version__ = '0.7.0'

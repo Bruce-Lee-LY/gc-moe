@@ -131,3 +131,16 @@ def tmem_free_2cta(address: Uint32, columns: Uint32, *, loc=None, ip=None) -> No
                     'tcgen05.dealloc.cta_group::2.sync.aligned.b32 $0, $1;',
                     'r,r', has_side_effects=True,
                     asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def mma_f16_2cta(desc_a: Uint64, desc_b: Uint64, accum_tmem: Uint32,
+                  accumulate: Uint32, instr_desc_hi: Uint32,
+                  *, loc=None, ip=None) -> None:
+    """Issue one two-CTA K16 BF16 MMA into FP32 TMEM."""
+    llvm.inline_asm(
+        None, [x.ir_value(loc=loc, ip=ip) for x in
+               (accum_tmem, desc_a, desc_b, instr_desc_hi, accumulate)],
+        '{ .reg .pred p; setp.ne.b32 p, $4, 0; '
+        'tcgen05.mma.cta_group::2.kind::f16 [$0], $1, $2, $3, p; }',
+        'r,l,l,r,r', has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)

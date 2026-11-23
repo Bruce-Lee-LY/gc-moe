@@ -3,20 +3,58 @@
 GC MoE is a CuTe DSL implementation of FP8/FP4 mixture-of-experts inference
 with CUDA Green Contexts for NVIDIA Hopper and Blackwell GPUs. It overlaps
 expert-parallel token dispatch with
-Tensor Core computation, then combines the expert outputs through a CUDA Graph
-with three kernel nodes (four or five for SM90 fused SE).
+Tensor Core computation, then combines the expert outputs through a CUDA Graph.
+The graph topology depends on the operator and shared-expert schedule.
 The operator supports routed experts and optional fused shared
-experts (SE), with FP8 activations, packed FP4 routed weights, FP8 shared
-weights and BF16 outputs.
+experts (SE), with FP8 routed activations, packed FP4 routed weights and
+BF16 outputs. Shared experts use FP8 weights in GC MoE and BF16 activations
+and weights in GC MoE K3.
 
 GPU kernels are JIT compiled on first use. Installation builds a Python wheel;
 it does not compile CUDA kernels.
 
+## Operator overview
+
+SM100 provides both the general GC MoE operator and the Kimi K3 operator.
+SM90 and SM120 each have a dedicated operator. Each figure shows (a) the
+work of every graph role and (b) how the roles overlap across the two Green
+Contexts: solid bars are role execution, dashed arrows completion joins and
+dotted arrows data gates.
+
+**`fp8_fp4_gc_moe`** — SM100 (compute capabilities 10.0 and 10.3), three
+roles on two Green Contexts; combine joins both.
+
+![Roles and Green Context parallelism of fp8_fp4_gc_moe on SM100](assets/fp8_fp4_gc_moe.png)
+
+**`fp8_fp4_gc_moe_k3`** — SM100 (compute capabilities 10.0 and 10.3), five
+base roles for live input rows. Front feeds Router, and Router feeds Dispatch.
+On Green Contexts, Compute waits for Front completion unless early shared
+enables a programmatic dependency. Finalize joins Dispatch and Compute. If Routed Assist runs,
+it follows Dispatch and Finalize joins Assist and Compute. Split-K adds a
+Reduce node after Finalize. A rank with zero physical input rows runs Dispatch,
+Compute and Finalize to publish and retire the workspace.
+
+![Roles and Green Context parallelism of fp8_fp4_gc_moe_k3 on SM100](assets/fp8_fp4_gc_moe_k3.png)
+
+**`sm90_fp8_fp4_gc_moe`** — SM90 (`sm_90a`), five roles on two Green
+Contexts with the shared-expert phase split into dedicated L1 and L2 GEMM
+roles in the split schedule shown. On Green Contexts, Dispatch and SE L1 can
+start independently. A bounded SE L2 can use a launch-order edge from SE L1. Combine joins all local producers.
+
+![Roles and Green Context parallelism of sm90_fp8_fp4_gc_moe on SM90](assets/sm90_fp8_fp4_gc_moe.png)
+
+**`sm120_fp8_fp4_gc_moe`** — SM120 (compute capability 12.0), three roles on
+two Green Contexts. Dispatch and Compute are independent graph roots in
+Green mode. Routed Compute waits for the expert counters from Dispatch.
+
+![Roles and Green Context parallelism of sm120_fp8_fp4_gc_moe on SM120](assets/sm120_fp8_fp4_gc_moe.png)
+
 ## Performance
 
-Decode latency comparing GC MoE with Mega MoE using CUDA Graph replay on eight
-or 32 GPUs. Each point uses 1–256 tokens per rank; total tokens equal eight or
-32 times the per-rank count. The figures use the measurements recorded in the
+Decode latency comparing GC MoE with Mega MoE using CUDA Graph replay on the GPU counts shown below.
+Kimi K3 on GB200 covers EP8, EP16 and EP32 at 1–128 tokens per rank. The other
+decode sweeps cover 1–256 tokens per rank. Total tokens equal the per-rank count
+multiplied by the number of ranks. The figures use the measurements recorded in the
 linked reports.
 
 ### Hopper
@@ -77,7 +115,7 @@ GLM5.2 and DSV4.1-Flash on eight NVIDIA L20D (B300) GPUs.
 
 #### GB200 / L20A
 
-GLM5.2 and DSV4.1-Flash on 32 NVIDIA L20A (GB200) GPUs.
+GLM5.2 and DSV4.1-Flash on 32 NVIDIA L20A (GB200) GPUs. Kimi K3 results cover 8, 16 and 32 GPUs.
 
 ##### Routed experts (non-SE)
 
@@ -94,6 +132,10 @@ GLM5.2 and DSV4.1-Flash on 32 NVIDIA L20A (GB200) GPUs.
 ![DSV4.1-Flash fused SE: GC MoE versus Mega MoE latency and speedup on 32 GB200 GPUs](docs/gb200_dsv41_flash_gc_moe_se.png)
 
 [Full GB200 SE accuracy and performance data](docs/gb200_gc_moe_se.md).
+
+![Kimi K3 full-output decode latency and speedup for GC MoE K3, SGLang Mega MoE K3 and vLLM Mega MoE K3 on 8, 16 and 32 GB200 GPUs](docs/gb200_gc_moe_k3.png)
+
+[Full GB200 Kimi K3 accuracy and performance data](docs/gb200_gc_moe_k3.md).
 
 #### RTX PRO 5000
 
@@ -181,6 +223,11 @@ allocation, weight transform and execution interfaces.
 | `fp8_fp4_gc_moe` | Write routed-expert output, optionally including shared experts, into `y`. |
 | `get_block_m_for_gc_moe` | Query the token block size for SM100 and SM120 shared-input scale staging. |
 | `GCSymmBuffer` | Own SM100 input views, peer addresses and workspace storage. |
+| `get_symm_buffer_for_gc_moe_k3` | Allocate and rendezvous the K3 input and workspace buffers. |
+| `transform_weights_for_gc_moe_k3` | Pack routed FP4 weight pairs or dense BF16 shared weights into the K3 slice-major layout. |
+| `fp8_fp4_gc_moe_k3` | Run K3 from BF16 post-attention hidden states through routing, SiTU experts, and the projected sum with an optional prefix. |
+| `get_block_m_for_gc_moe_k3` | Query the routed token block size for the expert-parallel group and local token count. |
+| `GCK3SymmBuffer` | Own K3 input views, peer addresses and workspace storage. |
 
 Hopper uses separate SM90 interfaces, also exported from `gc_moe`:
 
@@ -191,27 +238,6 @@ Hopper uses separate SM90 interfaces, also exported from `gc_moe`:
 | `sm90_fp8_fp4_gc_moe` | Write Hopper routed-expert output, optionally including fused shared experts, into `y`. |
 | `SM90GCSymmBuffer` | Own the independent SM90 input views, peer addresses and workspace storage. |
 
-SM90 uses its own buffers and transformed weight layout. Routed activations
-use E4M3FN with contiguous FP32 K128 scales. Pass `shared_l1_weights` and
-`shared_l2_weights` to `sm90_fp8_fp4_gc_moe` to fuse shared experts. See the
-[SM90 interfaces](gc_moe/sm90_gc/__init__.py),
-[routed-expert test](tests/test_sm90_gc_moe.py) and
-[shared-expert test](tests/test_sm90_gc_moe_se.py) for complete preparation.
-
-The SM90 Green Context selects and caches its scheduling policy from CUDA's
-device-visible total SM count before splitting communication and compute:
-devices with at least 128 SMs, including full 132-SM H100 devices, use
-the small-batch pipelined schedule; smaller devices, including 78-SM H20, keep
-the legacy schedule. This selection covers routed and
-shared launch geometry and shared-memory budgets and does not tune during graph
-replay.
-
-For calls with shared experts, the high-SM policy uses one routed compute CTA
-per compute SM at 1–16 tokens/rank. Its shared grid covers the shared task count
-with a floor of half the compute SM count. Routed-only calls use two routed
-compute CTAs per compute SM in this range. These rules apply to all supported
-expert-parallel group sizes and model shapes.
-
 SM120 (compute capability 12.0) has separate interfaces.
 
 | Interface | Purpose |
@@ -221,19 +247,9 @@ SM120 (compute capability 12.0) has separate interfaces.
 | `sm120_fp8_fp4_gc_moe` | Write SM120 routed and optional fused shared output into `y`. |
 | `SM120GCSymmBuffer` | Own SM120 input views, peer addresses and workspace storage. |
 
-The SM120 entry points use the SM100 weight formats described below, including
-packed `torch.int32` UE8M0 scales for both routed and shared experts.
-Shared-input scale staging also uses the same layout.
-If supplying `num_tokens_bound`, use the same positive bound on all ranks and
-cover every rank's token count. Valid expert IDs within each token must be
-distinct. If repeated IDs exhaust a source's capacity for an expert, SM120
-returns NaN for the affected output rows and counts only admitted routes.
-See the [SM120 test](tests/test_sm120_gc_moe.py)
-for complete routed and shared-expert examples.
-
 ### Input contract
 
-Let `P` be the number of ranks, `E` the total number of routed experts, `H` the
+This section describes `fp8_fp4_gc_moe`. Let `P` be the number of ranks, `E` the total number of routed experts, `H` the
 hidden size, `I` the intermediate size and `T` this rank's token count. Experts
 are evenly distributed across ranks, so each rank stores `E / P` routed experts.
 The total input token count is the sum of all ranks' `T` values; for a symmetric
@@ -277,7 +293,7 @@ accepts transformed pairs. Keep their storage and layout fixed while graphs use
 them. Order in-place value updates after previous readers and before replay;
 replacing storage or layout requires preparing and capturing new graphs.
 
-The current operator requires:
+The `fp8_fp4_gc_moe` operator requires:
 
 - `recipe=(1, 1, 32)` and `activation='swiglu'` for routed experts.
 - Positive `H` divisible by 256, and positive `I` divisible by 128 with `I <= 4096`.
@@ -421,12 +437,12 @@ bash scripts/run.sh 8 test --models glm5.2 --test-categories asymmetric
 bash scripts/run_se.sh 8 bench --models glm5.2
 ```
 
-The default accuracy cases and benchmarks use `1, 2, 4, 8, 16, 32, 64, 128, 256`
-tokens **per rank**. Boundary tests add zero and block-size boundaries;
-asymmetric tests vary counts across ranks, including empty ranks. The default
-cosine thresholds are 0.97 for non-SE and 0.99 for SE. Additional eight-rank
-readiness checks are available in [the non-SE readiness test](tests/test_gc_moe_readiness.py)
-and [the SE readiness test](tests/test_gc_moe_se_readiness.py).
+The SM100 K3 tests use the complete Kimi K3 routed and shared-expert output. Use `both` to run accuracy tests
+and benchmarks on eight GPUs.
+
+```bash
+bash scripts/run_k3.sh 8 both
+```
 
 The SM90 wrappers use the DSV4.1-Flash preset. Pass `--gc-only` when the
 DeepGEMM build lacks the SM90 comparison kernels. The SE wrapper then tests
@@ -447,20 +463,6 @@ bash scripts/run_sm120.sh 8 test
 bash scripts/run_sm120.sh 8 bench --arms baseline,cake,gc
 bash scripts/run_sm120_se.sh 8 both
 ```
-
-Each accuracy or benchmark stage waits for all selected GPUs to be idle:
-utilization 0%, no compute processes and at least 51200 MiB free per GPU,
-observed over at least three samples and ten seconds. `GC_MOE_PYTHON_BIN` selects the
-test interpreter; its default is `/opt/conda310/bin/python`. Set `GC_MOE_RESULT_DIR`
-to choose the raw JSON output directory; otherwise the script creates a new
-directory and prints its path. Use `bash scripts/run.sh --help` for the launch
-syntax; `scripts/run_se.sh` accepts the same options.
-
-Performance tests use CUDA Graph replay, with 10 warmup windows, 30 measured
-windows and 100 invocations per window by default. Each rank reports the median
-per-invocation CUDA-event latency; the final latency is the maximum across
-ranks. Decode average speedup is the arithmetic mean of the per-point ratios
-`baseline_latency / gc_latency`, rather than the ratio of average latencies.
 
 ## Configuration
 

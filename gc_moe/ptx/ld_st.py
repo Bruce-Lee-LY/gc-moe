@@ -77,6 +77,14 @@ def ld_acquire_gpu_u64(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint64:
 
 
 @dsl_user_op
+def st_release_gpu_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(None,
+        [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+        'st.release.gpu.global.u64 [$0], $1;', 'l,l,~{memory}',
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
 def ld_acquire_sys_u64(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint64:
     address = ptr.toint(loc=loc, ip=ip).ir_value()
     value = llvm.inline_asm(T.i64(), [address],
@@ -482,3 +490,14 @@ def ld_shared_u32x4_sm90(ptr: cute.Pointer, *, loc=None, ip=None):
         '=r,=r,=r,=r,r,~{memory}', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
     return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i])) for i in range(4))
+
+
+@dsl_user_op
+def stmatrix_bf16x4_trans(dst_smem: cute.Pointer, packed0: Uint32,
+                          packed1: Uint32, *, loc=None, ip=None) -> None:
+    """Collective transpose store of two packed BF16 register pairs."""
+    llvm.inline_asm(
+        None, [dst_smem.toint(loc=loc, ip=ip).ir_value(),
+               packed0.ir_value(loc=loc, ip=ip), packed1.ir_value(loc=loc, ip=ip)],
+        'stmatrix.sync.aligned.x2.m8n8.shared.b16.trans [$0], {$1, $2};',
+        'r,r,r', has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
