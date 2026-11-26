@@ -1,4 +1,4 @@
-"""Build the CuTe DSL package; GPU kernels are JIT compiled at runtime."""
+"""Build the GC MoE package. Device kernels are JIT compiled at runtime."""
 import ast
 import os
 from pathlib import Path
@@ -10,6 +10,7 @@ from setuptools import find_namespace_packages, setup
 
 ROOT = Path(__file__).resolve().parent
 GC_MOE_USE_LOCAL_VERSION = int(os.getenv('GC_MOE_USE_LOCAL_VERSION', '1')) == 1
+GC_MOE_PPU = os.getenv('GC_MOE_BACKEND') == 'ppu'
 
 
 def get_package_version():
@@ -55,7 +56,8 @@ if __name__ == '__main__':
             exclude=['*.__pycache__', '*.__pycache__.*'],
         ),
         python_requires='>=3.10',
-        install_requires=[
+        package_data={'gc_moe.impls.ppu': ['*.cu', '*.cuh']},
+        install_requires=[] if GC_MOE_PPU else [
             'torch>=2.11.0,<2.12',
             'nvidia-cutlass-dsl==4.8.1',
             'cuda-python>=13.2,<14',

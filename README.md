@@ -13,6 +13,10 @@ and weights in GC MoE K3.
 GPU kernels are JIT compiled on first use. Installation builds a Python wheel;
 it does not compile CUDA kernels.
 
+The Sail backend implements MXFP4 routed decode and optional fused E4M3 PTPC
+shared experts on ZW-M890P. It selects tiles using the expert geometry and the
+common token bound. See the [PPU API and setup](docs/ppu_gc_moe.md).
+
 ## Operator overview
 
 SM100 provides both the general GC MoE operator and the Kimi K3 operator.
@@ -51,7 +55,7 @@ Green mode. Routed Compute waits for the expert counters from Dispatch.
 
 ## Performance
 
-Decode latency comparing GC MoE with Mega MoE using CUDA Graph replay on the GPU counts shown below.
+Decode latency comparing GC MoE with the baselines in the linked reports using graph replay.
 Kimi K3 on GB200 covers EP8, EP16 and EP32 at 1–128 tokens per rank. The other
 decode sweeps cover 1–256 tokens per rank. Total tokens equal the per-rank count
 multiplied by the number of ranks. The figures use the measurements recorded in the
@@ -156,6 +160,28 @@ GLM5.2 and DSV4.1-Flash on eight NVIDIA RTX PRO 5000 72GB Blackwell GPUs.
 ![DSV4.1-Flash fused SE latency and speedup over Cake on eight RTX PRO 5000 GPUs](docs/pro5000_dsv41_flash_gc_moe_se.png)
 
 [Full RTX PRO 5000 SE accuracy and performance data](docs/pro5000_gc_moe_se.md).
+
+### Sail
+
+#### ZW-M890P
+
+DSV4-Flash and DSV4.1-Flash on eight ZW-M890P PPUs.
+
+##### Routed experts (non-SE)
+
+![DSV4-Flash non-SE latency and speedup over MegaMoE on eight ZW-M890P PPUs](docs/zw-m890p_dsv4_flash_gc_moe.png)
+
+![DSV4.1-Flash non-SE latency and speedup over MegaMoE on eight ZW-M890P PPUs](docs/zw-m890p_dsv41_flash_gc_moe.png)
+
+[Full ZW-M890P non-SE accuracy and performance data](docs/zw-m890p_gc_moe.md).
+
+##### Fused shared experts (SE)
+
+![DSV4-Flash fused SE latency and speedup over MegaMoE with serial PTPC SE on eight ZW-M890P PPUs](docs/zw-m890p_dsv4_flash_gc_moe_se.png)
+
+![DSV4.1-Flash fused SE latency and speedup over MegaMoE with serial PTPC SE on eight ZW-M890P PPUs](docs/zw-m890p_dsv41_flash_gc_moe_se.png)
+
+[Full ZW-M890P SE accuracy and performance data](docs/zw-m890p_gc_moe_se.md).
 
 ## Quick start
 
@@ -464,11 +490,22 @@ bash scripts/run_sm120.sh 8 bench --arms baseline,cake,gc
 bash scripts/run_sm120_se.sh 8 both
 ```
 
+Use the Sail SDK 2.2.0 environment for the PPU runners. Both runners accept
+`--model dsv4-flash` and `--model dsv4.1-flash`. See the [PPU setup](docs/ppu_gc_moe.md).
+
+```bash
+bash scripts/run_ppu.sh test --model dsv4-flash --mask --asymmetric
+bash scripts/run_ppu.sh readiness --model dsv4-flash --mode graph --steps 4
+bash scripts/run_ppu_se.sh readiness --model dsv4.1-flash --mode graph --steps 4
+bash scripts/run_ppu_se.sh bench --model dsv4-flash --warmup 20 --iters 20 --repeats 9
+```
+
 ## Configuration
 
 | Environment variable | Default | Effect |
 | --- | --- | --- |
 | `GC_MOE_USE_LOCAL_VERSION` | `1` | Include a local revision in the wheel version; use `0` for the public version. |
+| `GC_MOE_BACKEND` | Unset | Set to `ppu` when building a wheel for a Sail PyTorch environment. |
 | `GC_MOE_WHEEL_CUDA_VERSION` | Unset | Append a user-provided CUDA label to the local wheel version. |
 | `GC_MOE_PTXAS` | `/usr/local/cuda/bin/ptxas` | Select the assembler used by the JIT. |
 | `GC_MOE_DISPATCH_SMS` | `8` for ≤8 ranks; otherwise `16` | Override the SM100 dispatch SM request for the operator's communication group; the driver determines the aligned dispatch/compute partition. |
