@@ -2,6 +2,22 @@
 #include "dispatch.cuh"
 #include "projection.cuh"
 
+#if GC_MOE_MAX_RANKS > 8
+__global__ void gc_moe_probe_peer_stores(uint8_t* const* peers, int rank) {
+    const int peer = threadIdx.x;
+    if (peer < gc_moe::MaxRanks) {
+        const unsigned value = rank + 1;
+        __stbl(reinterpret_cast<uint4*>(peers[peer]) + rank, uint4{value, value, value, value});
+        __ppu_threadfence_system_uncache();
+    }
+}
+
+extern "C" int gc_moe_probe_peers(uint8_t* const* peers, int rank, hggcStream_t stream) {
+    gc_moe_probe_peer_stores<<<1, 64, 0, stream>>>(peers, rank);
+    return hggcGetLastError();
+}
+#endif
+
 extern "C" int gc_moe_init_silu(float* table, hggcStream_t stream) {
     gc_moe::make_silu_table<<<256, 256, 0, stream>>>(table);
     return hggcGetLastError();

@@ -17,8 +17,8 @@ struct DecodeSchedule {
 inline DecodeSchedule select_schedule(Launch& p, bool side) {
     const bool routed_only = !p.shared_x;
     const int routes = p.bound * p.ranks * TopK;
-    const bool ep8_aiu = p.ranks == MaxRanks && p.aiu;
-    const bool paged_dispatch = CanPage && ep8_aiu && (routed_only || side);
+    const bool full_group_aiu = p.ranks == MaxRanks && p.aiu;
+    const bool paged_dispatch = CanPage && full_group_aiu && (routed_only || side);
     const bool fused_dispatch = paged_dispatch && p.shared_x;
     const bool large_routed = paged_dispatch && routed_only && p.bound >= 64;
     if (!p.m_tiles) {
@@ -31,7 +31,11 @@ inline DecodeSchedule select_schedule(Launch& p, bool side) {
             // With long W1 reductions, a second M16 page is more expensive
             // than padding the first page to M32.
             const int medium_threshold = large_routed && LongGate ? 9 : 12;
-            if (routes >= tall_threshold * Experts)
+            // Increase the page size before the tail of the expert load spills
+            // into a second M96 page.
+            if (CanUseM128 && routes >= 84 * Experts)
+                p.m_tiles = 8;
+            else if (routes >= tall_threshold * Experts)
                 p.m_tiles = 6;
             else if (routes >= 20 * Experts)
                 p.m_tiles = 4;
@@ -45,12 +49,12 @@ inline DecodeSchedule select_schedule(Launch& p, bool side) {
     const bool has_shared_stream = side && p.shared_x && p.tokens;
     const bool tiny_shared = fused_dispatch && p.bound > 0 && p.bound <= TileM;
     const bool overlap = has_shared_stream &&
-                         (ep8_aiu || routes <= 4 * Experts || routes >= 8 * Experts || p.m_tiles >= 3);
+                         (full_group_aiu || routes <= 4 * Experts || routes >= 8 * Experts || p.m_tiles >= 3);
     const bool sparse_queue = routes >= Experts / 4 && routes <= Experts / 2;
     const bool large_queue = (routed_only || overlap || fused_dispatch) && p.ranks == MaxRanks && p.m_tiles >= 3;
     const bool small_pages = paged_dispatch && p.m_tiles == 1 && p.bound > 0;
     const bool medium_pages = paged_dispatch && p.m_tiles == 2 && p.bound > 0;
-    const bool tall_pages = paged_dispatch && p.m_tiles == 6 && p.bound > 0;
+    const bool tall_pages = paged_dispatch && (p.m_tiles == 6 || (CanUseM128 && p.m_tiles == 8)) && p.bound > 0;
     const bool paired_scales = paged_dispatch && p.m_tiles == 4 && p.bound > 0;
     // For near-full M64 tiles with a shorter W1 reduction, the indexed
     // layout keeps the independent column-group pipelines busy.

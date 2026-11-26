@@ -53,15 +53,20 @@ def build_ppu_library(cache_dir, source, *, defines=(), headers=()):
 
 
 @functools.lru_cache(maxsize=None)
-def load(cache_dir, hidden, intermediate, experts, topk):
+def load(cache_dir, hidden, intermediate, experts, topk, ranks=8):
     source = Path(__file__).resolve().parents[2] / 'impls' / 'ppu' / 'decode.cu'
     defines = (f'-DGC_MOE_HIDDEN={hidden}', f'-DGC_MOE_INTERMEDIATE={intermediate}',
                f'-DGC_MOE_EXPERTS={experts}', f'-DGC_MOE_TOPK={topk}')
+    if ranks > 8:
+        defines += (f'-DGC_MOE_MAX_RANKS={ranks}',)
     lib = build_ppu_library(cache_dir, source, defines=defines, headers=sorted(source.parent.glob('*.cuh')))
     lib.gc_moe_decode.argtypes = [ctypes.POINTER(Launch)] + [ctypes.c_void_p] * 4
     lib.gc_moe_decode.restype = ctypes.c_int
     lib.gc_moe_init_silu.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     lib.gc_moe_init_silu.restype = ctypes.c_int
+    if ranks > 8:
+        lib.gc_moe_probe_peers.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        lib.gc_moe_probe_peers.restype = ctypes.c_int
     return lib
 
 

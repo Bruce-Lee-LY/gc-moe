@@ -7,7 +7,15 @@ import torch
 import torch.distributed as dist
 
 from ..jit_kernels.impls.ppu_fp4_fp4_gc_moe import load
-from ..layout.ppu_gc_moe import HEADER_BYTES, MAX_RANKS, MAX_TOKENS, PPUBufferLayout, check_weight_dimensions
+from ..layout.ppu_gc_moe import LOCAL_RANKS, MAX_RANKS, MAX_TOKENS, PPUBufferLayout, check_weight_dimensions
+
+
+def _check_peer_status(group, error):
+    errors = [None] * group.size()
+    dist.all_gather_object(errors, error, group=group)
+    for rank, message in enumerate(errors):
+        if message is not None:
+            raise RuntimeError(f'PPU GC MoE requires directly mapped ICN peers (rank {rank}): {message}')
 
 
 class PPUGCSymmBuffer:
@@ -45,20 +53,32 @@ class PPUGCSymmBuffer:
         self.num_shared_experts = num_shared_experts
         self._device = device = torch.device('cuda', torch.cuda.current_device())
         self._library = load(Path(cache_dir or Path.home() / '.cache/gc_moe/ppu').expanduser().resolve(),
-                             hidden, intermediate_hidden, num_experts, num_topk)
+                             hidden, intermediate_hidden, num_experts, num_topk, max(LOCAL_RANKS, ranks))
 
         self.layout = layout = PPUBufferLayout(ranks, num_experts, capacity, num_topk, hidden)
         if ranks > 1:
             import torch.distributed._symmetric_memory as symm_mem
 
             self.buffer = symm_mem.empty(layout.nbytes, dtype=torch.uint8, device=device)
-            self._handle = symm_mem.rendezvous(self.buffer, group=group)
-            peers = self._handle.buffer_ptrs
+            try:
+                self._handle = symm_mem.rendezvous(self.buffer, group=group)
+                peers = self._handle.buffer_ptrs
+                error = None
+                if ranks > LOCAL_RANKS and (len(set(peers)) != ranks or len(peers) != ranks
+                                            or any(not ptr or ptr % 16 for ptr in peers)
+                                            or peers[self.rank_idx] != self.buffer.data_ptr()):
+                    error = 'symmetric memory rendezvous did not provide all peer mappings'
+            except (RuntimeError, AttributeError) as exc:
+                if ranks <= LOCAL_RANKS:
+                    raise
+                error = str(exc)
+            if ranks > LOCAL_RANKS:
+                _check_peer_status(group, error)
         else:
             self.buffer = torch.empty(layout.nbytes, dtype=torch.uint8, device=device)
             self._handle = None
             peers = [self.buffer.data_ptr()]
-        self.buffer[:HEADER_BYTES].zero_()
+        self.buffer[:layout.header_bytes].zero_()
         for view in layout.views:
             tensor = self.buffer.narrow(0, view.offset, view.nbytes).view(view.dtype).view(view.shape)
             setattr(self, view.name, tensor)
@@ -66,12 +86,15 @@ class PPUGCSymmBuffer:
         self.topk_idx.fill_(-1)
         self.topk_weights.zero_()
         self._peers = torch.tensor(peers, dtype=torch.int64, device=device)
+        if ranks > LOCAL_RANKS:
+            self._probe_icn_peers()
 
         max_routes = layout.max_routes
         local_experts = layout.local_experts
         max_tiles = (max_routes + 15) // 16 + local_experts
         # Every expert can own a partially filled tile in addition to the live rows.
-        rows = (max_tiles + local_experts * ((self._m_tiles or 6) - 1)) * 16
+        max_page_panels = 8 if ranks > LOCAL_RANKS and hidden <= 2 * intermediate_hidden else 6
+        rows = (max_tiles + local_experts * ((self._m_tiles or max_page_panels) - 1)) * 16
         self._scratch = tuple(torch.empty(shape, device=device, dtype=dtype) for shape, dtype in (
             ((rows, hidden // 2), torch.uint8), ((rows, hidden // 32), torch.uint8),
             ((rows,), torch.int64), ((max_tiles, 3), torch.int32), ((1,), torch.int32),
@@ -90,7 +113,7 @@ class PPUGCSymmBuffer:
             self._shared_scratch[1][-1, :20].zero_()
         self._units = torch.cuda.get_device_properties(device).multi_processor_count
         self._grouped_weights = torch.empty(rows, dtype=torch.float32, device=device)
-        pull_routes = ranks == MAX_RANKS and self._aiu and local_experts <= 64
+        pull_routes = ranks >= LOCAL_RANKS and self._aiu and local_experts <= 64
         # The push dispatcher indexes larger batches to keep its per-CTA
         # route scan and dynamic shared-memory allocation bounded.
         route_index = (torch.empty((local_experts, max_routes), dtype=torch.int32, device=device)
@@ -121,6 +144,23 @@ class PPUGCSymmBuffer:
             self._se_pipeline = (side, first, last)
         stream.synchronize()
         dist.barrier(group)
+
+    def _probe_icn_peers(self):
+        stream = torch.cuda.current_stream(self._device)
+        stream.synchronize()
+        dist.barrier(self.group)
+        status = self._library.gc_moe_probe_peers(self._peers.data_ptr(), self.rank_idx, stream.cuda_stream)
+        error = f'peer store probe failed with HGGC status {status}' if status else None
+        try:
+            stream.synchronize()
+        except RuntimeError as exc:
+            error = str(exc)
+        _check_peer_status(self.group, error)
+        ranks = self.group.size()
+        written = self.buffer[:ranks * 16].view(torch.int32).view(ranks, 4).cpu()
+        values = torch.arange(1, ranks + 1, dtype=torch.int32, device='cpu')[:, None].expand_as(written)
+        _check_peer_status(self.group, None if torch.equal(written, values) else 'peer store contents differ')
+        self.buffer[:self.layout.header_bytes].zero_()
 
     def destroy(self):
         if self.buffer is None:

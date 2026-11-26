@@ -196,12 +196,12 @@ __global__ void decode_index_routes(Launch p, bool pipeline = false) {
         const uint64_t expert = id - p.rank * experts;
         if constexpr (PullIds) {
             // This path owns the local inbox metadata until dispatch completes.
-            // The low 16 bits hold a row index (at most 256 * 8 * TopK routes).
+            // Keep the row index wide enough for every source route to target one expert.
             auto* token_routes = reinterpret_cast<uint32_t*>(p.peers[p.rank] + p.inbox_ids_offset);
             uint32_t route = ~0u;
             if (expert < experts) {
                 const uint32_t row = atomicAdd(counts + expert, 1u);
-                route = (uint32_t(expert) << 16) | row;
+                route = (uint32_t(expert) << RouteIndexBits) | row;
             }
             token_routes[source] = route;
         } else if (expert < experts) {
@@ -467,8 +467,8 @@ __global__ void decode_pull_tokens(Launch p) {
         return;
     const auto* peer = p.peers[owner];
     const auto* weights = reinterpret_cast<const uint32_t*>(peer + p.weight_offset);
-    const int expert = dest_code >> 16;
-    const int index = dest_code & 0xffff;
+    const int expert = dest_code >> RouteIndexBits;
+    const int index = dest_code & RouteIndexMask;
     int dest = 0;
     if (dest_code != ~0u)
         dest = p.route_counts[expert] * tile_rows + index;
@@ -722,10 +722,16 @@ inline void launch_dispatch(const Launch& p, const DecodeSchedule& schedule, hgg
             if (index_routes)
                 decode_inputs_ready<true><<<1, Threads, 0, stream>>>(p, schedule.pipeline);
             else
-                decode_inputs_ready<false><<<1, 32, 0, stream>>>(p, schedule.pipeline);
+                decode_inputs_ready<false><<<1, MaxRanks > 32 ? 64 : 32, 0, stream>>>(p, schedule.pipeline);
         }
     }
     if (schedule.tall_pages) {
+        if constexpr (CanUseM128) {
+            if (p.m_tiles == 8) {
+                launch_direct_page_dispatch<16, 128>(p, stream);
+                return;
+            }
+        }
         launch_direct_page_dispatch<32, 96>(p, stream);
     } else if (schedule.wide_pages) {
         if (schedule.large_routed) {

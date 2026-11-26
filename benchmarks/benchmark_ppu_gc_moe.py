@@ -14,6 +14,7 @@ import torch.distributed as dist
 
 from benchmarks.ppu_shared_expert import SerialPTPCSharedExpert
 from gc_moe import ppu_fp4_fp4_gc_moe, transform_weights_for_gc_moe_ppu
+from gc_moe.layout.ppu_gc_moe import LOCAL_RANKS
 from gc_moe.ppu_gc import MAX_TOKENS
 from tests.test_ppu_gc_moe import (
     DEFAULT_TOKENS, MODEL_PRESETS,
@@ -26,27 +27,40 @@ def measure(step, args, group):
         step()
     torch.cuda.synchronize()
     dist.barrier(group)
+    graph_events = args.mode == 'graph' and group.size() > LOCAL_RANKS
+    event_options = {'enable_timing': True}
+    if graph_events:
+        event_options['external'] = True
+    start, stop = (torch.cuda.Event(**event_options) for _ in range(2))
     graph = None
     if args.mode == 'graph':
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
+            if graph_events:
+                # A decode inside the graph rendezvous keeps host launch skew out of device timing.
+                step()
+                start.record()
             for _ in range(args.iters):
                 step()
+            if graph_events:
+                stop.record()
         graph.replay()
         torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    stop = torch.cuda.Event(enable_timing=True)
     samples = []
     for _ in range(args.repeats):
         dist.barrier(group)
-        start.record()
+        if not graph_events:
+            start.record()
         if graph is None:
             for _ in range(args.iters):
                 step()
         else:
             graph.replay()
-        stop.record()
-        stop.synchronize()
+        if graph_events:
+            torch.cuda.synchronize()
+        else:
+            stop.record()
+            stop.synchronize()
         samples.append(1000 * start.elapsed_time(stop) / args.iters)
     slowest = torch.tensor(samples, dtype=torch.float64, device='cpu')
     dist.all_reduce(slowest, op=dist.ReduceOp.MAX, group=group)
@@ -119,6 +133,8 @@ def run(args, group, *, shared):
         }
         if baseline_shared is not None:
             report['baseline_shared_swiglu'] = 'native_ptpc'
+        if args.mode == 'graph' and ranks > LOCAL_RANKS:
+            report['timing'] = 'graph_events_after_decode_rendezvous'
         if baseline is not None and candidate is not None:
             base_mean = mean(row[baseline_name]['median_us'] for row in rows)
             gc_mean = mean(row['gc_moe']['median_us'] for row in rows)

@@ -297,7 +297,7 @@ __device__ __forceinline__ void run_routed_tile(const Launch& p, int tile, int c
                                                 int* next_job = nullptr, int total = 0, bool seeded = false,
                                                 int* next_down_tile = nullptr, bool swap_slots = false) {
     constexpr bool Narrow = NarrowMode & (First ? 1 : 2);
-    if constexpr ((Rows == 96 && Narrow) || (Rows == 64 && (Narrow || (First && SplitColumns)))) {
+    if constexpr ((Rows >= 96 && Narrow) || (Rows == 64 && (Narrow || (First && SplitColumns)))) {
         const int rows = p.tiles[tile].rows;
         if (rows <= 32) {
             run_routed_tile_compute<First, Rows, NTile, Chunk, First ? W1NarrowStages : StageCount,
@@ -306,11 +306,19 @@ __device__ __forceinline__ void run_routed_tile(const Launch& p, int tile, int c
                 p, tile, column, memory);
             return;
         }
-        if constexpr (Rows == 96) {
+        if constexpr (Rows >= 96) {
             if (rows <= 64) {
                 run_routed_tile_compute<First, Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
                                         RowPanels, ClampInTable, PageLayout, SplitColumns, RtWeights,
                                         64, StageReady, PacketWidth, CycleCount>(p, tile, column, memory);
+                return;
+            }
+        }
+        if constexpr (Rows == 128) {
+            if (rows <= 96) {
+                run_routed_tile_compute<First, Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
+                                        RowPanels, ClampInTable, PageLayout, SplitColumns, RtWeights,
+                                        96, StageReady, PacketWidth, CycleCount>(p, tile, column, memory);
                 return;
             }
         }
@@ -724,6 +732,13 @@ inline void launch_routed(const Launch& p, const DecodeSchedule& schedule, hggcS
                                        false, 4, 64>(p, stream, schedule.clamp_in_table);
             }
         } else if (schedule.tall_pages) {
+            if constexpr (CanUseM128) {
+                if (p.m_tiles == 8) {
+                    launch_routed_pipeline<128, 256, 64, 3, true, true, 4, true, false,
+                                           3, 64, 3, false, 3, 2>(p, stream, schedule.clamp_in_table, 8);
+                    return;
+                }
+            }
             launch_routed_pipeline<96, 256, 64, 3, true, true, 3, true, false,
                                    3, 64, 3, false, 3, 2>(p, stream, schedule.clamp_in_table);
         } else if (schedule.wide_pages) {

@@ -19,8 +19,15 @@ case "$stage" in
 esac
 
 cd "$(dirname "$0")/.."
-export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-lo}
 export DEEPEP_DISABLE_NETWORK=1
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
+if [[ ${GC_MOE_NUM_NODES:-1} == 1 ]]; then
+    export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-lo}
+    rendezvous=(--standalone)
+else
+    rendezvous=(--nnodes="$GC_MOE_NUM_NODES" --node-rank="${GC_MOE_NODE_RANK:?set the PPU node rank}"
+                --master-addr="${MASTER_ADDR:?set the PPU rendezvous address}"
+                --master-port="${MASTER_PORT:-29500}")
+fi
 exec "${GC_MOE_PYTHON_BIN:-python}" -m torch.distributed.run \
-    --standalone --nproc-per-node="${GC_MOE_NUM_PPUS:-8}" "$entry" "$@"
+    "${rendezvous[@]}" --nproc-per-node="${GC_MOE_NUM_PPUS:-8}" "$entry" "$@"

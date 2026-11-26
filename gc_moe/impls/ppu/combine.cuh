@@ -12,7 +12,13 @@ __global__ void decode_rank_barrier(Launch p) {
     auto& local = header(p, p.rank);
     const int peer = threadIdx.x;
     const auto epoch = __ldbl(local.published + p.rank);
-    if (peer < p.ranks) {
+    if constexpr (MaxRanks > 32) {
+        for (int i = peer; i < p.ranks; i += 32)
+            publish_return_epoch<ReleaseSignal>(header(p, i).outputs_ready + p.rank, epoch);
+        __syncwarp();
+        for (int i = peer; i < p.ranks; i += 32)
+            while (acquire(local.outputs_ready + i) != epoch) {}
+    } else if (peer < p.ranks) {
         publish_return_epoch<ReleaseSignal>(header(p, peer).outputs_ready + p.rank, epoch);
         while (acquire(local.outputs_ready + peer) != epoch) {}
     }
@@ -31,8 +37,13 @@ __device__ __forceinline__ void announce_returns(const Launch& p, uint32_t epoch
     int elected = 0;
     if (lane == 0 && __ldbl(&local.return_announced) != epoch)
         elected = atomicExch(&local.return_announced, epoch) != epoch;
-    if (__shfl_sync(0xffffffff, elected, 0) && lane < p.ranks)
+    if constexpr (MaxRanks > 32) {
+        if (__shfl_sync(0xffffffff, elected, 0))
+            for (int peer = lane; peer < p.ranks; peer += 32)
+                publish_return_epoch<ReleaseSignal>(header(p, peer).outputs_ready + p.rank, epoch);
+    } else if (__shfl_sync(0xffffffff, elected, 0) && lane < p.ranks) {
         publish_return_epoch<ReleaseSignal>(header(p, lane).outputs_ready + p.rank, epoch);
+    }
 }
 
 template <int BlockThreads, bool WaitForReturns = false, bool DenseReturns = false,
@@ -56,7 +67,11 @@ __global__ void decode_combine(Launch p) {
     uint32_t epoch = 0;
     auto wait_for_returns = [&] {
         // All peers must finish reading this dispatch epoch before reuse.
-        if (lane < p.ranks && (!BlockWait || threadIdx.x < 32)) {
+        if constexpr (MaxRanks > 32) {
+            if (!BlockWait || threadIdx.x < 32)
+                for (int peer = lane; peer < p.ranks; peer += 32)
+                    while (acquire(header(p, p.rank).outputs_ready + peer) != epoch) {}
+        } else if (lane < p.ranks && (!BlockWait || threadIdx.x < 32)) {
             while (acquire(header(p, p.rank).outputs_ready + lane) != epoch) {}
         }
         if constexpr (BlockWait)

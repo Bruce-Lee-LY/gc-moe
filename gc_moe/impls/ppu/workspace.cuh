@@ -5,7 +5,13 @@
 namespace gc_moe {
 
 constexpr int H = GC_MOE_HIDDEN, I = GC_MOE_INTERMEDIATE;
-constexpr int Experts = GC_MOE_EXPERTS, TopK = GC_MOE_TOPK, MaxRanks = 8;
+#ifndef GC_MOE_MAX_RANKS
+#define GC_MOE_MAX_RANKS 8
+#endif
+constexpr int Experts = GC_MOE_EXPERTS, TopK = GC_MOE_TOPK, MaxRanks = GC_MOE_MAX_RANKS;
+constexpr int RouteIndexBits = MaxRanks <= 8 ? 16 : 24;
+constexpr uint32_t RouteIndexMask = (1u << RouteIndexBits) - 1;
+static_assert(256 * MaxRanks * TopK <= RouteIndexMask + 1);
 using ReturnRow = uint64_t;
 // A per-rank return area at maximum capacity needs fewer than 24 bits
 // to index its BF16 vectors.
@@ -29,6 +35,7 @@ constexpr int FullDownChunk = I % 256 == 0 ? 128 : 64;
 constexpr int GateStages = H / 128 % 5 == 0 ? 5 : 4;
 constexpr bool LongGate = H / 128 > 32;
 constexpr bool BalancedProjections = H <= 2 * I;
+constexpr bool CanUseM128 = MaxRanks > 8 && BalancedProjections;
 constexpr bool ShortDown = I / 128 <= 20;
 
 struct Tile {
@@ -82,7 +89,7 @@ struct Header {
     uint32_t indexed_slots[MaxRanks];
     uint32_t published_stripes[MaxRanks];
 };
-static_assert(sizeof(Header) <= 256);
+static_assert(sizeof(Header) == (5 * MaxRanks + 6) * sizeof(uint32_t));
 
 struct alignas(256) InboxRow {
     uint4 x[H / 32];

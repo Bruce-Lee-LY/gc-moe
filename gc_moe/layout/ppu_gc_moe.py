@@ -9,7 +9,7 @@ import torch
 from .gc_moe import align
 
 
-MAX_RANKS, MAX_TOKENS = 8, 256
+LOCAL_RANKS, MAX_RANKS, MAX_TOKENS = 8, 64, 256
 WEIGHT_PACKET_BYTES, SCALE_PACKET_BYTES = 8192, 512
 HEADER_BYTES = 256
 
@@ -52,6 +52,10 @@ class PPUBufferLayout:
     def max_routes(self) -> int:
         return self.capacity * self.ranks * self.topk
 
+    @property
+    def header_bytes(self) -> int:
+        return align((5 * max(LOCAL_RANKS, self.ranks) + 6) * 4, HEADER_BYTES)
+
     @cached_property
     def views(self) -> tuple[BufferView, ...]:
         ranks, capacity, topk, hidden = self.ranks, self.capacity, self.topk, self.hidden
@@ -65,7 +69,7 @@ class PPUBufferLayout:
             ('_inbox', (ranks, capacity, inbox_row_bytes), torch.uint8, 1),
             ('_inbox_ids', (ranks, capacity, topk), torch.int32, 4),
         )
-        offset = HEADER_BYTES
+        offset = self.header_bytes
         views = []
         for name, shape, dtype, itemsize in specs:
             offset = align(offset, HEADER_BYTES)
