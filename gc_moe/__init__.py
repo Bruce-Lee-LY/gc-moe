@@ -37,6 +37,7 @@ _BACKENDS = {
         'get_symm_buffer_for_gc_moe_ppu',
         'transform_weights_for_gc_moe_ppu',
         'ppu_fp4_fp4_gc_moe',
+        'ppu_fp8_fp4_gc_moe',
     ),
 }
 _EXPORTS = {name: backend for backend, names in _BACKENDS.items() for name in names}

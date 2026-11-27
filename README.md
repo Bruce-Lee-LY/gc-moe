@@ -13,9 +13,21 @@ and weights in GC MoE K3.
 GPU kernels are JIT compiled on first use. Installation builds a Python wheel;
 it does not compile CUDA kernels.
 
-The Sail backend implements MXFP4 routed decode and optional fused E4M3 PTPC
-shared experts on ZW-M890P. It selects tiles using the expert geometry and the
-common token bound. See the [PPU API and setup](docs/ppu_gc_moe.md).
+The Sail backend implements W4A4 and W4A8 routed decode on ZW-M890P, with optional
+fused W8A8 PTPC shared experts. It selects tiles using the expert geometry and the
+common token bound. Select the workspace with `routed_precision="fp4_fp4"` or
+`routed_precision="fp8_fp4"`. Pack MXFP4 routed weights once with
+`transform_weights_for_gc_moe_ppu(..., routed_precision=workspace.routed_precision)`.
+The packer selects the Tensor Cell packet layout for the decode mode. For W8A8
+PTPC shared experts, pass E4M3 weights and FP32 per-channel scales to the same
+packer without `routed_precision`.
+
+| PPU routed precision | Decode |
+| --- | --- |
+| W4A4 | `ppu_fp4_fp4_gc_moe` |
+| W4A8 | `ppu_fp8_fp4_gc_moe` |
+
+See the [W4A8 PPU API example](docs/zw-m890p_w4a8_gc_moe.md).
 
 ## Operator overview
 
@@ -165,23 +177,28 @@ GLM5.2 and DSV4.1-Flash on eight NVIDIA RTX PRO 5000 72GB Blackwell GPUs.
 
 #### ZW-M890P
 
-DSV4-Flash and DSV4.1-Flash on eight ZW-M890P PPUs.
+DSV4-Flash and DSV4.1-Flash on ZW-M890P PPUs. The linked reports cover EP8 and EP16.
 
-##### Routed experts (non-SE)
+##### W4A4 routed experts
 
-![DSV4-Flash non-SE latency and speedup over MegaMoE on eight ZW-M890P PPUs](docs/zw-m890p_dsv4_flash_gc_moe.png)
+![DSV4-Flash W4A4 routed latency and speedup over MegaMoE at EP8](docs/zw-m890p_dsv4_flash_w4a4_gc_moe_ep8.png)
 
-![DSV4.1-Flash non-SE latency and speedup over MegaMoE on eight ZW-M890P PPUs](docs/zw-m890p_dsv41_flash_gc_moe.png)
+![DSV4.1-Flash W4A4 routed latency and speedup over MegaMoE at EP8](docs/zw-m890p_dsv41_flash_w4a4_gc_moe_ep8.png)
 
-[Full ZW-M890P non-SE accuracy and performance data](docs/zw-m890p_gc_moe.md).
+[W4A4 routed accuracy and performance](docs/zw-m890p_w4a4_gc_moe.md).
 
-##### Fused shared experts (SE)
+##### W4A4 routed with fused W8A8 PTPC shared experts
 
-![DSV4-Flash fused SE latency and speedup over MegaMoE with serial PTPC SE on eight ZW-M890P PPUs](docs/zw-m890p_dsv4_flash_gc_moe_se.png)
+![DSV4-Flash W4A4 with fused W8A8 PTPC SE latency and speedup at EP8](docs/zw-m890p_dsv4_flash_w4a4_gc_moe_se_ep8.png)
 
-![DSV4.1-Flash fused SE latency and speedup over MegaMoE with serial PTPC SE on eight ZW-M890P PPUs](docs/zw-m890p_dsv41_flash_gc_moe_se.png)
+![DSV4.1-Flash W4A4 with fused W8A8 PTPC SE latency and speedup at EP8](docs/zw-m890p_dsv41_flash_w4a4_gc_moe_se_ep8.png)
 
-[Full ZW-M890P SE accuracy and performance data](docs/zw-m890p_gc_moe_se.md).
+[W4A4 fused SE accuracy and performance](docs/zw-m890p_w4a4_gc_moe_se.md).
+
+##### W4A8 routed decode
+
+[W4A8 routed experts](docs/zw-m890p_w4a8_gc_moe.md) and
+[W4A8 with fused W8A8 PTPC shared experts](docs/zw-m890p_w4a8_gc_moe_se.md).
 
 ## Quick start
 
@@ -491,13 +508,16 @@ bash scripts/run_sm120_se.sh 8 both
 ```
 
 Use the Sail SDK 2.2.0 environment for the PPU runners. Both runners accept
-`--model dsv4-flash` and `--model dsv4.1-flash`. See the [PPU setup](docs/ppu_gc_moe.md).
+`--model dsv4-flash` and `--model dsv4.1-flash`. Pass `--w4a4` (the default)
+or `--w4a8` before the test or benchmark arguments to select routed precision.
+See the [W4A8 PPU setup](docs/zw-m890p_w4a8_gc_moe.md).
 
 ```bash
-bash scripts/run_ppu.sh test --model dsv4-flash --mask --asymmetric
-bash scripts/run_ppu.sh readiness --model dsv4-flash --mode graph --steps 4
-bash scripts/run_ppu_se.sh readiness --model dsv4.1-flash --mode graph --steps 4
-bash scripts/run_ppu_se.sh bench --model dsv4-flash --warmup 20 --iters 20 --repeats 9
+bash scripts/run_ppu.sh test --w4a4 --model dsv4-flash --mask --asymmetric
+bash scripts/run_ppu.sh readiness --w4a4 --model dsv4-flash --mode graph --steps 4
+bash scripts/run_ppu_se.sh readiness --w4a4 --model dsv4.1-flash --mode graph --steps 4
+bash scripts/run_ppu_se.sh bench --w4a4 --model dsv4-flash --warmup 20 --iters 100 --repeats 13
+bash scripts/run_ppu_se.sh bench --w4a8 --model dsv4.1-flash --warmup 20 --iters 100 --repeats 13
 ```
 
 ## Configuration

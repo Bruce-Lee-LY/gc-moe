@@ -12,7 +12,8 @@ struct Accumulator {
     float v[8]{};
 };
 
-template <bool FP4> constexpr int PackedWeightWords = 128 + 8 * FP4;
+template <bool FP4, bool FP8_FP4 = false>
+constexpr int PackedWeightWords = FP8_FP4 ? 68 : 128 + 8 * FP4;
 
 template <int Rows, bool Rt = false, int Width = 128>
 __device__ __forceinline__ void copy_linear_tile(void* dst, const void* src) {
@@ -32,7 +33,7 @@ __device__ __forceinline__ void copy_linear_tile(void* dst, const void* src) {
 
 // The two instructions consume the same four packed words per lane. Each
 // nibble in the MXFP4 operand corresponds to one byte in the E4M3 operand.
-template <bool FP4>
+template <bool FP4, bool FP8_FP4 = false>
 __device__ __forceinline__ void mma(Accumulator& acc, uint4 a, uint4 b,
                                     uint32_t a_scale = 0, uint32_t b_scale = 0) {
     auto& c = acc.v;
@@ -46,13 +47,19 @@ __device__ __forceinline__ void mma(Accumulator& acc, uint4 a, uint4 b,
               "r"(b.x), "r"(b.y), "r"(b.z), "r"(b.w),
               "r"(a_scale), "r"(b_scale), "r"(0u));
     } else {
-        asm("ppu.tc02.mma.sync.aligned.m16n16k32.row.col.f32.e4m3.e4m3.f32 "
-            "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9,%10,%11}, {%12,%13,%14,%15}, "
-            "{%0,%1,%2,%3,%4,%5,%6,%7};"
-            : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]),
-              "+r"(c[4]), "+r"(c[5]), "+r"(c[6]), "+r"(c[7])
-            : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w),
-              "r"(b.x), "r"(b.y), "r"(b.z), "r"(b.w));
+        #define GC_MOE_FP8_MMA(format) \
+        asm("ppu.tc02.mma.sync.aligned.m16n16k32.row.col.f32.e4m3." format ".f32 " \
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9,%10,%11}, {%12,%13,%14,%15}, " \
+            "{%0,%1,%2,%3,%4,%5,%6,%7};" \
+            : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]), \
+              "+r"(c[4]), "+r"(c[5]), "+r"(c[6]), "+r"(c[7]) \
+            : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), \
+              "r"(b.x), "r"(b.y), "r"(b.z), "r"(b.w))
+        if constexpr (FP8_FP4)
+            GC_MOE_FP8_MMA("e5m2");
+        else
+            GC_MOE_FP8_MMA("e4m3");
+        #undef GC_MOE_FP8_MMA
     }
 }
 

@@ -3,19 +3,25 @@ set -euo pipefail
 
 stage=${1:-}
 if [[ "$stage" != test && "$stage" != readiness && "$stage" != bench ]]; then
-    echo 'Usage: bash scripts/run_ppu.sh {test|readiness|bench} [--shared] [ARGS...]' >&2
+    echo 'Usage: bash scripts/run_ppu.sh {test|readiness|bench} [--shared] [--w4a4|--w4a8] [ARGS...]' >&2
     exit 2
 fi
 shift
 suffix=
-if [[ "${1:-}" == --shared ]]; then
-    suffix=_se
+precision=_w4a4
+while true; do
+    case "${1:-}" in
+        --shared) suffix=_se ;;
+        --w4a4) precision=_w4a4 ;;
+        --w4a8) precision=_w4a8 ;;
+        *) break ;;
+    esac
     shift
-fi
+done
 case "$stage" in
-    test) entry=tests/test_ppu_gc_moe${suffix}.py ;;
-    readiness) entry=tests/test_ppu_gc_moe${suffix}_readiness.py ;;
-    bench) entry=benchmarks/benchmark_ppu_gc_moe${suffix}.py ;;
+    test) entry=tests/test_ppu${precision}_gc_moe${suffix}.py ;;
+    readiness) entry=tests/test_ppu${precision}_gc_moe${suffix}_readiness.py ;;
+    bench) entry=benchmarks/benchmark_ppu${precision}_gc_moe${suffix}.py ;;
 esac
 
 cd "$(dirname "$0")/.."

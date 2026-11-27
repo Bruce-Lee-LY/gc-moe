@@ -113,11 +113,18 @@ __global__ void decode_combine(Launch p) {
             return;
     }
     float routed[Values]{};
-    auto add_route = [&](uint4 v) {
+    const auto* weights = reinterpret_cast<const float*>(peer + p.weight_offset);
+    auto add_route = [&](uint4 v, int slot) {
+        const float weight = RoutedFP8_FP4 ? weights[first_route + slot] : 1.f;
         const uint32_t pairs[] = {v.x, v.y, v.z, v.w};
         #pragma unroll
-        for (int i = 0; i < Values; ++i)
-            routed[i] += unpack_bf16(pairs[i / 2], i % 2);
+        for (int i = 0; i < Values; ++i) {
+            const float value = unpack_bf16(pairs[i / 2], i % 2);
+            if constexpr (RoutedFP8_FP4)
+                routed[i] = __fadd_rn(routed[i], __fmul_rn(value, weight));
+            else
+                routed[i] += value;
+        }
     };
     const bool dense = DenseReturns && valid == (1u << TopK) - 1;
     if (dense) {
@@ -128,12 +135,12 @@ __global__ void decode_combine(Launch p) {
             payloads[slot] = __ldbl(returns + slot * (H / Values));
         #pragma unroll
         for (int slot = 0; slot < TopK; ++slot)
-            add_route(payloads[slot]);
+            add_route(payloads[slot], slot);
     } else {
         #pragma unroll
         for (int slot = 0; slot < TopK; ++slot) {
             if (valid & (1u << slot))
-                add_route(__ldbl(returns + slot * (H / Values)));
+                add_route(__ldbl(returns + slot * (H / Values)), slot);
         }
     }
     if constexpr (!ReadSharedEarly)

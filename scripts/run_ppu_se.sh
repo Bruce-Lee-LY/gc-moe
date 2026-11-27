@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -eq 0 ]]; then
-    echo 'Usage: bash scripts/run_ppu_se.sh {test|readiness|bench} [ARGS...]' >&2
+    echo 'Usage: bash scripts/run_ppu_se.sh {test|readiness|bench} [--w4a4|--w4a8] [ARGS...]' >&2
     exit 2
 fi
 

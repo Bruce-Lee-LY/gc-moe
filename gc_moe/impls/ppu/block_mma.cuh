@@ -45,22 +45,28 @@ __device__ __forceinline__ uint4 matrix_fragment(const uint8_t* src) {
 
 template <int M, int N, int KBytes, bool FP4 = true, int ChunkBytes = (M == 16 ? 128 : 64),
           int StageCount = 3, bool PairedScales = false, int RowPanels = 1, bool CycleStages = false, bool MaskScales = false,
-          bool SplitColumns = false, int ScaleStrideRows = M, int PacketWidth = 0>
+          bool SplitColumns = false, int ScaleStrideRows = M, int PacketWidth = 0, bool FP8_FP4 = false, int WarpN = 64, bool Gate = false, int AStride = KBytes>
 struct BlockProject {
     static constexpr int MPanels = RowPanels;
-    static constexpr int NWarps = N / 64;
+    static constexpr int NWarps = N / WarpN;
+    // A packed weight group always covers 64 output columns. Large M
+    // tiles can assign its two halves to separate compute warps.
+    static constexpr int WeightWarps = N / 64;
+    static constexpr int WeightPanels = 4;
+    static_assert(WarpN == 64 || (FP8_FP4 && WarpN == 32));
     static constexpr int MWarps = M / (16 * RowPanels);
     static constexpr int Threads = NWarps * MWarps * 32;
     static constexpr int NPanels = N / (16 * NWarps);
     static constexpr int Stages = StageCount <= KBytes / ChunkBytes + 1 ? StageCount : KBytes / ChunkBytes + 1;
     static constexpr int Chunk = ChunkBytes;
     static constexpr int Slices = Chunk / 32;
-    static constexpr int BWords = NPanels * 32;
-    static constexpr int ScaleWords = 8;
+    static_assert(!FP8_FP4 || (!FP4 && Chunk >= 64));
+    static constexpr int BWords = WeightPanels * (FP8_FP4 ? 16 : 32);
+    static constexpr int ScaleWords = FP8_FP4 ? 4 : 8;
 
     struct alignas(128) Stage {
         uint8_t a[M * Chunk];
-        uint4 packets[NWarps * Slices * PackedWeightWords<FP4>];
+        uint4 packets[WeightWarps * Slices * PackedWeightWords<FP4, FP8_FP4>];
         uint16_t sa[Slices * M];
     };
 
@@ -70,7 +76,7 @@ struct BlockProject {
 
     struct alignas(128) GroupStage {
         uint8_t a[M * Chunk];
-        uint4 packets[2 * Slices * PackedWeightWords<FP4>];
+        uint4 packets[2 * Slices * PackedWeightWords<FP4, FP8_FP4>];
         uint16_t sa[Slices * M];
     };
 
@@ -80,11 +86,49 @@ struct BlockProject {
 
     static constexpr int ScratchBytes = SplitColumns ? sizeof(GroupStorage) : sizeof(Stage) * Stages;
 
+    // Rebasing keeps all nonzero E2M1 values exactly representable in E5M2.
+    __device__ __forceinline__ static uint2 e5m2_magnitudes(uint32_t bias) {
+        return {(0x0a080400u + bias) & 0xffffff00u, 0x12100e0cu + bias};
+    }
+
+    __device__ __forceinline__ static uint2 expand_e5m2_pair(uint32_t codes, uint2 magnitudes) {
+        constexpr uint32_t Sign = 0x80808080u;
+        const uint32_t lo = __byte_perm(magnitudes.x, magnitudes.y, codes & 0x7777u);
+        const uint32_t hi = __byte_perm(magnitudes.x, magnitudes.y, (codes >> 16) & 0x7777u);
+        return {lo | (codes & Sign), hi | ((codes << 4) & Sign)};
+    }
+
+    template <bool UseLut = false>
+    __device__ __forceinline__ static uint4 load_weight(const uint4* packet, int step, int panel,
+                                                       int lane, uint2 scales, const uint2* lut = nullptr) {
+        const auto* fragment = packet + step * BWords;
+        if constexpr (FP8_FP4) {
+            const uint2 packed = reinterpret_cast<const uint2*>(fragment)[panel * 32 + lane];
+            uint2 lo, hi;
+            if constexpr (UseLut) {
+                const uint32_t pair = panel < 2 ? scales.x : scales.y;
+                const int shift = 16 * (panel % 2);
+                lo = lut[(pair >> (shift + 2)) & 31u];
+                hi = lut[(pair >> (shift + 10)) & 31u];
+            } else {
+                const int selector = panel * 0x2222;
+                lo = e5m2_magnitudes(__byte_perm(scales.x, scales.y, selector));
+                hi = e5m2_magnitudes(__byte_perm(scales.x, scales.y, selector + 0x1111));
+            }
+            // Each word holds both K halves for one output column.
+            const auto lower_column = expand_e5m2_pair(packed.x, lo);
+            const auto upper_column = expand_e5m2_pair(packed.y, hi);
+            return {lower_column.x, lower_column.y, upper_column.x, upper_column.y};
+        } else {
+            return fragment[panel * 32 + lane];
+        }
+    }
+
     // Each column group has a separate activation and weight pipeline.
     __device__ __forceinline__ static Result run_warp_groups(const uint8_t* a, const uint16_t* sa, const uint4* b,
                                                 int rows, GroupStorage& storage) {
         static_assert(M % (16 * RowPanels) == 0);
-        static_assert(NPanels == 4 && KBytes % Chunk == 0);
+        static_assert((NPanels == 4 || (FP8_FP4 && NPanels == 2)) && KBytes % Chunk == 0);
         constexpr int KGroups = KBytes / Chunk;
         const int warp = threadIdx.x / 32;
         const int warp_m = warp % MWarps;
@@ -105,14 +149,14 @@ struct BlockProject {
         }
         auto issue = [&](int k, GroupStage& stage) {
             if (group_warp == 0 && lane == 0) {
-                copy_swizzled_rows<M, Chunk>(stage.a, a + k * Chunk, rows, KBytes);
+                copy_swizzled_rows<M, Chunk>(stage.a, a + k * Chunk, rows, AStride);
                 if constexpr (FP4) {
                     const int scale_rows = PairedScales ? (rows + 15) / 16 * 16 : rows;
                     copy_a_scales<M, Slices, ScaleStrideRows>(stage.sa, sa + k * Slices * ScaleStrideRows, scale_rows);
                 }
             }
             if (group_warp == 1 && lane == 0) {
-                constexpr int packet_words = 2 * Slices * PackedWeightWords<FP4>;
+                constexpr int packet_words = 2 * Slices * PackedWeightWords<FP4, FP8_FP4>;
                 // Use the .rt request policy for streamed routed weight packets.
                 constexpr int width = M == 32 && ScaleStrideRows == 32 ? 64 : 128;
                 copy_linear_tile<packet_words * sizeof(uint4) / width, true, width>(
@@ -147,19 +191,23 @@ struct BlockProject {
                         }
                     }
                 }
-                const auto* packet = stage.packets + (slice / 2) * 4 * PackedWeightWords<FP4>;
+                const auto* packet = stage.packets + (slice / 2) * 4 * PackedWeightWords<FP4, FP8_FP4>;
                 const int weight_step = (warp_n % 2) * 2 + slice % 2;
-                const auto* frag = packet + weight_step * BWords;
                 uint4 scales{};
-                if constexpr (FP4)
+                uint2 routed_scales{};
+                if constexpr (FP8_FP4) {
+                    const auto* bases = packet + 4 * BWords + weight_step * ScaleWords;
+                    routed_scales = reinterpret_cast<const uint2*>(bases)[lane / 4];
+                } else if constexpr (FP4) {
                     scales = packet[4 * BWords + weight_step * ScaleWords + lane / 4];
+                }
                 const uint32_t bsf[] = {scales.x, scales.y, scales.z, scales.w};
                 #pragma unroll
                 for (int n = 0; n < NPanels; ++n) {
-                    const uint4 bv = frag[n * 32 + lane];
+                    const uint4 bv = load_weight(packet, weight_step, n, lane, routed_scales);
                     #pragma unroll
                     for (int m = 0; m < RowPanels; ++m)
-                        mma<FP4>(result.block[m][n], av[m], bv, asf[m], bsf[n]);
+                        mma<FP4, FP8_FP4>(result.block[m][n], av[m], bv, asf[m], bsf[n]);
                 }
             }
         };
@@ -217,9 +265,10 @@ struct BlockProject {
               typename FollowingTile = std::nullptr_t>
     __device__ __forceinline__ static Result run(const uint8_t* a, const uint16_t* sa, const uint4* b,
                                                 int rows, Stage* stages, const uint32_t* ready_columns = nullptr,
-                                                bool seeded = false, FollowingTile next_tile = nullptr) {
+                                                bool seeded = false, FollowingTile next_tile = nullptr,
+                                                const uint2* weight_magnitudes = nullptr) {
         static_assert(M % (16 * RowPanels) == 0);
-        static_assert(NPanels == 4 && KBytes % Chunk == 0);
+        static_assert((NPanels == 4 || (FP8_FP4 && NPanels == 2)) && KBytes % Chunk == 0);
         constexpr int KGroups = KBytes / Chunk;
         static_assert(!TilePrefetch || (!StageReady && CycleStages && (KGroups % Stages == 0 || Stages == 2)));
         static_assert(StageOffset < Stages);
@@ -250,15 +299,15 @@ struct BlockProject {
                                      : "=r"(observed) : "l"(ready_columns) : "memory");
                     }
                 }
-                copy_swizzled_rows<M, Chunk>(stage.a, input.activation + k * Chunk, input.rows, KBytes);
+                copy_swizzled_rows<M, Chunk>(stage.a, input.activation + k * Chunk, input.rows, AStride);
                 if constexpr (FP4) {
                     const int scale_rows = PairedScales ? (input.rows + 15) / 16 * 16 : input.rows;
                     copy_a_scales<M, Slices, ScaleStrideRows>(stage.sa, input.scales + k * Slices * ScaleStrideRows, scale_rows);
                 }
             }
-            if (warp > 0 && warp <= NWarps / 2 && lane == 0) {
+            if (warp > 0 && warp <= WeightWarps / 2 && lane == 0) {
                 const int pair = warp - 1;
-                constexpr int packet_words = 2 * Slices * PackedWeightWords<FP4>;
+                constexpr int packet_words = 2 * Slices * PackedWeightWords<FP4, FP8_FP4>;
                 constexpr int width = PacketWidth ? PacketWidth : (M == 32 && RtWeights ? 64 : 128);
                 copy_linear_tile<packet_words * sizeof(uint4) / width, RtWeights, width>(
                     stage.packets + pair * packet_words, input.weights + (pair * KGroups + k) * packet_words);
@@ -294,19 +343,31 @@ struct BlockProject {
                         }
                     }
                 }
-                const auto* packet = stage.packets + ((warp_n / 2) * Slices / 2 + slice / 2) * 4 * PackedWeightWords<FP4>;
-                const int weight_step = (warp_n % 2) * 2 + slice % 2;
-                const auto* frag = packet + weight_step * BWords;
+                const int weight_warp = warp_n / (64 / WarpN);
+                const auto* packet = stage.packets + ((weight_warp / 2) * Slices / 2 + slice / 2) *
+                                     4 * PackedWeightWords<FP4, FP8_FP4>;
+                const int weight_step = (weight_warp % 2) * 2 + slice % 2;
                 uint4 scales{};
-                if constexpr (FP4)
+                uint2 routed_scales{};
+                if constexpr (FP8_FP4) {
+                    const auto* bases = packet + 4 * BWords + weight_step * ScaleWords;
+                    routed_scales = reinterpret_cast<const uint2*>(bases)[lane / 4];
+                } else if constexpr (FP4) {
                     scales = packet[4 * BWords + weight_step * ScaleWords + lane / 4];
+                }
                 const uint32_t bsf[] = {scales.x, scales.y, scales.z, scales.w};
                 #pragma unroll
                 for (int n = 0; n < NPanels; ++n) {
-                    const uint4 bv = frag[n * 32 + lane];
+                    int panel = n;
+                    if constexpr (WarpN == 32)
+                        panel = Gate ? warp_n % 2 + 2 * n : 2 * (warp_n % 2) + n;
+                    // The narrower N32 warps already reuse each decoded fragment
+                    // across more row panels, so retain arithmetic expansion there.
+                    const uint4 bv = load_weight<FP8_FP4 && WarpN == 64>(
+                        packet, weight_step, panel, lane, routed_scales, weight_magnitudes);
                     #pragma unroll
                     for (int m = 0; m < RowPanels; ++m)
-                        mma<FP4>(result.block[m][n], av[m], bv, asf[m], bsf[n]);
+                        mma<FP4, FP8_FP4>(result.block[m][n], av[m], bv, asf[m], bsf[n]);
                 }
             }
         };

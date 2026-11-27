@@ -64,7 +64,7 @@ __global__ void decode_publish(Launch p, bool pipeline) {
     const int lane = threadIdx.x % 32;
     const auto* local = p.peers[p.rank];
     const auto* src_x = reinterpret_cast<const uint4*>(local + p.x_offset);
-    const auto* src_sf = reinterpret_cast<const uint4*>(local + p.sf_offset);
+    const auto* src_sf = local + p.sf_offset;
     const auto* src_ids = reinterpret_cast<const int64_t*>(local + p.id_offset);
     const auto* src_weights = reinterpret_cast<const float*>(local + p.weight_offset);
     auto* target = p.peers[peer];
@@ -93,13 +93,20 @@ __global__ void decode_publish(Launch p, bool pipeline) {
                 const int expert = int(id) - peer * 32;
                 atomicOr(masks + expert * BitmapWords + bit / 32, 1u << (bit % 32));
             }
-            __stbl(reinterpret_cast<uint32_t*>(&inbox[token].weights[lane]), __float_as_uint(src_weights[slot]));
+            if constexpr (!RoutedFP8_FP4)
+                __stbl(reinterpret_cast<uint32_t*>(&inbox[token].weights[lane]), __float_as_uint(src_weights[slot]));
         }
         if (__ballot_sync(0xffffffff, selected)) {
-            for (int i = lane; i < H / 32; i += 32)
-                __stbl(inbox[token].x + i, src_x[token * (H / 32) + i]);
-            if (lane < H / 512)
-                __stbl(inbox[token].sf + lane, src_sf[token * (H / 512) + lane]);
+            constexpr int Vectors = RoutedActivationBytes / sizeof(uint4);
+            for (int i = lane; i < Vectors; i += 32)
+                __stbl(inbox[token].x + i, src_x[token * Vectors + i]);
+            if constexpr (RoutedFP8_FP4) {
+                if (lane == 0)
+                    __stbl(inbox[token].sf, reinterpret_cast<const uint32_t*>(src_sf)[token]);
+            } else if (lane < H / 512) {
+                auto* target_sf = reinterpret_cast<uint4*>(inbox[token].sf);
+                __stbl(target_sf + lane, reinterpret_cast<const uint4*>(src_sf)[token * (H / 512) + lane]);
+            }
         }
     }
     if constexpr (Bitmap) {
@@ -245,22 +252,28 @@ __global__ void decode_index_routes(Launch p, bool pipeline = false) {
 
 __device__ __forceinline__ void gather_aiu_row(const Launch& p, const InboxRow& token, int source,
                                               int dest, int tile_rows, int lane) {
-    auto* grouped = reinterpret_cast<uint4*>(p.grouped_x) + dest * (H / 32);
-    const auto* token_scales = reinterpret_cast<const uint32_t*>(token.sf);
-    for (int i = lane; i < H / 32; i += 32)
+    constexpr int Vectors = RoutedActivationBytes / sizeof(uint4);
+    auto* grouped = reinterpret_cast<uint4*>(p.grouped_x) + dest * Vectors;
+    for (int i = lane; i < Vectors; i += 32)
         grouped[i] = __ldbl(token.x + i);
-    auto* transposed = reinterpret_cast<uint16_t*>(p.grouped_sf);
-    const int tile_row = dest % tile_rows;
-    transposed += dest / tile_rows * (H / 64) * tile_rows + tile_row;
-    for (int i = lane; i < H / 128; i += 32) {
-        const uint32_t pair = __ldbl(token_scales + i);
-        transposed[2 * i * tile_rows] = pair;
-        transposed[(2 * i + 1) * tile_rows] = pair >> 16;
+    if constexpr (RoutedFP8_FP4) {
+        if (lane == 0)
+            reinterpret_cast<uint32_t*>(p.grouped_sf)[dest] = __ldbl(token.sf);
+    } else {
+        auto* transposed = reinterpret_cast<uint16_t*>(p.grouped_sf);
+        const int tile_row = dest % tile_rows;
+        transposed += dest / tile_rows * (H / 64) * tile_rows + tile_row;
+        for (int i = lane; i < H / 128; i += 32) {
+            const uint32_t pair = __ldbl(token.sf + i);
+            transposed[2 * i * tile_rows] = pair;
+            transposed[(2 * i + 1) * tile_rows] = pair >> 16;
+        }
     }
     if (lane == 0) {
         p.return_rows[dest] = encode_return_slot(p, source);
-        p.grouped_weights[dest] = __uint_as_float(__ldbl(reinterpret_cast<const uint32_t*>(
-            &token.weights[source % TopK])));
+        if constexpr (!RoutedFP8_FP4)
+            p.grouped_weights[dest] = __uint_as_float(__ldbl(reinterpret_cast<const uint32_t*>(
+                &token.weights[source % TopK])));
     }
 }
 
@@ -364,7 +377,7 @@ __global__ void decode_dispatch(Launch p, bool pipeline) {
         const int source = Indexed ? indexed_routes[position] : warp_routes[row];
         const auto& token = inbox[source / TopK];
         const int dest = tile_start * tile_rows + position;
-        if (p.aiu) {
+        if (p.aiu || RoutedFP8_FP4) {
             gather_aiu_row(p, token, source, dest, tile_rows, lane);
             continue;
         }
@@ -394,7 +407,7 @@ __device__ __forceinline__ void store_pulled_routes(const Launch& p, const uint4
         asm volatile("ppu.cp.async.wait_all;" ::: "memory");
         __syncwarp();
     }
-    constexpr int Vectors = H / 32;
+    constexpr int Vectors = RoutedActivationBytes / sizeof(uint4);
     constexpr int Chunks = (Vectors + 31) / 32;
     uint4 x[Chunks];
     #pragma unroll
@@ -410,32 +423,37 @@ __device__ __forceinline__ void store_pulled_routes(const Launch& p, const uint4
     while (mask) {
         const int slot = __ffs(mask) - 1;
         const int row = __shfl_sync(0xffffffff, dest, slot);
-        auto* out = reinterpret_cast<uint4*>(p.grouped_x) + row * (H / 32);
+        auto* out = reinterpret_cast<uint4*>(p.grouped_x) + row * Vectors;
         #pragma unroll
         for (int i = 0; i < Chunks; ++i) {
             const int index = i * 32 + lane;
             if (index < Vectors)
                 out[index] = x[i];
         }
-        const int offset = row % tile_rows;
-        const int scale_row = PairedScales ? paired_scale_row(offset) : offset;
-        auto* scales = reinterpret_cast<uint16_t*>(p.grouped_sf) + row / tile_rows * tile_rows * (H / 64);
-        #pragma unroll
-        for (int pair = lane; pair < H / 128; pair += 32) {
-            const uint32_t value = pair < 32 ? scale : tail_scale;
-            scales[2 * pair * tile_rows + scale_row] = value;
-            scales[(2 * pair + 1) * tile_rows + scale_row] = value >> 16;
-        }
-        if constexpr (PairedScales && PadScales) {
-            const int live = p.tiles[row / tile_rows].rows;
-            if (offset + 1 == live) {
-                const int padded = (live + TileM - 1) / TileM * TileM;
-                for (int missing = live; missing < padded; ++missing) {
-                    const int missing_scale = paired_scale_row(missing);
-                    #pragma unroll
-                    for (int pair = lane; pair < H / 128; pair += 32) {
-                        scales[2 * pair * tile_rows + missing_scale] = 0;
-                        scales[(2 * pair + 1) * tile_rows + missing_scale] = 0;
+        if constexpr (RoutedFP8_FP4) {
+            if (lane == 0)
+                reinterpret_cast<uint32_t*>(p.grouped_sf)[row] = scale;
+        } else {
+            const int offset = row % tile_rows;
+            const int scale_row = PairedScales ? paired_scale_row(offset) : offset;
+            auto* scales = reinterpret_cast<uint16_t*>(p.grouped_sf) + row / tile_rows * tile_rows * (H / 64);
+            #pragma unroll
+            for (int pair = lane; pair < H / 128; pair += 32) {
+                const uint32_t value = pair < 32 ? scale : tail_scale;
+                scales[2 * pair * tile_rows + scale_row] = value;
+                scales[(2 * pair + 1) * tile_rows + scale_row] = value >> 16;
+            }
+            if constexpr (PairedScales && PadScales) {
+                const int live = p.tiles[row / tile_rows].rows;
+                if (offset + 1 == live) {
+                    const int padded = (live + TileM - 1) / TileM * TileM;
+                    for (int missing = live; missing < padded; ++missing) {
+                        const int missing_scale = paired_scale_row(missing);
+                        #pragma unroll
+                        for (int pair = lane; pair < H / 128; pair += 32) {
+                            scales[2 * pair * tile_rows + missing_scale] = 0;
+                            scales[(2 * pair + 1) * tile_rows + missing_scale] = 0;
+                        }
                     }
                 }
             }
@@ -457,7 +475,7 @@ __global__ void decode_pull_tokens(Launch p) {
     const int token = blockIdx.y * GatherWarps + warp;
     if (token >= tokens)
         return;
-    auto* stage = reinterpret_cast<uint4*>(storage) + warp * (H / 32);
+    auto* stage = reinterpret_cast<uint4*>(storage) + warp * (RoutedActivationBytes / sizeof(uint4));
     const int tile_rows = PairedScales ? 4 * TileM : p.m_tiles * TileM;
     const int origin = (owner * p.capacity + token) * TopK;
     const auto* token_routes = reinterpret_cast<const uint32_t*>(p.peers[p.rank] + p.inbox_ids_offset);
@@ -474,17 +492,18 @@ __global__ void decode_pull_tokens(Launch p) {
         dest = p.route_counts[expert] * tile_rows + index;
     // The same source row can feed several local experts.
     if (lane == 0)
-        copy_linear_tile<H / 256>(stage, peer + p.x_offset + token * (H / 2));
+        copy_linear_tile<RoutedActivationBytes / 128>(stage, peer + p.x_offset + token * RoutedActivationBytes);
     asm volatile("ppu.cp.async.commit_group;" ::: "memory");
-    const auto* sf = reinterpret_cast<const uint32_t*>(peer + p.sf_offset + token * (H / 32));
+    const auto* sf = reinterpret_cast<const uint32_t*>(peer + p.sf_offset + token * RoutedScaleBytes);
     const uint32_t scale = lane < ScaleWordsPerRow ? __ldbl(sf + lane) : 0;
     uint32_t tail_scale = 0;
-    if constexpr (H / 128 > 32)
+    if constexpr (ScaleWordsPerRow > 32)
         if (lane < H / 128 - 32)
             tail_scale = __ldbl(sf + lane + 32);
     if (dest_code != ~0u) {
         p.return_rows[dest] = encode_return_row(p, owner, token * TopK + lane);
-        p.grouped_weights[dest] = __uint_as_float(__ldbl(weights + token * TopK + lane));
+        if constexpr (!RoutedFP8_FP4)
+            p.grouped_weights[dest] = __uint_as_float(__ldbl(weights + token * TopK + lane));
     }
     store_pulled_routes<PairedScales>(p, stage, scale, dest, mask, tile_rows, lane, tail_scale);
 }
@@ -510,37 +529,39 @@ __device__ __forceinline__ void gather_into_pages(const Launch& p, int owner, in
         return;
     constexpr bool PrefetchMetadata = DirectActivation || PageRows == TileM || MetaMode == 3;
     constexpr bool SpeculateActivation = PageRows == TileM && !DirectActivation;
-    constexpr int StageWords = (DirectActivation ? 0 : H / 32) + (PrefetchMetadata ? PageMetadataBytes / 16 : 0);
+    constexpr int StageWords = (DirectActivation ? 0 : RoutedActivationBytes / sizeof(uint4)) + (PrefetchMetadata ? PageMetadataBytes / 16 : 0);
     const auto* peer = p.peers[owner];
     const auto* ids = reinterpret_cast<const int64_t*>(peer + p.id_offset);
     const auto* weights = reinterpret_cast<const uint32_t*>(peer + p.weight_offset);
-    const auto* sf = reinterpret_cast<const uint32_t*>(peer + p.sf_offset + token * (H / 32));
+    const auto* sf = reinterpret_cast<const uint32_t*>(peer + p.sf_offset + token * RoutedScaleBytes);
     const int source = token * TopK + lane;
     auto* stage = storage + warp * StageWords;
     uint64_t id;
     uint32_t scale, tail_scale = 0, weight = 0;
     if constexpr (PrefetchMetadata) {
-        auto* scales = reinterpret_cast<uint32_t*>(stage + (DirectActivation ? 0 : H / 32));
-        auto* staged_ids = reinterpret_cast<uint64_t*>(scales + H / 128);
+        auto* scales = reinterpret_cast<uint32_t*>(stage + (DirectActivation ? 0 : RoutedActivationBytes / sizeof(uint4)));
+        auto* staged_ids = reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(scales) + PageScaleBytes);
         auto* staged_weights = reinterpret_cast<uint32_t*>(staged_ids + AlignedTopK);
-        if constexpr (MetaMode && H % 1024 == 0) {
+        if constexpr (!RoutedFP8_FP4 && MetaMode && H % 1024 == 0) {
             if (lane == 0)
                 copy_linear_tile<H / 1024, false, 32>(scales, sf);
         } else {
             #pragma unroll
-            for (int pair = lane; pair < H / 128; pair += 32)
+            for (int pair = lane; pair < ScaleWordsPerRow; pair += 32)
                 copy_page_metadata<4>(scales + pair, sf + pair);
         }
         if constexpr (MetaMode >= 2 && TopK % 2 == 0) {
             if (lane < TopK / 2) {
                 const int pair = token * TopK + 2 * lane;
                 copy_page_metadata<16>(staged_ids + 2 * lane, ids + pair);
-                copy_page_metadata<8>(staged_weights + 2 * lane, weights + pair);
+                if constexpr (!RoutedFP8_FP4)
+                    copy_page_metadata<8>(staged_weights + 2 * lane, weights + pair);
             }
         } else {
             if (lane < TopK) {
                 copy_page_metadata<8>(staged_ids + lane, ids + source);
-                copy_page_metadata<4>(staged_weights + lane, weights + source);
+                if constexpr (!RoutedFP8_FP4)
+                    copy_page_metadata<4>(staged_weights + lane, weights + source);
             }
         }
         // On M16 pages, hide route resolution under the speculative activation copy.
@@ -548,7 +569,7 @@ __device__ __forceinline__ void gather_into_pages(const Launch& p, int owner, in
         asm volatile("ppu.cp.async.commit_group;" ::: "memory");
         if constexpr (SpeculateActivation) {
             if (lane == 0)
-                copy_linear_tile<H / 256>(stage, peer + p.x_offset + token * (H / 2));
+                copy_linear_tile<RoutedActivationBytes / 128>(stage, peer + p.x_offset + token * RoutedActivationBytes);
             asm volatile("ppu.cp.async.commit_group;" ::: "memory");
             asm volatile("ppu.cp.async.wait_group %0;" :: "n"(1) : "memory");
         } else {
@@ -557,10 +578,11 @@ __device__ __forceinline__ void gather_into_pages(const Launch& p, int owner, in
         __syncwarp();
         id = lane < TopK ? uint64_t(staged_ids[lane]) : ~0ull;
         scale = lane < ScaleWordsPerRow ? scales[lane] : 0;
-        if constexpr (H / 128 > 32)
+        if constexpr (ScaleWordsPerRow > 32)
             if (lane < H / 128 - 32)
                 tail_scale = scales[lane + 32];
-        weight = lane < TopK ? staged_weights[lane] : 0;
+        if constexpr (!RoutedFP8_FP4)
+            weight = lane < TopK ? staged_weights[lane] : 0;
     } else {
         id = lane < TopK ? uint64_t(__ldbl(ids + source)) : ~0ull;
     }
@@ -573,12 +595,12 @@ __device__ __forceinline__ void gather_into_pages(const Launch& p, int owner, in
     }
     if constexpr (!SpeculateActivation && !DirectActivation) {
         if (lane == 0)
-            copy_linear_tile<H / 256>(stage, peer + p.x_offset + token * (H / 2));
+            copy_linear_tile<RoutedActivationBytes / 128>(stage, peer + p.x_offset + token * RoutedActivationBytes);
         asm volatile("ppu.cp.async.commit_group;" ::: "memory");
     }
     if constexpr (!PrefetchMetadata) {
         scale = lane < ScaleWordsPerRow ? __ldbl(sf + lane) : 0;
-        if constexpr (H / 128 > 32)
+        if constexpr (ScaleWordsPerRow > 32)
             if (lane < H / 128 - 32)
                 tail_scale = __ldbl(sf + lane + 32);
     }
@@ -610,13 +632,15 @@ __device__ __forceinline__ void gather_into_pages(const Launch& p, int owner, in
     if (expert < PageExperts) {
         dest = page * PageRows + offset % PageRows;
         p.return_rows[dest] = encode_return_row(p, owner, source);
-        if constexpr (!PrefetchMetadata)
-            weight = __ldbl(weights + source);
-        p.grouped_weights[dest] = __uint_as_float(weight);
+        if constexpr (!RoutedFP8_FP4) {
+            if constexpr (!PrefetchMetadata)
+                weight = __ldbl(weights + source);
+            p.grouped_weights[dest] = __uint_as_float(weight);
+        }
     }
     const uint4* activation = stage;
     if constexpr (DirectActivation)
-        activation = reinterpret_cast<const uint4*>(peer + p.x_offset + token * (H / 2));
+        activation = reinterpret_cast<const uint4*>(peer + p.x_offset + token * RoutedActivationBytes);
     store_pulled_routes<PageRows == TileM, false, DirectActivation>(
         p, activation, scale, dest, active, PageRows, lane, tail_scale);
 }
@@ -678,7 +702,7 @@ void launch_page_dispatch(const Launch& p, hggcStream_t stream) {
     constexpr int WarpsPerBlock = std::max(BlockWarps, PageMinWarps);
     const dim3 grid(p.ranks, (p.bound + WarpsPerBlock - 1) / WarpsPerBlock);
     constexpr bool PrefetchWideMetadata = (LongGate || PageRows == 64) && PageRows != TileM;
-    constexpr int Scratch = WarpsPerBlock * (H / 2 + ((PageRows == TileM || PrefetchWideMetadata) ? PageMetadataBytes : 0));
+    constexpr int Scratch = WarpsPerBlock * (RoutedActivationBytes + ((PageRows == TileM || PrefetchWideMetadata) ? PageMetadataBytes : 0));
     if constexpr (PrefetchWideMetadata) {
         decode_page_dispatch<WarpsPerBlock, PageRows, 3><<<grid, WarpsPerBlock * 32, Scratch, stream>>>(p);
         return;
@@ -723,6 +747,12 @@ inline void launch_dispatch(const Launch& p, const DecodeSchedule& schedule, hgg
                 decode_inputs_ready<true><<<1, Threads, 0, stream>>>(p, schedule.pipeline);
             else
                 decode_inputs_ready<false><<<1, MaxRanks > 32 ? 64 : 32, 0, stream>>>(p, schedule.pipeline);
+        }
+    }
+    if constexpr (RoutedFP8_FP4) {
+        if (schedule.page_dispatch && p.m_tiles == 3) {
+            launch_direct_page_dispatch<8, 48>(p, stream);
+            return;
         }
     }
     if (schedule.tall_pages) {
@@ -775,7 +805,7 @@ inline void launch_dispatch(const Launch& p, const DecodeSchedule& schedule, hgg
             const dim3 index(p.ranks, (p.bound + PullIndexTokens - 1) / PullIndexTokens);
             decode_index_routes<true><<<index, PullIndexTokens * TopK, 0, stream>>>(p, schedule.pipeline);
             const dim3 grid(p.ranks, (p.bound + GatherWarps - 1) / GatherWarps);
-            constexpr int Scratch = GatherWarps * (H / 2);
+            constexpr int Scratch = GatherWarps * RoutedActivationBytes;
             if (schedule.paired_scales)
                 decode_pull_tokens<true><<<grid, GatherWarps * 32, Scratch, stream>>>(p);
             else

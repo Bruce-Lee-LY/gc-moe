@@ -160,7 +160,8 @@ template <int Rows, int NTile, typename Project, bool Packed>
 __device__ __forceinline__ void routed_staged_store(const Launch& p, const typename Project::Result& acc,
                                                     int live_rows, int base, int column, uint8_t* memory) {
     constexpr int Vectors = NTile / 8;
-    static_assert(32 % Vectors == 0);
+    constexpr int StoreGroup = std::min(Vectors, 32);
+    static_assert(Vectors % StoreGroup == 0);
     static_assert(Project::ScratchBytes >= Rows * NTile * sizeof(bf16));
     const int tid = threadIdx.x;
     const int warp = tid / 32;
@@ -185,10 +186,12 @@ __device__ __forceinline__ void routed_staged_store(const Launch& p, const typen
     }
     __syncthreads();
     // Each group writes a contiguous column tile to one destination row.
-    const int col = lane % Vectors;
-    for (int row = tid / Vectors; row < live_rows; row += Project::Threads / Vectors) {
+    const int col = lane % StoreGroup;
+    for (int row = tid / StoreGroup; row < live_rows; row += Project::Threads / StoreGroup) {
         auto* target = return_row<Packed>(p, base + row) + column * Vectors;
-        __stbl(target + col, staging[row * Vectors + col]);
+        #pragma unroll
+        for (int i = 0; i < Vectors; i += StoreGroup)
+            __stbl(target + col + i, staging[row * Vectors + col + i]);
     }
 }
 
@@ -379,7 +382,7 @@ __global__ void decode_block_experts(Launch p) {
 // Let a quarter of the CTAs take a completed down tile while other CTAs
 // are claiming W1. A CTA starts waiting for W1 only after the W1 queue is
 // fully claimed, so that work owned by another CTA can always make progress.
-__global__ void decode_routed_pipeline_m16_interleaved(Launch p) {
+__global__ void decode_fp4_fp4_pipeline_m16_interleaved(Launch p) {
     constexpr int GateColumns = 2 * I / 128;
     constexpr int DownColumns = H / 128;
     extern __shared__ __align__(128) uint8_t memory[];
@@ -453,16 +456,16 @@ __global__ void decode_routed_pipeline_m16_interleaved(Launch p) {
         __ppu_threadfence_system_uncache();
 }
 
-void launch_interleaved_m16(const Launch& p, hggcStream_t stream) {
+void launch_fp4_fp4_interleaved_m16(const Launch& p, hggcStream_t stream) {
     using Gate = BlockProject<16, 128, H / 2, true, 64, 5, true>;
     using Down = BlockProject<16, 128, I / 2, true, FullDownChunk, 2, true>;
     constexpr int Scratch = std::max(Gate::ScratchBytes, Down::ScratchBytes);
-    decode_routed_pipeline_m16_interleaved<<<p.units * 8, Gate::Threads, Scratch, stream>>>(p);
+    decode_fp4_fp4_pipeline_m16_interleaved<<<p.units * 8, Gate::Threads, Scratch, stream>>>(p);
 }
 
 template <int Rows, int NTile, int Chunk, int StageCount, bool PairedScales, bool StagedScatter,
           int RowPanels, bool ClampInTable, bool PageLayout, bool SplitColumns, bool RtWeights, int DownStages, int DownChunk, int NarrowMode, bool StageReady, int W1NarrowStages, int DownCycles, bool PrefetchTiles, int GateCycles>
-__global__ void decode_routed_pipeline(Launch p) {
+__global__ void decode_fp4_fp4_pipeline(Launch p) {
     constexpr int GateColumns = 2 * I / NTile;
     constexpr int DownColumns = H / NTile;
     // A W1 column tile produces half as many SwiGLU channels as its N width.
@@ -670,7 +673,7 @@ void launch_shared_projection(const Launch& p, hggcStream_t stream) {
 template <int Rows, int NTile, int Chunk = 64, int StageCount = 3,
           bool PairedScales = false, bool StagedScatter = false, int RowPanels = 1,
           bool PageLayout = false, bool SplitColumns = false, int DownStages = StageCount, int DownChunk = Chunk, int NarrowMode = 0, bool StageReady = false, int W1NarrowStages = StageCount, int DownCycles = 1, bool PrefetchTiles = false, int GateCycles = 1>
-void launch_routed_pipeline(const Launch& p, hggcStream_t stream, bool clamp_in_table,
+void launch_fp4_fp4_pipeline(const Launch& p, hggcStream_t stream, bool clamp_in_table,
                             int blocks_per_unit_override = 0) {
     using Project = BlockProject<Rows, NTile, H / 2, true, Chunk, StageCount, PairedScales, RowPanels,
                                  false, false, SplitColumns>;
@@ -689,12 +692,12 @@ void launch_routed_pipeline(const Launch& p, hggcStream_t stream, bool clamp_in_
     auto launch = [&](auto rt_weights) {
         constexpr bool RtWeights = decltype(rt_weights)::value;
         if (clamp_in_table) {
-            decode_routed_pipeline<Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
+            decode_fp4_fp4_pipeline<Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
                                    RowPanels, true, PageLayout, SplitColumns, RtWeights, DownStages, DownChunk, NarrowMode, StageReady, W1NarrowStages, DownCycles, PrefetchTiles, GateCycles>
                 <<<blocks, Project::Threads, staging, stream>>>(p);
             return;
         }
-        decode_routed_pipeline<Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
+        decode_fp4_fp4_pipeline<Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
                                RowPanels, false, PageLayout, SplitColumns, RtWeights, DownStages, DownChunk, NarrowMode, false, W1NarrowStages, DownCycles, PrefetchTiles, GateCycles>
             <<<blocks, Project::Threads, staging, stream>>>(p);
     };
@@ -707,79 +710,79 @@ void launch_routed_pipeline(const Launch& p, hggcStream_t stream, bool clamp_in_
     launch(std::false_type{});
 }
 
-inline void launch_routed(const Launch& p, const DecodeSchedule& schedule, hggcStream_t stream) {
+inline void launch_fp4_fp4(const Launch& p, const DecodeSchedule& schedule, hggcStream_t stream) {
     if (schedule.pipeline) {
         if (schedule.small_pages) {
             const bool prefetch = schedule.clamp_in_table && (schedule.fused_dispatch || (LongGate && schedule.prefetch_returns));
             if (prefetch && (p.bound >= 2 || LongGate)) {
                 if (GateStages > 4 && schedule.prefetch_returns && schedule.fused_dispatch) {
-                    launch_routed_pipeline<16, 128, 64, 4, true, false, 1, true,
+                    launch_fp4_fp4_pipeline<16, 128, 64, 4, true, false, 1, true,
                                            false, 2, FullDownChunk, 0, false, 4, 1, true>(p, stream, schedule.clamp_in_table);
                 } else {
-                    launch_routed_pipeline<16, 128, 64, GateStages, true, false, 1, true,
+                    launch_fp4_fp4_pipeline<16, 128, 64, GateStages, true, false, 1, true,
                                            false, 2, FullDownChunk, 0, false, GateStages, 1, true>(p, stream, schedule.clamp_in_table);
                 }
             } else if (LongGate && schedule.clamp_in_table && p.bound == 2) {
-                launch_interleaved_m16(p, stream);
+                launch_fp4_fp4_interleaved_m16(p, stream);
             } else if (LongGate && p.bound == 1) {
-                launch_routed_pipeline<16, 128, 128, 3, true, false, 1, true,
+                launch_fp4_fp4_pipeline<16, 128, 128, 3, true, false, 1, true,
                                        false, 2, FullDownChunk>(p, stream, schedule.clamp_in_table);
             } else if (LongGate) {
-                launch_routed_pipeline<16, 128, 64, 5, true, false, 1, true,
+                launch_fp4_fp4_pipeline<16, 128, 64, 5, true, false, 1, true,
                                        false, 2, FullDownChunk>(p, stream, schedule.clamp_in_table);
             } else {
-                launch_routed_pipeline<16, 128, 64, 5, true, false, 1, true,
+                launch_fp4_fp4_pipeline<16, 128, 64, 5, true, false, 1, true,
                                        false, 4, 64>(p, stream, schedule.clamp_in_table);
             }
         } else if (schedule.tall_pages) {
             if constexpr (CanUseM128) {
                 if (p.m_tiles == 8) {
-                    launch_routed_pipeline<128, 256, 64, 3, true, true, 4, true, false,
+                    launch_fp4_fp4_pipeline<128, 256, 64, 3, true, true, 4, true, false,
                                            3, 64, 3, false, 3, 2>(p, stream, schedule.clamp_in_table, 8);
                     return;
                 }
             }
-            launch_routed_pipeline<96, 256, 64, 3, true, true, 3, true, false,
+            launch_fp4_fp4_pipeline<96, 256, 64, 3, true, true, 3, true, false,
                                    3, 64, 3, false, 3, 2>(p, stream, schedule.clamp_in_table);
         } else if (schedule.wide_pages) {
             const bool compact = !LongGate && schedule.routes < 28 * Experts;
             if (schedule.large_routed) {
                 if (!LongGate && schedule.routes >= 32 * Experts) {
-                    launch_routed_pipeline<64, 256, 64, 3, true, true, 2, true, false,
+                    launch_fp4_fp4_pipeline<64, 256, 64, 3, true, true, 2, true, false,
                                            3, 64, 3, ShortDown, 4, 2, false, 2>(p, stream, schedule.clamp_in_table, 10);
                 } else {
-                    launch_routed_pipeline<64, 256, 64, 3, true, true, 2, true, false,
+                    launch_fp4_fp4_pipeline<64, 256, 64, 3, true, true, 2, true, false,
                                            3, 64, 3, ShortDown, 4, 2>(p, stream, schedule.clamp_in_table, LongGate ? 8 : 10);
                 }
             } else if (compact) {
-                launch_routed_pipeline<64, 256, 64, 3, true, true, 2, true, true>(p, stream, schedule.clamp_in_table);
+                launch_fp4_fp4_pipeline<64, 256, 64, 3, true, true, 2, true, true>(p, stream, schedule.clamp_in_table);
             } else if (!LongGate || schedule.routes >= 28 * Experts) {
-                launch_routed_pipeline<64, 256, 64, 3, true, true, 2, true, false,
+                launch_fp4_fp4_pipeline<64, 256, 64, 3, true, true, 2, true, false,
                                        3, 64, 3, ShortDown, 4, 2>(p, stream, schedule.clamp_in_table);
             } else {
-                launch_routed_pipeline<64, 256, 64, 3, true, true, 2, true, false,
+                launch_fp4_fp4_pipeline<64, 256, 64, 3, true, true, 2, true, false,
                                        3, 64, 3, ShortDown, 4>(p, stream, schedule.clamp_in_table);
             }
         } else if (schedule.medium_pages) {
             if (LongGate) {
-                launch_routed_pipeline<32, 256, 64, 4, false, true, 1, true, false,
+                launch_fp4_fp4_pipeline<32, 256, 64, 4, false, true, 1, true, false,
                                        3, 64, 0, ShortDown>(p, stream, schedule.clamp_in_table);
             } else if (schedule.routes >= 15 * Experts) {
-                launch_routed_pipeline<32, 256, 64, 3, false, true, 1, true, true>(p, stream, schedule.clamp_in_table);
+                launch_fp4_fp4_pipeline<32, 256, 64, 3, false, true, 1, true, true>(p, stream, schedule.clamp_in_table);
             } else {
-                launch_routed_pipeline<32, 256, 64, 4, false, false, 1, true, false,
+                launch_fp4_fp4_pipeline<32, 256, 64, 4, false, false, 1, true, false,
                                        3>(p, stream, schedule.clamp_in_table);
             }
         } else if (schedule.paired_scales) {
-            launch_routed_pipeline<64, 256, 64, 3, true, true, 2, false, true>(p, stream, schedule.clamp_in_table);
+            launch_fp4_fp4_pipeline<64, 256, 64, 3, true, true, 2, false, true>(p, stream, schedule.clamp_in_table);
         } else if (schedule.large_queue && p.m_tiles == 4) {
-            launch_routed_pipeline<64, 128, FullDownChunk, 2>(p, stream, schedule.clamp_in_table);
+            launch_fp4_fp4_pipeline<64, 128, FullDownChunk, 2>(p, stream, schedule.clamp_in_table);
         } else if (schedule.large_queue) {
-            launch_routed_pipeline<48, 128, FullDownChunk, 2>(p, stream, schedule.clamp_in_table);
+            launch_fp4_fp4_pipeline<48, 128, FullDownChunk, 2>(p, stream, schedule.clamp_in_table);
         } else if (p.m_tiles == 2) {
-            launch_routed_pipeline<32, 256>(p, stream, schedule.clamp_in_table);
+            launch_fp4_fp4_pipeline<32, 256>(p, stream, schedule.clamp_in_table);
         } else {
-            launch_routed_pipeline<16, 128>(p, stream, schedule.clamp_in_table);
+            launch_fp4_fp4_pipeline<16, 128>(p, stream, schedule.clamp_in_table);
         }
     } else if (schedule.overlap || schedule.routed_only) {
         launch_projection<true, ProjectionRole::Routed>(p, stream);

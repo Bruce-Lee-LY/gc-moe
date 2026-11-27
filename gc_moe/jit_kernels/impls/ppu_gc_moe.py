@@ -24,7 +24,7 @@ class Launch(ctypes.Structure):
         'rank', 'ranks', 'capacity', 'tokens', 'bound', 'units',
         'x_offset', 'sf_offset', 'id_offset', 'weight_offset', 'return_offset',
         'inbox_offset', 'inbox_ids_offset', 'aiu', 'm_tiles',
-    )] + [('clamp', ctypes.c_float)]
+    )] + [(name, ctypes.c_float) for name in ('clamp', 'w1_inv_scale', 'w2_inv_scale')]
 
 
 def build_ppu_library(cache_dir, source, *, defines=(), headers=()):
@@ -53,12 +53,14 @@ def build_ppu_library(cache_dir, source, *, defines=(), headers=()):
 
 
 @functools.lru_cache(maxsize=None)
-def load(cache_dir, hidden, intermediate, experts, topk, ranks=8):
+def load(cache_dir, hidden, intermediate, experts, topk, ranks=8, routed_precision='fp4_fp4'):
     source = Path(__file__).resolve().parents[2] / 'impls' / 'ppu' / 'decode.cu'
     defines = (f'-DGC_MOE_HIDDEN={hidden}', f'-DGC_MOE_INTERMEDIATE={intermediate}',
                f'-DGC_MOE_EXPERTS={experts}', f'-DGC_MOE_TOPK={topk}')
     if ranks > 8:
         defines += (f'-DGC_MOE_MAX_RANKS={ranks}',)
+    if routed_precision == 'fp8_fp4':
+        defines += ('-DGC_MOE_ROUTED_FP8_FP4=1',)
     lib = build_ppu_library(cache_dir, source, defines=defines, headers=sorted(source.parent.glob('*.cuh')))
     lib.gc_moe_decode.argtypes = [ctypes.POINTER(Launch)] + [ctypes.c_void_p] * 4
     lib.gc_moe_decode.restype = ctypes.c_int
@@ -76,7 +78,8 @@ def launch_gc_moe(config, y, workspace, stats) -> None:
     grouped_x, grouped_sf, return_rows, tiles, tile_count, mid, mid_sf = workspace._scratch
     x_offset, sf_offset, id_offset, weight_offset, return_offset, inbox_offset, inbox_ids_offset = workspace._offsets
     route_index, route_counts = workspace._route_index
-    w1, w2 = config.routed_weights
+    routed_w1, routed_w2 = config.routed_weights
+    w1_inv_scale, w2_inv_scale = config.routed_inverse_scales
     args = Launch(
         peers=workspace._peers.data_ptr(),
         grouped_x=grouped_x.data_ptr(),
@@ -86,11 +89,11 @@ def launch_gc_moe(config, y, workspace, stats) -> None:
         tile_count=tile_count.data_ptr(),
         mid=mid.data_ptr(),
         mid_sf=mid_sf.data_ptr(),
-        w1=w1.data_ptr(),
-        w2=w2.data_ptr(),
+        w1=routed_w1.data_ptr(),
+        w2=routed_w2.data_ptr(),
         out=y.data_ptr(),
         stats=stats.data_ptr() if stats is not None else None,
-        grouped_weights=workspace._grouped_weights.data_ptr(),
+        grouped_weights=workspace._grouped_weights.data_ptr() if workspace._grouped_weights is not None else None,
         silu_table=workspace._silu_table.data_ptr(),
         route_index=route_index.data_ptr() if route_index is not None else None,
         route_counts=route_counts.data_ptr() if route_counts is not None else None,
@@ -112,16 +115,18 @@ def launch_gc_moe(config, y, workspace, stats) -> None:
         aiu=workspace._aiu,
         m_tiles=workspace._m_tiles,
         clamp=config.clamp,
+        w1_inv_scale=w1_inv_scale,
+        w2_inv_scale=w2_inv_scale,
     )
-    if config.shared_weights is not None:
-        (w1, w1_sf), (w2, w2_sf) = config.shared_weights
+    if config.shared_fp8_fp8_ptpc_weights is not None:
+        (shared_w1, shared_w1_sf), (shared_w2, shared_w2_sf) = config.shared_fp8_fp8_ptpc_weights
         act, shared_mid, shared_mid_sf, shared_out = workspace._shared_scratch
         args.shared_x = workspace.shared_x.data_ptr()
         args.shared_x_sf = workspace.shared_x_sf.data_ptr()
-        args.shared_w1 = w1.data_ptr()
-        args.shared_w1_sf = w1_sf.data_ptr()
-        args.shared_w2 = w2.data_ptr()
-        args.shared_w2_sf = w2_sf.data_ptr()
+        args.shared_w1 = shared_w1.data_ptr()
+        args.shared_w1_sf = shared_w1_sf.data_ptr()
+        args.shared_w2 = shared_w2.data_ptr()
+        args.shared_w2_sf = shared_w2_sf.data_ptr()
         args.shared_act = act.data_ptr()
         args.shared_mid = shared_mid.data_ptr()
         args.shared_mid_sf = shared_mid_sf.data_ptr()

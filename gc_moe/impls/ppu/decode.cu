@@ -1,6 +1,10 @@
 #include "combine.cuh"
 #include "dispatch.cuh"
+#if GC_MOE_ROUTED_FP8_FP4
+#include "fp8_fp4_projection.cuh"
+#else
 #include "projection.cuh"
+#endif
 
 #if GC_MOE_MAX_RANKS > 8
 __global__ void gc_moe_probe_peer_stores(uint8_t* const* peers, int rank) {
@@ -27,7 +31,9 @@ extern "C" int gc_moe_decode(const gc_moe::Launch* request, hggcStream_t stream,
                              hggcStream_t side, hggcEvent_t start, hggcEvent_t done) {
     using namespace gc_moe;
     auto p = *request;
-    const auto schedule = select_schedule(p, side != nullptr);
+    auto schedule = select_schedule(p, side != nullptr);
+    if constexpr (RoutedFP8_FP4)
+        schedule.pipeline = true;
 
     if (schedule.overlap) {
         if (const auto status = hggcEventRecord(start, stream); status != hggcSuccess)
@@ -50,6 +56,15 @@ extern "C" int gc_moe_decode(const gc_moe::Launch* request, hggcStream_t stream,
             return status;
     }
     launch_dispatch(p, schedule, stream);
-    launch_routed(p, schedule, stream);
+#if GC_MOE_ROUTED_FP8_FP4
+    if (!schedule.overlap && p.shared_x && p.tokens) {
+        launch_shared_projection<true>(p, stream);
+        decode_ptpc_quantize<<<p.tokens, Threads, 0, stream>>>(p);
+        launch_shared_projection<false>(p, stream);
+    }
+    launch_fp8_fp4(p, stream);
+#else
+    launch_fp4_fp4(p, schedule, stream);
+#endif
     return launch_finalize(p, schedule, stream, done);
 }

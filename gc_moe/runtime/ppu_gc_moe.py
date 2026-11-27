@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from ..jit_kernels.impls.ppu_fp4_fp4_gc_moe import load
+from ..jit_kernels.impls.ppu_gc_moe import load
 from ..layout.ppu_gc_moe import LOCAL_RANKS, MAX_RANKS, MAX_TOKENS, PPUBufferLayout, check_weight_dimensions
 
 
@@ -28,7 +28,18 @@ class PPUGCSymmBuffer:
 
     def __init__(self, group, num_experts, num_max_tokens_per_rank, num_topk,
                  hidden, intermediate_hidden, activation='swiglu', num_shared_experts=0,
-                 *, cache_dir=None, shared_fp8=False, graph_safe=False):
+                 *, cache_dir=None, graph_safe=False, routed_precision=None, shared_fp8_fp8_ptpc=None,
+                 routed_fp8=None, shared_fp8=None):
+        if routed_precision is None:
+            routed_precision = 'fp8_fp4' if routed_fp8 else 'fp4_fp4'
+        elif routed_fp8 is not None and (routed_precision == 'fp8_fp4') != routed_fp8:
+            raise ValueError('conflicting routed precision settings')
+        if routed_precision not in ('fp4_fp4', 'fp8_fp4'):
+            raise ValueError('routed_precision must be fp4_fp4 or fp8_fp4')
+        if shared_fp8_fp8_ptpc is None:
+            shared_fp8_fp8_ptpc = False if shared_fp8 is None else shared_fp8
+        elif shared_fp8 is not None and shared_fp8_fp8_ptpc != shared_fp8:
+            raise ValueError('conflicting shared precision settings')
         check_weight_dimensions(hidden, intermediate_hidden)
         capacity = num_max_tokens_per_rank
         ranks = group.size()
@@ -36,7 +47,7 @@ class PPUGCSymmBuffer:
                 or not ranks <= num_experts <= 65535 or num_experts % ranks
                 or not 1 <= num_topk <= min(16, num_experts)
                 or activation != 'swiglu' or num_shared_experts not in (0, 1)
-                or bool(num_shared_experts) != shared_fp8):
+                or bool(num_shared_experts) != shared_fp8_fp8_ptpc):
             raise ValueError('invalid decode capacity, EP size, activation or shared-expert configuration')
         if torch.cuda.is_current_stream_capturing():
             raise ValueError('allocate the workspace outside graph capture')
@@ -51,11 +62,14 @@ class PPUGCSymmBuffer:
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_max_tokens_per_rank = capacity
         self.num_shared_experts = num_shared_experts
+        self.routed_precision = routed_precision
+        routed_fp8_fp4 = routed_precision == 'fp8_fp4'
         self._device = device = torch.device('cuda', torch.cuda.current_device())
         self._library = load(Path(cache_dir or Path.home() / '.cache/gc_moe/ppu').expanduser().resolve(),
-                             hidden, intermediate_hidden, num_experts, num_topk, max(LOCAL_RANKS, ranks))
+                             hidden, intermediate_hidden, num_experts, num_topk, max(LOCAL_RANKS, ranks),
+                             routed_precision)
 
-        self.layout = layout = PPUBufferLayout(ranks, num_experts, capacity, num_topk, hidden)
+        self.layout = layout = PPUBufferLayout(ranks, num_experts, capacity, num_topk, hidden, routed_precision)
         if ranks > 1:
             import torch.distributed._symmetric_memory as symm_mem
 
@@ -95,14 +109,19 @@ class PPUGCSymmBuffer:
         # Every expert can own a partially filled tile in addition to the live rows.
         max_page_panels = 8 if ranks > LOCAL_RANKS and hidden <= 2 * intermediate_hidden else 6
         rows = (max_tiles + local_experts * ((self._m_tiles or max_page_panels) - 1)) * 16
+        activation_width = hidden if routed_fp8_fp4 else hidden // 2
+        scale_width = 1 if routed_fp8_fp4 else hidden // 32
+        scale_dtype = torch.float32 if routed_fp8_fp4 else torch.uint8
+        mid_width = 2 * intermediate_hidden if routed_fp8_fp4 else intermediate_hidden // 2
+        mid_scale_width = 1 if routed_fp8_fp4 else intermediate_hidden // 32
         self._scratch = tuple(torch.empty(shape, device=device, dtype=dtype) for shape, dtype in (
-            ((rows, hidden // 2), torch.uint8), ((rows, hidden // 32), torch.uint8),
+            ((rows, activation_width), torch.uint8), ((rows, scale_width), scale_dtype),
             ((rows,), torch.int64), ((max_tiles, 3), torch.int32), ((1,), torch.int32),
-            ((rows, intermediate_hidden // 2), torch.uint8), ((rows, intermediate_hidden // 32), torch.uint8),
+            ((rows, mid_width), torch.uint8), ((rows, mid_scale_width), scale_dtype),
         ))
         self.shared_x = self.shared_x_sf = None
         self._shared_scratch = ()
-        if shared_fp8:
+        if shared_fp8_fp8_ptpc:
             self.shared_x = torch.empty((capacity, hidden), dtype=torch.float8_e4m3fn, device=device)
             self.shared_x_sf = torch.empty((capacity, 1), dtype=torch.float32, device=device)
             self._shared_scratch = tuple(torch.empty(shape, device=device, dtype=dtype) for shape, dtype in (
@@ -112,7 +131,8 @@ class PPUGCSymmBuffer:
             # The extra row holds the five counters used by the small SE queue.
             self._shared_scratch[1][-1, :20].zero_()
         self._units = torch.cuda.get_device_properties(device).multi_processor_count
-        self._grouped_weights = torch.empty(rows, dtype=torch.float32, device=device)
+        # W4A8 reads routing weights from the source rank during combine.
+        self._grouped_weights = None if routed_fp8_fp4 else torch.empty(rows, dtype=torch.float32, device=device)
         pull_routes = ranks >= LOCAL_RANKS and self._aiu and local_experts <= 64
         # The push dispatcher indexes larger batches to keep its per-CTA
         # route scan and dynamic shared-memory allocation bounded.
@@ -136,7 +156,7 @@ class PPUGCSymmBuffer:
         if status:
             raise RuntimeError(f'PPU SiLU table initialization failed with HGGC status {status}')
         self._se_pipeline = None
-        if shared_fp8 and self._aiu:
+        if shared_fp8_fp8_ptpc and self._aiu:
             side = torch.cuda.Stream(device=device)
             first, last = torch.cuda.Event(), torch.cuda.Event()
             first.record()
@@ -144,6 +164,11 @@ class PPUGCSymmBuffer:
             self._se_pipeline = (side, first, last)
         stream.synchronize()
         dist.barrier(group)
+
+    @property
+    def routed_fp8(self):
+        """Compatibility view of the routed activation mode."""
+        return self.routed_precision == 'fp8_fp4'
 
     def _probe_icn_peers(self):
         stream = torch.cuda.current_stream(self._device)

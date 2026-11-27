@@ -2,6 +2,7 @@
 
 #include "workspace.cuh"
 
+#include <cmath>
 #include <cstring>
 
 namespace gc_moe {
@@ -24,7 +25,24 @@ inline DecodeSchedule select_schedule(Launch& p, bool side) {
     if (!p.m_tiles) {
         // Expected rows per expert guide the tile size. Actual receive counts
         // determine page overflow and how many M panels W1 and W2 need.
-        if (paged_dispatch) {
+        if (RoutedFP8_FP4 && paged_dispatch) {
+            // Reserve room above the mean and shrink the actual MMA for
+            // partially filled pages. This avoids repeating B on short tails.
+            const double mean = double(routes) / Experts;
+            const double target = mean + 2 * std::sqrt(mean);
+            if (target <= 16)
+                p.m_tiles = 1;
+            else if (target <= 32)
+                p.m_tiles = 2;
+            else if (target <= 48)
+                p.m_tiles = 3;
+            else if (target <= 64)
+                p.m_tiles = 4;
+            else if (target <= 96 || !CanUseM128)
+                p.m_tiles = 6;
+            else
+                p.m_tiles = 8;
+        } else if (paged_dispatch) {
             // Leave room for the tail of the expert load before an M64 page
             // fills. Wider down projections repay the larger page sooner.
             const int tall_threshold = BalancedProjections ? 56 : 58;
@@ -60,10 +78,12 @@ inline DecodeSchedule select_schedule(Launch& p, bool side) {
     // layout keeps the independent column-group pipelines busy.
     const bool wide_pages = paired_scales &&
                             (!routed_only || LongGate || (large_routed && routes < 46 * Experts));
-    const bool page_dispatch = small_pages || medium_pages || wide_pages || tall_pages;
-    const bool pipeline = p.aiu && (overlap || routed_only || fused_dispatch) &&
-                          (page_dispatch || large_queue ||
-                           (p.m_tiles < 3 && (sparse_queue || routes >= 2 * Experts)));
+    const bool page48 = RoutedFP8_FP4 && paged_dispatch && p.m_tiles == 3 && p.bound > 0;
+    const bool page_dispatch = small_pages || medium_pages || page48 || wide_pages || tall_pages;
+    const bool pipeline = RoutedFP8_FP4 ||
+                          (p.aiu && (overlap || routed_only || fused_dispatch) &&
+                           (page_dispatch || large_queue ||
+                            (p.m_tiles < 3 && (sparse_queue || routes >= 2 * Experts))));
     const bool queue_shared_m64 = BalancedProjections && fused_dispatch && medium_pages &&
                                   p.bound <= 64 && p.tokens > 32;
 

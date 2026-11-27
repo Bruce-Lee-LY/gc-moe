@@ -1,19 +1,21 @@
-"""PPU routed expert accuracy against masked MXFP4 grouped GEMM."""
+"""Shared PPU GC MoE inputs, references, and accuracy checks."""
 
 import argparse
 from datetime import timedelta
 import json
 import os
 from pathlib import Path
-import sys
 from typing import Tuple
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 import torch.distributed as dist
 
-from gc_moe import get_symm_buffer_for_gc_moe_ppu, ppu_fp4_fp4_gc_moe, transform_weights_for_gc_moe_ppu
+from gc_moe import (
+    get_symm_buffer_for_gc_moe_ppu,
+    ppu_fp4_fp4_gc_moe,
+    ppu_fp8_fp4_gc_moe,
+    transform_weights_for_gc_moe_ppu,
+)
 from gc_moe.ppu_gc import MAX_TOKENS
 
 
@@ -68,7 +70,7 @@ def _gather(tensor, ranks):
     return torch.stack(gathered)
 
 
-def _requantize(x):
+def _requantize_fp4_fp4_activation(x):
     groups = x.reshape(*x.shape[:-1], x.shape[-1] // 32, 32)
     amax = groups.abs().amax(dim=-1)
     bits = amax.view(torch.int32)
@@ -91,12 +93,25 @@ def _unpack_down_output(tensor):
 
 
 class ReferenceMoE:
-    def __init__(self, deep_gemm, w1, w1_sf, w2, w2_sf, rank, ranks):
-        self.gemm = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked
-        self.w1 = w1, deep_gemm.preprocess_mxfp4_scales(w1_sf)
-        self.w2 = w2, deep_gemm.preprocess_mxfp4_scales(w2_sf)
+    def __init__(self, deep_gemm, w1, w1_sf, w2, w2_sf, rank, ranks, *, routed_precision):
+        self.routed_fp8_fp4 = routed_precision == 'fp8_fp4'
+        if self.routed_fp8_fp4:
+            self.gemm = deep_gemm.m_grouped_gemm_fp8_fp4_bf16_nt_masked
+            mode = deep_gemm.PreprocessMode.W4A8_MXFP4_MMA
+            self.w1 = deep_gemm.preprocess_weights_and_scales(mode, False, w1, w1_sf)
+            self.w2 = deep_gemm.preprocess_weights_and_scales(mode, False, w2, w2_sf)
+        else:
+            self.gemm = deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked
+            self.w1 = w1, deep_gemm.preprocess_mxfp4_scales(w1_sf)
+            self.w2 = w2, deep_gemm.preprocess_mxfp4_scales(w2_sf)
         self.rank = rank
         self.ranks = ranks
+
+    def _project(self, x, sf, weight, out, counts, m):
+        if self.routed_fp8_fp4:
+            self.gemm((x.view(torch.float8_e4m3fn), sf), weight[:2], out, counts, m, inv_scale=weight[2])
+        else:
+            self.gemm((x, sf), weight, None, out, counts, m)
 
     def __call__(self, packed, scales, ids, weights, token_counts=None, *, bias=None, clamp=None):
         bound, topk = ids.shape
@@ -125,9 +140,9 @@ class ReferenceMoE:
         m = max(16, ((int(counts.max()) + 15) // 16) * 16)
         coordinates = (local_ids.cuda(), rows.cuda())
         source = routed[:, 0], routed[:, 1] // topk
-        x = packed.new_zeros((experts, m, hidden // 2))
-        sf = scales.new_full((experts, m, hidden // 32), 127)
-        x[coordinates] = _gather(packed, self.ranks)[source].cuda()
+        x = packed.view(torch.uint8).new_zeros((experts, m, packed.shape[-1]))
+        sf = scales.new_full((experts, m, scales.shape[-1]), 1 if self.routed_fp8_fp4 else 127)
+        x[coordinates] = _gather(packed.view(torch.uint8), self.ranks)[source].cuda()
         sf[coordinates] = _gather(scales, self.ranks)[source].cuda()
         route_weights = _gather(weights, self.ranks).reshape(self.ranks, -1)
         route_weights = route_weights[routed[:, 0], routed[:, 1]].cuda()
@@ -135,19 +150,22 @@ class ReferenceMoE:
         if routed.numel():
             counts_cuda = counts.to(device='cuda', dtype=torch.int32)
             gate_up = torch.empty((experts, m, 2 * inter), dtype=torch.bfloat16, device='cuda')
-            self.gemm((x, sf), self.w1, None, gate_up, counts_cuda, m)
+            self._project(x, sf, self.w1, gate_up, counts_cuda, m)
             gate, up = gate_up[coordinates].float().chunk(2, dim=-1)
             if clamp is not None:
                 gate = gate.clamp_max(clamp)
                 up = up.clamp(-clamp, clamp)
-            activation = ((gate / (1.0 + torch.exp(-gate))) * up) * route_weights.unsqueeze(-1)
-            mid, mid_sf = _requantize(activation)
-            grouped_mid = packed.new_zeros((experts, m, inter // 2))
-            grouped_mid_sf = scales.new_full((experts, m, inter // 32), 127)
-            grouped_mid[coordinates] = mid
+            activation = (gate / (1.0 + torch.exp(-gate))) * up
+            if self.routed_fp8_fp4:
+                mid, mid_sf = quantize_fp8_fp4_activation(activation.bfloat16())
+            else:
+                mid, mid_sf = _requantize_fp4_fp4_activation(activation * route_weights.unsqueeze(-1))
+            grouped_mid = x.new_zeros((experts, m, mid.shape[-1]))
+            grouped_mid_sf = sf.new_full((experts, m, mid_sf.shape[-1]), 1 if self.routed_fp8_fp4 else 127)
+            grouped_mid[coordinates] = mid.view(torch.uint8)
             grouped_mid_sf[coordinates] = mid_sf
             l2 = gate_up.new_empty((experts, m, hidden))
-            self.gemm((grouped_mid, grouped_mid_sf), self.w2, None, l2, counts_cuda, m)
+            self._project(grouped_mid, grouped_mid_sf, self.w2, l2, counts_cuda, m)
             contributions = l2[coordinates].cpu()
         else:
             contributions = torch.empty((0, hidden), dtype=torch.bfloat16, device='cpu')
@@ -165,19 +183,36 @@ class ReferenceMoE:
         self.slots = slots.view(tokens, topk, hidden)
         result = (torch.zeros((tokens, hidden), dtype=torch.float32, device='cuda')
                   if bias is None else bias.float())
-        for contribution in self.slots.unbind(dim=1):
-            result.add_(contribution.float())
+        for slot, contribution in enumerate(self.slots.unbind(dim=1)):
+            values = contribution.float()
+            if self.routed_fp8_fp4:
+                valid_weight = weights[:tokens, slot].masked_fill(~valid[self.rank, slot:tokens * topk:topk].cuda(), 0.)
+                values = values * valid_weight[:, None]
+            result.add_(values)
         return result.bfloat16()
 
 
-def quant_ptpc(x):
+def quantize_fp8_fp8_ptpc(x):
     """E4M3 with one FP32 scale per activation token or weight channel."""
     x = x.float()
     scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1.e-10) / 448.
     return (x * scale.reciprocal()).clamp(-448., 448.).to(torch.float8_e4m3fn), scale
 
 
-class PTPCSharedExpert:
+def quantize_fp8_fp4_activation(x):
+    values = x.float()
+    scale = values.abs().amax(dim=-1, keepdim=True).clamp_min(1.e-10) * (1.0 / 448.0)
+    return (values * scale.reciprocal()).clamp(-448., 448.).to(torch.float8_e4m3fn), scale
+
+
+ROUTED_OPERATORS = {
+    'fp4_fp4': (quant_mxfp4, ppu_fp4_fp4_gc_moe),
+    'fp8_fp4': (quantize_fp8_fp4_activation, ppu_fp8_fp4_gc_moe),
+}
+ROUTED_PRECISION_LABELS = {'fp4_fp4': 'w4a4', 'fp8_fp4': 'w4a8'}
+
+
+class FP8FP8PTPCSharedExpert:
     """Independent shared expert with PPU DeepGEMM and a Torch SwiGLU reference."""
 
     def __init__(self, deep_gemm, w1, w2, capacity):
@@ -196,7 +231,7 @@ class PTPCSharedExpert:
                 gate = gate.clamp_max(clamp)
                 up = up.clamp(-clamp, clamp)
             gate = gate.float()
-            mid = quant_ptpc((gate * gate.sigmoid()).bfloat16() * up)
+            mid = quantize_fp8_fp8_ptpc((gate * gate.sigmoid()).bfloat16() * up)
             self.gemm(mid, self.w2, output)
         return output
 
@@ -207,7 +242,7 @@ def init_dist():
     return dist.group.WORLD
 
 
-def workload(rank, ranks, capacity, geometry, *, shared, skew=False):
+def workload(rank, ranks, capacity, geometry, *, shared_fp8_fp8_ptpc, skew=False):
     torch.manual_seed(20261109 + rank)
     device = 'cuda'
     hidden, intermediate, num_experts, topk = geometry
@@ -232,16 +267,19 @@ def workload(rank, ranks, capacity, geometry, *, shared, skew=False):
 
     shapes = ((2 * intermediate, hidden), (hidden, intermediate))
     routed = tuple(routed_weight(n, k) for n, k in shapes)
-    shared_weights = (tuple(quant_ptpc((torch.randn((n, k), device=device) * .02).bfloat16())
-                            for n, k in shapes) if shared else None)
-    return x, ids, weights, routed, shared_weights
+    shared_fp8_fp8_ptpc_weights = (
+        tuple(quantize_fp8_fp8_ptpc((torch.randn((n, k), device=device) * .02).bfloat16()) for n, k in shapes)
+        if shared_fp8_fp8_ptpc else None
+    )
+    return x, ids, weights, routed, shared_fp8_fp8_ptpc_weights
 
 
-def make_workspace(group, capacity, geometry, *, shared):
+def make_workspace(group, capacity, geometry, *, routed_precision, shared_fp8_fp8_ptpc):
     hidden, intermediate, num_experts, topk = geometry
     return get_symm_buffer_for_gc_moe_ppu(
         group, num_experts, capacity, topk, hidden, intermediate,
-        num_shared_experts=int(shared), shared_fp8=shared, graph_safe=True)
+        num_shared_experts=int(shared_fp8_fp8_ptpc), shared_fp8_fp8_ptpc=shared_fp8_fp8_ptpc,
+        graph_safe=True, routed_precision=routed_precision)
 
 
 def stage(workspace, packed, scales, ids, weights, shared_inputs):
@@ -263,15 +301,18 @@ def _cosine(left, right):
 
 
 def _mega_metrics(result, actual, routed_ref, shared_ref, shared_output, hidden_states,
-                  ids, weights, mega, mega_weights, clamp, group):
+                  ids, weights, mega, mega_weights, clamp, group, *, routed_precision):
     import deep_gemm
 
     tokens = actual.size(0)
     mega_output = torch.empty_like(actual, memory_format=torch.contiguous_format)
+    routed_fp8_fp4 = routed_precision == 'fp8_fp4'
+    mega_options = {'mma_type': 'fp8xfp4'} if routed_fp8_fp4 else {}
     deep_gemm.mega_moe_pre_dispatch(hidden_states[:tokens], ids[:tokens], weights[:tokens],
                                    mega.x, mega.x_sf, mega.topk_idx, mega.topk_weights,
-                                   num_tokens=tokens)
-    deep_gemm.fp4_fp4_mega_moe(mega_output, *mega_weights, mega, activation_clamp=clamp)
+                                   num_tokens=tokens, **mega_options)
+    decode_mega = deep_gemm.fp8_fp4_mega_moe if routed_fp8_fp4 else deep_gemm.fp4_fp4_mega_moe
+    decode_mega(mega_output, *mega_weights, mega, activation_clamp=clamp)
     expected = routed_ref
     cosine = {}
     errors = {}
@@ -299,7 +340,7 @@ def _mega_metrics(result, actual, routed_ref, shared_ref, shared_output, hidden_
     result['mega_finite_ranks'] = int(finite_ranks)
 
 
-def check(args, group, *, shared, readiness=False):
+def check(args, group, *, routed_precision, shared_fp8_fp8_ptpc, readiness=False):
     import deep_gemm
 
     rank, ranks = group.rank(), group.size()
@@ -308,7 +349,7 @@ def check(args, group, *, shared, readiness=False):
     if args.asymmetric:
         vectors += [tuple((rank + 1) % (args.capacity + 1) for rank in range(ranks)),
                     (args.capacity,) + (0,) * (ranks - 1)]
-        if readiness and not shared and ranks > 1:
+        if readiness and not shared_fp8_fp8_ptpc and ranks > 1:
             vectors.append((min(8, args.capacity),) + (0,) * (ranks - 1))
     cases_per_round = len(vectors)
     vectors *= args.replays
@@ -316,35 +357,44 @@ def check(args, group, *, shared, readiness=False):
         raise ValueError('every token count must fit capacity')
     geometry = MODEL_PRESETS[args.model]
     hidden, intermediate, num_experts, topk = geometry
-    x, ids, weights, routed, shared_weights = workload(rank, ranks, args.capacity, geometry,
-                                                     shared=shared, skew=args.skew)
+    x, ids, weights, routed, shared_fp8_fp8_ptpc_weights = workload(
+        rank, ranks, args.capacity, geometry, shared_fp8_fp8_ptpc=shared_fp8_fp8_ptpc, skew=args.skew)
     if args.mask:
         ids[::2, 0] = -1
         ids[::3, min(1, topk - 1)] = num_experts
         weights[::2, min(2, topk - 1)] = 0
-    packed, scales = quant_mxfp4(x)
-    shared_inputs = quant_ptpc(x) if shared else None
-    ref = ReferenceMoE(deep_gemm, *routed[0], *routed[1], rank, ranks)
-    shared_ref = PTPCSharedExpert(deep_gemm, *shared_weights, args.capacity) if shared else None
+    routed_fp8_fp4 = routed_precision == 'fp8_fp4'
+    quantize_routed, decode_routed = ROUTED_OPERATORS[routed_precision]
+    packed, scales = quantize_routed(x)
+    shared_inputs = quantize_fp8_fp8_ptpc(x) if shared_fp8_fp8_ptpc else None
+    ref = ReferenceMoE(deep_gemm, *routed[0], *routed[1], rank, ranks, routed_precision=routed_precision)
+    shared_ref = (FP8FP8PTPCSharedExpert(deep_gemm, *shared_fp8_fp8_ptpc_weights, args.capacity)
+                  if shared_fp8_fp8_ptpc else None)
     mega = None
     if args.compare_mega:
-        mega = deep_gemm.get_symm_buffer_for_mega_moe(group, num_experts, args.capacity, topk, hidden, intermediate)
-        mega_weights = deep_gemm.transform_weights_for_mega_moe(*routed)
+        mega_options = {'mma_type': 'fp8xfp4'} if routed_fp8_fp4 else {}
+        mega = deep_gemm.get_symm_buffer_for_mega_moe(group, num_experts, args.capacity, topk, hidden, intermediate,
+                                                     **mega_options)
+        mega_transform = (deep_gemm.transform_weights_for_w4a8_mega_moe if routed_fp8_fp4
+                          else deep_gemm.transform_weights_for_mega_moe)
+        mega_weights = mega_transform(*routed)
         # Both paths ignore invalid routes. MegaMoE uses -1 for masked slots.
         mega_ids = ids.masked_fill((ids < 0) | (ids >= num_experts), -1)
         mega_inputs = (x, mega_ids)
         mega_alternate = (x.flip(0), mega_ids.flip(0)) if args.replays > 1 else None
-    routed = transform_weights_for_gc_moe_ppu(*routed)
-    shared_w1, shared_w2 = transform_weights_for_gc_moe_ppu(*shared_weights) if shared else (None, None)
-    workspace = make_workspace(group, args.capacity, geometry, shared=shared)
+    packed_routed_weights = transform_weights_for_gc_moe_ppu(*routed, routed_precision=routed_precision)
+    shared_w1, shared_w2 = (transform_weights_for_gc_moe_ppu(*shared_fp8_fp8_ptpc_weights)
+                            if shared_fp8_fp8_ptpc else (None, None))
+    workspace = make_workspace(group, args.capacity, geometry, routed_precision=routed_precision,
+                               shared_fp8_fp8_ptpc=shared_fp8_fp8_ptpc)
     inputs = (packed, scales, ids, weights, shared_inputs)
     alternate = None
     if args.replays > 1:
         flipped_shared = None
-        if shared:
+        if shared_fp8_fp8_ptpc:
             fp8, sf = shared_inputs
             flipped_shared = fp8.view(torch.uint8).flip(0).view(torch.float8_e4m3fn), sf.flip(0)
-        alternate = (packed.flip(0), scales.flip(0), ids.flip(0), weights.flip(0), flipped_shared)
+        alternate = (packed.view(torch.uint8).flip(0).view(packed.dtype), scales.flip(0), ids.flip(0), weights.flip(0), flipped_shared)
 
     out_storage = torch.empty(x.numel() + 2, dtype=x.dtype, device=x.device)
     experts = num_experts // ranks
@@ -366,8 +416,8 @@ def check(args, group, *, shared, readiness=False):
             out_storage.fill_(float('nan'))
             before = stats.clone()
             def step():
-                ppu_fp4_fp4_gc_moe(
-                    out[:tokens], *routed, workspace, stats, activation_clamp=args.clamp,
+                decode_routed(
+                    out[:tokens], *packed_routed_weights, workspace, stats, activation_clamp=args.clamp,
                     num_tokens_bound=bound, shared_l1_weights=shared_w1, shared_l2_weights=shared_w2)
 
             if args.graph:
@@ -392,8 +442,8 @@ def check(args, group, *, shared, readiness=False):
 
             routed_expected = ref(packed[:bound], scales[:bound], ids[:bound], weights[:bound],
                                   counts, clamp=args.clamp)
-            shared_expected = shared_ref(tokens, shared_inputs, clamp=args.clamp) if shared else None
-            expected = routed_expected + shared_expected if shared else routed_expected
+            shared_expected = shared_ref(tokens, shared_inputs, clamp=args.clamp) if shared_fp8_fp8_ptpc else None
+            expected = routed_expected + shared_expected if shared_fp8_fp8_ptpc else routed_expected
             actual = out[:tokens]
             visible = _gather(ids[:bound], ranks)
             valid = torch.arange(bound)[None, :, None] < torch.tensor(counts)[:, None, None]
@@ -406,7 +456,7 @@ def check(args, group, *, shared, readiness=False):
                 returns = _unpack_down_output(workspace._returns[:tokens])
                 differences = (returns != ref.slots).any(dim=-1) & valid_slots
                 shared_debug = ''
-                if shared:
+                if shared_fp8_fp8_ptpc:
                     shared_output = _unpack_down_output(workspace._shared_scratch[-1][:tokens])
                     error = (shared_output.float() - shared_expected.float()).abs().max().item()
                     shared_debug = f'shared max_abs={error} '
@@ -415,14 +465,14 @@ def check(args, group, *, shared, readiness=False):
                       f'stats_match={torch.equal(received, expected_stats)}', flush=True)
             output_guard = (bool(torch.isnan(out_storage[:offset]).all())
                             and bool(torch.isnan(out_storage[offset + actual.numel():]).all()))
-            shared_inputs_match = not shared or (
+            shared_inputs_match = not shared_fp8_fp8_ptpc or (
                 torch.equal(workspace.shared_x.view(torch.uint8), shared_inputs[0].view(torch.uint8))
                 and torch.equal(workspace.shared_x_sf, shared_inputs[1])
             )
             checks = torch.tensor([
                 torch.equal(actual, expected), output_guard,
                 torch.equal((stats - before).cpu(), expected_stats),
-                bool(torch.isfinite(actual).all()), torch.equal(workspace.x, packed),
+                bool(torch.isfinite(actual).all()), torch.equal(workspace.x.view(torch.uint8), packed.view(torch.uint8)),
                 torch.equal(workspace.x_sf, scales), torch.equal(workspace.topk_idx, ids),
                 torch.equal(workspace.topk_weights, weights), shared_inputs_match,
             ], dtype=torch.int32, device='cpu')
@@ -436,9 +486,10 @@ def check(args, group, *, shared, readiness=False):
                           passed=bool(checks.all()), output_guard=bool(checks[1]), stats=bool(checks[2]),
                           rank_passes=int(rank_counts[0]), finite_ranks=int(rank_counts[1]))
             if mega is not None and bound:
-                shared_output = _unpack_down_output(workspace._shared_scratch[-1][:tokens]) if shared else None
+                shared_output = _unpack_down_output(workspace._shared_scratch[-1][:tokens]) if shared_fp8_fp8_ptpc else None
                 _mega_metrics(result, actual, routed_expected, shared_expected, shared_output,
-                              mega_x, mega_topk, weights, mega, mega_weights, args.clamp, group)
+                              mega_x, mega_topk, weights, mega, mega_weights, args.clamp, group,
+                              routed_precision=routed_precision)
             results.append(result)
             if rank == 0:
                 print(json.dumps(result), flush=True)
@@ -451,12 +502,14 @@ def check(args, group, *, shared, readiness=False):
             mega.destroy()
 
 
-def main(*, shared=False, readiness=False):
+def main(*, routed_precision, shared_fp8_fp8_ptpc=False, readiness=False):
+    precision = ROUTED_PRECISION_LABELS[routed_precision].upper()
+    variant = 'fused SE' if shared_fp8_fp8_ptpc else 'routed'
     if readiness:
-        variant = 'fused SE' if shared else 'routed'
-        description = f'PPU {variant} readiness with alternating inputs and workspace reuse.'
+        description = f'PPU {precision} {variant} readiness with alternating inputs and workspace reuse.'
     else:
-        description = 'PPU fused shared-expert accuracy against grouped GEMM and PTPC GEMM.' if shared else __doc__
+        reference = 'grouped GEMM and PTPC GEMM' if shared_fp8_fp8_ptpc else 'grouped GEMM'
+        description = f'PPU {precision} {variant} accuracy against {reference}.'
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument('--model', choices=MODEL_PRESETS, default='dsv4.1-flash')
     parser.add_argument('--capacity', type=int, default=MAX_TOKENS)
@@ -487,7 +540,7 @@ def main(*, shared=False, readiness=False):
             if args.model == 'dsv4.1-flash':
                 args.tokens = FLASH41_READINESS_TOKENS
             else:
-                args.tokens = FLASH_SE_READINESS_TOKENS if shared else FLASH_ROUTED_READINESS_TOKENS
+                args.tokens = FLASH_SE_READINESS_TOKENS if shared_fp8_fp8_ptpc else FLASH_ROUTED_READINESS_TOKENS
         if args.calls_per_case < 1:
             parser.error('expected positive calls per case')
     if not 1 <= args.capacity <= MAX_TOKENS or args.replays < 1:
@@ -496,10 +549,12 @@ def main(*, shared=False, readiness=False):
     try:
         stream = torch.cuda.Stream() if args.side_stream else torch.cuda.current_stream()
         with torch.cuda.stream(stream):
-            results = check(args, group, shared=shared, readiness=readiness)
+            results = check(args, group, routed_precision=routed_precision,
+                            shared_fp8_fp8_ptpc=shared_fp8_fp8_ptpc, readiness=readiness)
         all_pass = all(row['passed'] for row in results)
         if args.output_json and group.rank() == 0:
-            report = (dict(model=args.model, shared_expert=shared, ranks=group.size(),
+            report = (dict(model=args.model, shared_expert=shared_fp8_fp8_ptpc, ranks=group.size(),
+                           routed_precision=ROUTED_PRECISION_LABELS[routed_precision],
                            readiness_mode=args.mode, readiness_steps=args.replays,
                            checked_cases_per_rank=len(results), all_pass=all_pass, results=results)
                       if readiness else results)
@@ -509,7 +564,3 @@ def main(*, shared=False, readiness=False):
             raise SystemExit(1)
     finally:
         dist.destroy_process_group()
-
-
-if __name__ == '__main__':
-    main()

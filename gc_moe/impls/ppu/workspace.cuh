@@ -5,6 +5,12 @@
 namespace gc_moe {
 
 constexpr int H = GC_MOE_HIDDEN, I = GC_MOE_INTERMEDIATE;
+#ifndef GC_MOE_ROUTED_FP8_FP4
+#define GC_MOE_ROUTED_FP8_FP4 0
+#endif
+constexpr bool RoutedFP8_FP4 = GC_MOE_ROUTED_FP8_FP4;
+constexpr int RoutedActivationBytes = RoutedFP8_FP4 ? H : H / 2;
+constexpr int RoutedScaleBytes = RoutedFP8_FP4 ? sizeof(float) : H / 32;
 #ifndef GC_MOE_MAX_RANKS
 #define GC_MOE_MAX_RANKS 8
 #endif
@@ -28,9 +34,10 @@ constexpr int BlockN = 128;
 constexpr int PageExperts = Experts / MaxRanks;
 constexpr bool CanPage = Experts % MaxRanks == 0 && PageExperts <= 64;
 constexpr int PageMinWarps = CanPage ? (PageExperts + 31) / 32 : 1;
-constexpr int ScaleWordsPerRow = H / 128;
+constexpr int ScaleWordsPerRow = RoutedScaleBytes / sizeof(uint32_t);
+constexpr int PageScaleBytes = (RoutedScaleBytes + 7) / 8 * 8;
 constexpr int AlignedTopK = (TopK + 1) & ~1;
-constexpr int PageMetadataBytes = (H / 32 + AlignedTopK * 8 + TopK * 4 + 127) / 128 * 128;
+constexpr int PageMetadataBytes = (PageScaleBytes + AlignedTopK * 8 + TopK * 4 + 127) / 128 * 128;
 constexpr int FullDownChunk = I % 256 == 0 ? 128 : 64;
 constexpr int GateStages = H / 128 % 5 == 0 ? 5 : 4;
 constexpr bool LongGate = H / 128 > 32;
@@ -76,7 +83,7 @@ struct Launch {
     int rank, ranks, capacity, tokens, bound, units;
     int x_offset, sf_offset, id_offset, weight_offset, return_offset, inbox_offset, inbox_ids_offset, aiu;
     int m_tiles;
-    float clamp;
+    float clamp, w1_inv_scale, w2_inv_scale;
 };
 
 struct Header {
@@ -92,11 +99,11 @@ struct Header {
 static_assert(sizeof(Header) == (5 * MaxRanks + 6) * sizeof(uint32_t));
 
 struct alignas(256) InboxRow {
-    uint4 x[H / 32];
-    uint4 sf[H / 512];
+    uint4 x[RoutedActivationBytes / sizeof(uint4)];
+    uint32_t sf[ScaleWordsPerRow];
     float weights[TopK];
 };
-static_assert(sizeof(InboxRow) == (H / 2 + H / 32 + TopK * sizeof(float) + 255) / 256 * 256);
+static_assert(sizeof(InboxRow) == (RoutedActivationBytes + RoutedScaleBytes + TopK * sizeof(float) + 255) / 256 * 256);
 
 __device__ __forceinline__ Header& header(const Launch& p, int rank) {
     return *reinterpret_cast<Header*>(p.peers[rank]);

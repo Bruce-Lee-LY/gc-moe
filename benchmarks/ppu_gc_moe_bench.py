@@ -1,24 +1,21 @@
-"""Time PPU routed decode against DeepGEMM-for-sail MegaMoE."""
+"""Shared benchmark driver for PPU GC MoE decode."""
 
 import argparse
 from importlib.metadata import version
 import json
 from pathlib import Path
 from statistics import mean, median
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 import torch.distributed as dist
 
-from benchmarks.ppu_shared_expert import SerialPTPCSharedExpert
-from gc_moe import ppu_fp4_fp4_gc_moe, transform_weights_for_gc_moe_ppu
+from benchmarks.ppu_shared_expert import SerialFP8FP8PTPCSharedExpert
+from gc_moe import transform_weights_for_gc_moe_ppu
 from gc_moe.layout.ppu_gc_moe import LOCAL_RANKS
 from gc_moe.ppu_gc import MAX_TOKENS
-from tests.test_ppu_gc_moe import (
-    DEFAULT_TOKENS, MODEL_PRESETS,
-    init_dist, make_workspace, quant_mxfp4, quant_ptpc, stage, workload,
+from tests.ppu_gc_moe_cases import (
+    DEFAULT_TOKENS, MODEL_PRESETS, ROUTED_OPERATORS, ROUTED_PRECISION_LABELS,
+    init_dist, make_workspace, quantize_fp8_fp8_ptpc, stage, workload,
 )
 
 
@@ -67,31 +64,41 @@ def measure(step, args, group):
     return {'median_us': median(slowest.tolist()), 'samples_us': slowest.tolist()}
 
 
-def run(args, group, *, shared):
+def run(args, group, *, routed_precision, shared_fp8_fp8_ptpc):
     rank, ranks = group.rank(), group.size()
     capacity = max(args.tokens)
     geometry = MODEL_PRESETS[args.model]
     hidden, intermediate, experts, topk = geometry
-    x, ids, route_weights, routed, shared_weights = workload(rank, ranks, capacity, geometry,
-                                                            shared=shared, skew=args.skew)
-    shared_inputs = quant_ptpc(x) if shared else None
+    routed_fp8_fp4 = routed_precision == 'fp8_fp4'
+    mega_options = {'mma_type': 'fp8xfp4'} if routed_fp8_fp4 else {}
+    quantize_routed, decode_routed = ROUTED_OPERATORS[routed_precision]
+    x, ids, route_weights, routed, shared_fp8_fp8_ptpc_weights = workload(
+        rank, ranks, capacity, geometry, shared_fp8_fp8_ptpc=shared_fp8_fp8_ptpc, skew=args.skew)
+    shared_inputs = quantize_fp8_fp8_ptpc(x) if shared_fp8_fp8_ptpc else None
     output = torch.empty_like(x)
     candidate = baseline = baseline_shared = None
-    baseline_name = 'mega_moe_ptpc' if shared else 'mega_moe'
+    baseline_name = 'mega_moe_ptpc' if shared_fp8_fp8_ptpc else 'mega_moe'
     try:
         if args.arm != 'baseline':
-            candidate = make_workspace(group, capacity, geometry, shared=shared)
-            candidate_weights = transform_weights_for_gc_moe_ppu(*routed)
-            shared_w1, shared_w2 = transform_weights_for_gc_moe_ppu(*shared_weights) if shared else (None, None)
-            packed, scales = quant_mxfp4(x)
+            candidate = make_workspace(group, capacity, geometry, routed_precision=routed_precision,
+                                       shared_fp8_fp8_ptpc=shared_fp8_fp8_ptpc)
+            packed_routed_weights = transform_weights_for_gc_moe_ppu(
+                *routed, routed_precision=candidate.routed_precision)
+            shared_w1, shared_w2 = (transform_weights_for_gc_moe_ppu(*shared_fp8_fp8_ptpc_weights)
+                                    if shared_fp8_fp8_ptpc else (None, None))
+            packed, scales = quantize_routed(x)
             stage(candidate, packed, scales, ids, route_weights, shared_inputs)
         if args.arm != 'gc':
             import deep_gemm
 
-            baseline = deep_gemm.get_symm_buffer_for_mega_moe(group, experts, capacity, topk, hidden, intermediate)
-            baseline_weights = deep_gemm.transform_weights_for_mega_moe(*routed)
-            if shared:
-                baseline_shared = SerialPTPCSharedExpert(deep_gemm, *shared_weights, capacity)
+            baseline = deep_gemm.get_symm_buffer_for_mega_moe(group, experts, capacity, topk, hidden, intermediate,
+                                                             **mega_options)
+            baseline_transform = (deep_gemm.transform_weights_for_w4a8_mega_moe if routed_fp8_fp4
+                                  else deep_gemm.transform_weights_for_mega_moe)
+            baseline_decode = deep_gemm.fp8_fp4_mega_moe if routed_fp8_fp4 else deep_gemm.fp4_fp4_mega_moe
+            baseline_weights = baseline_transform(*routed)
+            if shared_fp8_fp8_ptpc:
+                baseline_shared = SerialFP8FP8PTPCSharedExpert(deep_gemm, *shared_fp8_fp8_ptpc_weights, capacity)
 
         rows = []
         for t in args.tokens:
@@ -99,14 +106,13 @@ def run(args, group, *, shared):
             shared_step = baseline_shared.bind(t, shared_inputs, args.clamp) if baseline_shared is not None else None
 
             def gc_step():
-                ppu_fp4_fp4_gc_moe(y, *candidate_weights, candidate, activation_clamp=args.clamp,
-                                    num_tokens_bound=t, shared_l1_weights=shared_w1,
-                                    shared_l2_weights=shared_w2)
+                decode_routed(y, *packed_routed_weights, candidate, activation_clamp=args.clamp,
+                              num_tokens_bound=t, shared_l1_weights=shared_w1, shared_l2_weights=shared_w2)
 
             def baseline_step():
                 deep_gemm.mega_moe_pre_dispatch(hidden_states, route_ids, weights, baseline.x, baseline.x_sf,
-                                               baseline.topk_idx, baseline.topk_weights, num_tokens=t)
-                deep_gemm.fp4_fp4_mega_moe(y, *baseline_weights, baseline, activation_clamp=args.clamp)
+                                               baseline.topk_idx, baseline.topk_weights, num_tokens=t, **mega_options)
+                baseline_decode(y, *baseline_weights, baseline, activation_clamp=args.clamp)
                 if shared_step is not None:
                     y.add_(shared_step())
 
@@ -123,7 +129,8 @@ def run(args, group, *, shared):
         report = {
             'device': torch.cuda.get_device_name(), 'torch': str(torch.__version__),
             'deep_gemm': version('deep-gemm') if baseline is not None else None,
-            'model': args.model, 'shared_expert': shared,
+            'model': args.model, 'shared_expert': shared_fp8_fp8_ptpc,
+            'routed_precision': ROUTED_PRECISION_LABELS[routed_precision],
             'hidden': hidden, 'intermediate': intermediate, 'experts': experts, 'topk': topk,
             'ranks': ranks, 'mode': args.mode,
             'warmup': args.warmup, 'iterations': args.iters, 'repeats': args.repeats,
@@ -132,7 +139,7 @@ def run(args, group, *, shared):
             'activation_clamp': args.clamp, 'skew': args.skew, 'results': rows,
         }
         if baseline_shared is not None:
-            report['baseline_shared_swiglu'] = 'native_ptpc'
+            report['baseline_shared_swiglu'] = 'sglang_sail_silu_and_mul_post_per_token_quant_fp8'
         if args.mode == 'graph' and ranks > LOCAL_RANKS:
             report['timing'] = 'graph_events_after_decode_rendezvous'
         if baseline is not None and candidate is not None:
@@ -156,8 +163,11 @@ def run(args, group, *, shared):
             baseline.destroy()
 
 
-def main(*, shared=False):
-    description = 'Time PPU fused SE against MegaMoE plus serial PTPC SE.' if shared else __doc__
+def main(*, routed_precision, shared_fp8_fp8_ptpc=False):
+    precision = ROUTED_PRECISION_LABELS[routed_precision].upper()
+    variant = 'fused SE' if shared_fp8_fp8_ptpc else 'routed decode'
+    baseline = 'MegaMoE plus serial PTPC SE' if shared_fp8_fp8_ptpc else 'MegaMoE'
+    description = f'Time PPU {precision} {variant} against {baseline}.'
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument('--model', choices=MODEL_PRESETS, default='dsv4.1-flash')
     parser.add_argument('--tokens', type=int, nargs='+', default=DEFAULT_TOKENS)
@@ -174,13 +184,9 @@ def main(*, shared=False):
         parser.error(f'expected 1–{MAX_TOKENS} tokens, a nonnegative warmup and positive iterations and repeats')
     group = init_dist()
     try:
-        report = run(args, group, shared=shared)
+        report = run(args, group, routed_precision=routed_precision, shared_fp8_fp8_ptpc=shared_fp8_fp8_ptpc)
         if args.output_json and group.rank() == 0:
             args.output_json.parent.mkdir(parents=True, exist_ok=True)
             args.output_json.write_text(json.dumps(report, indent=2) + '\n')
     finally:
         dist.destroy_process_group()
-
-
-if __name__ == '__main__':
-    main()
