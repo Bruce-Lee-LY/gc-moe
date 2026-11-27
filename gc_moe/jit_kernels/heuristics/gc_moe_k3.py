@@ -17,6 +17,7 @@ from ...layout.gc_moe_k3 import (
     FINALIZE_ROLE,
     WORKER_ROLES,
     FINALIZE_THREADS,
+    SMALL_LOCAL_EXPERT_TABLE_MAX,
     SharedStorageLayout,
     align,
     ceil_div,
@@ -36,6 +37,15 @@ def _f32(value):
 def get_block_m_for_gc_moe_k3(num_ranks: int, num_experts: int,
                            num_max_tokens_per_rank: int, num_tokens: int,
                            num_topk: int, mma_type: str = 'fp8xfp4') -> int:
+    return get_routed_block_sizes(num_ranks, num_experts, num_max_tokens_per_rank,
+                                  num_tokens, num_topk, mma_type)[0]
+
+
+@lru_cache(maxsize=256)
+def get_routed_block_sizes(num_ranks: int, num_experts: int,
+                           num_max_tokens_per_rank: int, num_tokens: int,
+                           num_topk: int, mma_type: str = 'fp8xfp4') -> tuple[int, int]:
+    """Choose the routed MMA width and the M width used to size epilogue stores."""
     if (num_ranks <= 0 or num_experts <= 0 or num_experts % num_ranks or
             num_tokens < 0 or num_tokens > num_max_tokens_per_rank or
             num_topk <= 0 or num_topk > min(32,num_experts) or mma_type != 'fp8xfp4'):
@@ -44,10 +54,11 @@ def get_block_m_for_gc_moe_k3(num_ranks: int, num_experts: int,
     expected = _f32(_f32(_f32(_f32(num_tokens) * _f32(num_ranks))
                                 * _f32(num_topk)) / _f32(num_experts))
     covered = _f32(expected + _f32(sqrt(expected)))
+    local_experts = num_experts // num_ranks
     block_m = 16 if expected <= 10 else 32
     if expected > 24:
         num_blocks = ceil(_f32(covered / 240))
-        if num_blocks == 1 and covered > 192 and num_experts // num_ranks < 14:
+        if num_blocks == 1 and covered > 192 and local_experts < 14:
             num_blocks = 2
         for candidate in CANDIDATE_BLOCK_M:
             if candidate < 64:
@@ -81,18 +92,33 @@ def get_block_m_for_gc_moe_k3(num_ranks: int, num_experts: int,
         peak = next((m for m in CANDIDATE_BLOCK_M if m >= covered_peak),
                     CANDIDATE_BLOCK_M[-1])
         if shared_m > 4 * atom:
-            # Keep the normal routed sizing if the skew estimate would
-            # already fill the shared tile. Padding a wider tile in that
-            # regime consumes TMA stages without keeping the rings aligned.
             if covered_peak <= shared_m:
                 block_m = max(block_m, shared_m // 2, peak)
+            elif block_m < shared_m:
+                # With a single shared tile, adjacent widths can share the data
+                # ring. Keep W1 and W2 stores at their original row granularity.
+                next_m = next(m for m in ROUTED_BLOCK_M if m > block_m)
+                if num_tokens <= shared_m and next_m == shared_m:
+                    return shared_m, block_m
         elif atom // 2 <= covered <= atom:
             # With roughly one routed atom per expert, the larger tile
             # also gives Dispatch room to widen its reservation traversal.
             block_m = max(block_m, min(2 * shared_m, 4 * atom))
         else:
             block_m = max(block_m, min(shared_m, max(2 * atom, peak)))
-    return max(ROUTED_BLOCK_M[0], block_m)
+    min_routed_m = ROUTED_BLOCK_M[0]
+    block_m = max(min_routed_m, block_m)
+    wide_routed_m = 2 * min_routed_m
+    shared_m = get_shared_block_m(block_m, num_tokens)
+    if shared_m == num_tokens and block_m < wide_routed_m:
+        # A full shared tile leaves room to group more routed rows per task.
+        # Promote more routed shapes when the estimated load per expert
+        # reaches one MMA atom and Dispatch can use its wider pull path.
+        between_tiles = block_m == min_routed_m and block_m < shared_m < wide_routed_m
+        can_widen_dispatch = local_experts <= SMALL_LOCAL_EXPERT_TABLE_MAX
+        if between_tiles or (expected >= atom and can_widen_dispatch):
+            return wide_routed_m, block_m
+    return block_m, block_m
 
 
 def get_shared_block_m(block_m: int, tokens: int) -> int:
@@ -194,10 +220,11 @@ def get_role_config(role: int, block_m: int, num_experts: int,
     store2 = 8 if block_m == 240 else store1
     # Large local expert tables need 96 registers per dispatch thread.
     # Keep that path within the per-SM register budget.
-    routing_warps = (24 if local_experts <= 64 else 12) if block_m >= 96 else 8
+    small_expert_table = local_experts <= SMALL_LOCAL_EXPERT_TABLE_MAX
+    routing_warps = (24 if small_expert_table else 12) if block_m >= 96 else 8
     if role == DISPATCH_ROLE and 64 <= block_m < 96 and route_entries >= 16 * 32:
         # Widen only if one CTA can afford both its registers and TMA pull rows.
-        dispatch_registers = 48 if local_experts <= 64 else 96
+        dispatch_registers = 48 if small_expert_table else 96
         expanded_layout = get_role_shared_layout(
             role, block_m, num_experts, pull_bytes, 2,
             store_m_l1=store1, store_m_l2=store2, dispatch_warps=16,

@@ -35,6 +35,8 @@ TOKEN_ALIGNMENT = 16
 MAX_RANKS = 72
 MAX_EXPERTS = 2048
 MAX_EXPERTS_PER_RANK = 512
+# Keep host launch sizing and device register tiers on the same threshold.
+SMALL_LOCAL_EXPERT_TABLE_MAX = 64
 MAX_RING_BLOCKS = 1 << 20
 MAX_SHARED_L2_BLOCKS = 1 << 15
 # Accumulator barriers reserved here; the compute role indexes them by

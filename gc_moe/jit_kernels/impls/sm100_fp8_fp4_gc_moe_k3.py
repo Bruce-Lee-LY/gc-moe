@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import inf
 import os
 from pathlib import Path
@@ -507,7 +507,7 @@ def _capture_key(config, sym_buffer, green_context, y, l1_weights, l2_weights,
             tuple(sym_buffer.peer_addresses), sym_buffer.rank_idx,
             sym_buffer.group.size(), sym_buffer.num_experts,
             sym_buffer.num_max_tokens_per_rank,
-            config.tokens, config.block_m, config.hidden, config.intermediate,
+            config.tokens, config.block_m, config.store_block_m, config.hidden, config.intermediate,
             config.local_experts, config.shared_experts,
             config.shared_hidden, config.shared_intermediate,
             config.beta, config.linear_beta, config.clamp != inf,
@@ -625,6 +625,11 @@ def prepare_role_binaries(config, y: torch.Tensor,
     routed_block_m = config.block_m if config.block_m < shared_block_m <= 128 else None
     epilogue_config = get_role_config(COMPUTE_ROLE, config.block_m, sym_buffer.num_experts,
                                       config.hidden, local_experts=config.local_experts)
+    if config.store_block_m != config.block_m:
+        store_config = get_role_config(COMPUTE_ROLE, config.store_block_m, sym_buffer.num_experts,
+                                       config.hidden, local_experts=config.local_experts)
+        epilogue_config = replace(epilogue_config, store_m_l1=store_config.store_m_l1,
+                                  store_m_l2=store_config.store_m_l2)
     role_configs = tuple(get_role_config(
         role, storage_block_m if role == COMPUTE_ROLE else config.block_m,
         sym_buffer.num_experts, config.hidden, local_experts=config.local_experts,

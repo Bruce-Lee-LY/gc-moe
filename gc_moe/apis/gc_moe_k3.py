@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from math import inf, isfinite
 from typing import TYPE_CHECKING
 import torch
-from ..jit_kernels.heuristics.gc_moe_k3 import get_block_m_for_gc_moe_k3
+from ..jit_kernels.heuristics.gc_moe_k3 import get_routed_block_sizes
 
 if TYPE_CHECKING:
     from ..gc_k3 import GCK3SymmBuffer
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 class ValidatedCall:
     tokens: int
     block_m: int
+    store_block_m: int
     hidden: int
     intermediate: int
     local_experts: int
@@ -103,9 +104,10 @@ def _validate_call(out, t, l1_weights, l2_weights, sym_buffer, shared_x, shared_
             raise ValueError('expert weights must be disjoint from output and workspace')
     if _overlaps(shared_x, shared_output):
         raise ValueError('shared input and workspace output must not overlap')
-    bm = get_block_m_for_gc_moe_k3(sym_buffer.group.size(), sym_buffer.num_experts,
-                                  sym_buffer.num_max_tokens_per_rank, t, sym_buffer.num_topk)
-    return ValidatedCall(t, bm, h, i, e, sym_buffer.num_shared_experts, hs, si,
+    block_m, store_block_m = get_routed_block_sizes(
+        sym_buffer.group.size(), sym_buffer.num_experts, sym_buffer.num_max_tokens_per_rank,
+        t, sym_buffer.num_topk, sym_buffer.mma_type)
+    return ValidatedCall(t, block_m, store_block_m, h, i, e, sym_buffer.num_shared_experts, hs, si,
                          clamp, beta, linear, bool(fast_math))
 
 

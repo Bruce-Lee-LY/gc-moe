@@ -51,6 +51,7 @@ from ..layout.gc_moe_k3 import (
     MAX_EXPERTS_PER_RANK,
     MAX_RANKS,
     SIGNAL_OFFSETS,
+    SMALL_LOCAL_EXPERT_TABLE_MAX,
 )
 from ..layout.sym_buffer import mapped_peer_base
 from ..mma.sm100 import (
@@ -1069,8 +1070,10 @@ class GCK3MoERoleKernel:
         self.cd_bytes = max(self.cd_l1_bytes, self.cd_l2_bytes)
         # float2[kNumEpilogueWarps][STORE_BLOCK_M_L1 / 2].
         self.amax_float_count = 8 * self.store_m_l1
-        self.non_epi_registers = 40 if local_experts <= 64 else 72
-        self.epi_registers = 208 if local_experts <= 64 else 168
+        small_expert_table = local_experts <= SMALL_LOCAL_EXPERT_TABLE_MAX
+        self.dispatch_registers = 48 if small_expert_table else 96
+        self.non_epi_registers = 40 if small_expert_table else 72
+        self.epi_registers = 208 if small_expert_table else 168
         tile = MixedMmaTile(storage_block_m, hidden, intermediate)
         self.l1_clusters = tile.l1_clusters
         self.l2_clusters = tile.l2_clusters
@@ -1082,11 +1085,10 @@ class GCK3MoERoleKernel:
         self.sf_block_m = role_config.sf_block_m
         self.sfa_tmem_cols = tile.sfa_tmem_cols
         self.dispatch_warps = role_config.routing_warps
-        dispatch_registers = 48 if local_experts <= 64 else 96
         role_registers = (
-            self.dispatch_warps * 32 * dispatch_registers if role == DISPATCH_ROLE else
+            self.dispatch_warps * 32 * self.dispatch_registers if role == DISPATCH_ROLE else
             128 * self.non_epi_registers + 256 * self.epi_registers if role == COMPUTE_ROLE else
-            128 * dispatch_registers + (COMBINE_WARPS * 32) * self.epi_registers)
+            128 * self.dispatch_registers + (COMBINE_WARPS * 32) * self.epi_registers)
         if role_registers > 64512:
             raise ValueError('role register allocation exceeds the SM budget')
         self.pull_bytes = role_config.pull_bytes
@@ -1278,7 +1280,7 @@ class GCK3MoERoleKernel:
                 signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4,
                 Uint32(1))
         if cutlass.const_expr(not self.projection_tile_rows):
-            warpgroup_reg_dealloc(48 if self.local_experts <= 64 else 96)
+            warpgroup_reg_dealloc(self.dispatch_registers)
 
         if block == 0:
             if cutlass.const_expr(not self.single_cta_routes):
@@ -1575,7 +1577,7 @@ class GCK3MoERoleKernel:
             pull = cute.recast_ptr(slab + self.shared_layout.pull, dtype=Uint32)
             pull_bar = cute.recast_ptr(slab + self.shared_layout.dispatch_bars, dtype=Uint64)
             self._initialize_shared_storage(slab, Uint32(physical_warp), Uint32(lane))
-            warpgroup_reg_dealloc(48 if self.local_experts <= 64 else 96)
+            warpgroup_reg_dealloc(self.dispatch_registers)
             # Dual-buffered receive signals: replay N publishes and reads
             # generation parity & 1; finalize flips the persistent parity
             # word after consuming each replay, and the replay that retires
