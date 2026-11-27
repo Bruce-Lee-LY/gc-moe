@@ -11,6 +11,11 @@ __device__ __forceinline__ int paired_scale_row(int row) {
     return (row / 16) * 16 + (row % 8) * 2 + (row % 16) / 8;
 }
 
+// In each M16 panel, keep two adjacent K scales together for each row pair.
+__device__ __forceinline__ int packed_gate_scale_index(int row_pair, int column) {
+    return (column / 2 * 8 + row_pair) * 2 + column % 2;
+}
+
 template <int TileRows, int Chunk>
 __device__ __forceinline__ void copy_swizzled_rows(uint8_t* dst, const uint8_t* src, int rows, int stride) {
     const uint32_t address = __cvta_generic_to_shared(dst);
@@ -45,7 +50,7 @@ __device__ __forceinline__ uint4 matrix_fragment(const uint8_t* src) {
 
 template <int M, int N, int KBytes, bool FP4 = true, int ChunkBytes = (M == 16 ? 128 : 64),
           int StageCount = 3, bool PairedScales = false, int RowPanels = 1, bool CycleStages = false, bool MaskScales = false,
-          bool SplitColumns = false, int ScaleStrideRows = M, int PacketWidth = 0, bool FP8_FP4 = false, int WarpN = 64, bool Gate = false, int AStride = KBytes>
+          bool SplitColumns = false, int ScaleStrideRows = M, int PacketWidth = 0, bool FP8_FP4 = false, int WarpN = 64, bool Gate = false, int AStride = KBytes, bool CachedAScales = false>
 struct BlockProject {
     static constexpr int MPanels = RowPanels;
     static constexpr int NWarps = N / WarpN;
@@ -61,6 +66,7 @@ struct BlockProject {
     static constexpr int Chunk = ChunkBytes;
     static constexpr int Slices = Chunk / 32;
     static_assert(!FP8_FP4 || (!FP4 && Chunk >= 64));
+    static_assert(!CachedAScales || (FP4 && MaskScales));
     static constexpr int BWords = WeightPanels * (FP8_FP4 ? 16 : 32);
     static constexpr int ScaleWords = FP8_FP4 ? 4 : 8;
 
@@ -150,7 +156,7 @@ struct BlockProject {
         auto issue = [&](int k, GroupStage& stage) {
             if (group_warp == 0 && lane == 0) {
                 copy_swizzled_rows<M, Chunk>(stage.a, a + k * Chunk, rows, AStride);
-                if constexpr (FP4) {
+                if constexpr (FP4 && !CachedAScales) {
                     const int scale_rows = PairedScales ? (rows + 15) / 16 * 16 : rows;
                     copy_a_scales<M, Slices, ScaleStrideRows>(stage.sa, sa + k * Slices * ScaleStrideRows, scale_rows);
                 }
@@ -171,7 +177,7 @@ struct BlockProject {
         #pragma unroll
         for (int k = 0; k < Ahead; ++k)
             issue(k, stages[k]);
-        auto compute = [&](const GroupStage& stage) {
+        auto compute = [&](const GroupStage& stage, int k) {
             #pragma unroll
             for (int slice = 0; slice < Slices; ++slice) {
                 uint4 av[RowPanels];
@@ -181,13 +187,21 @@ struct BlockProject {
                     const int row = (warp_m * RowPanels + m) * 16;
                     av[m] = matrix_fragment<Chunk>(stage.a + row * Chunk + slice * 32);
                     if constexpr (FP4) {
-                        const auto* scale = stage.sa + slice * M + row;
-                        if constexpr (PairedScales) {
-                            asf[m] = reinterpret_cast<const uint32_t*>(scale)[lane / 4];
-                            if constexpr (MaskScales)
-                                asf[m] &= scale_masks[m];
+                        if constexpr (CachedAScales) {
+                            const int k_index = k * Slices + slice;
+                            const auto* scales = reinterpret_cast<const uint32_t*>(sa);
+                            const int panel_base = (row / 16) * (KBytes / 32) * 8;
+                            asf[m] = scales[panel_base + packed_gate_scale_index(lane / 4, k_index)];
+                            asf[m] &= scale_masks[m];
                         } else {
-                            asf[m] = scale[lane / 4] | (uint32_t(scale[lane / 4 + 8]) << 16);
+                            const auto* scale = stage.sa + slice * M + row;
+                            if constexpr (PairedScales) {
+                                asf[m] = reinterpret_cast<const uint32_t*>(scale)[lane / 4];
+                                if constexpr (MaskScales)
+                                    asf[m] &= scale_masks[m];
+                            } else {
+                                asf[m] = scale[lane / 4] | (uint32_t(scale[lane / 4 + 8]) << 16);
+                            }
                         }
                     }
                 }
@@ -220,7 +234,7 @@ struct BlockProject {
                     asm volatile("ppu.cp.async.wait_group %0;" :: "n"(Ahead - 1) : "memory");
                     __ppu_barrier_sync(3 + group, ThreadsPerGroup);
                     issue(base + slot + Ahead, stages[(slot + Ahead) % Stages]);
-                    compute(stages[slot]);
+                    compute(stages[slot], base + slot);
                 }
             }
             #pragma unroll
@@ -233,7 +247,7 @@ struct BlockProject {
                 __ppu_barrier_sync(3 + group, ThreadsPerGroup);
                 if (k + Ahead < KGroups)
                     issue(k + Ahead, stages[(slot + Ahead) % Stages]);
-                compute(stages[slot]);
+                compute(stages[slot], k);
             }
         } else {
             int slot = 0;
@@ -246,7 +260,7 @@ struct BlockProject {
                 __ppu_barrier_sync(3 + group, ThreadsPerGroup);
                 if (k + Ahead < KGroups)
                     issue(k + Ahead, stages[slot == 0 ? Stages - 1 : slot - 1]);
-                compute(stages[slot]);
+                compute(stages[slot], k);
                 slot = slot == Stages - 1 ? 0 : slot + 1;
             }
         }
@@ -274,6 +288,15 @@ struct BlockProject {
         static_assert(StageOffset < Stages);
         auto slot_for = [&](int k) -> Stage& { return stages[(StageOffset + k) % Stages]; };
         const InputTile current{a, sa, b, rows};
+        if constexpr (CachedAScales) {
+            static_assert(!StageReady && !TilePrefetch);
+            auto* scale_cache = reinterpret_cast<uint8_t*>(stages) + ScratchBytes;
+            constexpr int ScaleBytes = M * (KBytes / 16);
+            static_assert(ScaleBytes % 128 == 0);
+            if (threadIdx.x == 0)
+                copy_linear_tile<ScaleBytes / 128>(scale_cache, sa);
+            sa = reinterpret_cast<const uint16_t*>(scale_cache);
+        }
         const int warp = threadIdx.x / 32;
         const int warp_m = warp % MWarps;
         const int warp_n = warp / MWarps;
@@ -300,7 +323,7 @@ struct BlockProject {
                     }
                 }
                 copy_swizzled_rows<M, Chunk>(stage.a, input.activation + k * Chunk, input.rows, AStride);
-                if constexpr (FP4) {
+                if constexpr (FP4 && !CachedAScales) {
                     const int scale_rows = PairedScales ? (input.rows + 15) / 16 * 16 : input.rows;
                     copy_a_scales<M, Slices, ScaleStrideRows>(stage.sa, input.scales + k * Slices * ScaleStrideRows, scale_rows);
                 }
@@ -323,7 +346,7 @@ struct BlockProject {
             for (int k = 0; k < Ahead; ++k)
                 issue(k, slot_for(k), current);
         }
-        auto compute = [&](const Stage& stage) {
+        auto compute = [&](const Stage& stage, int k) {
             #pragma unroll
             for (int slice = 0; slice < Slices; ++slice) {
                 uint4 av[RowPanels];
@@ -333,13 +356,20 @@ struct BlockProject {
                     const int row = (warp_m * RowPanels + m) * 16;
                     av[m] = matrix_fragment<Chunk>(stage.a + row * Chunk + slice * 32);
                     if constexpr (FP4) {
-                        const auto* scale = stage.sa + slice * M + row;
-                        if constexpr (PairedScales) {
-                            asf[m] = reinterpret_cast<const uint32_t*>(scale)[lane / 4];
-                            if constexpr (MaskScales)
-                                asf[m] &= scale_masks[m];
+                        if constexpr (CachedAScales) {
+                            const auto* scales = reinterpret_cast<const uint32_t*>(sa);
+                            const int k_index = k * Slices + slice;
+                            asf[m] = scales[((row / 16) * (KBytes / 32) + k_index) * 8 + lane / 4];
+                            asf[m] &= scale_masks[m];
                         } else {
-                            asf[m] = scale[lane / 4] | (uint32_t(scale[lane / 4 + 8]) << 16);
+                            const auto* scale = stage.sa + slice * M + row;
+                            if constexpr (PairedScales) {
+                                asf[m] = reinterpret_cast<const uint32_t*>(scale)[lane / 4];
+                                if constexpr (MaskScales)
+                                    asf[m] &= scale_masks[m];
+                            } else {
+                                asf[m] = scale[lane / 4] | (uint32_t(scale[lane / 4 + 8]) << 16);
+                            }
                         }
                     }
                 }
@@ -381,7 +411,7 @@ struct BlockProject {
                     asm volatile("ppu.cp.async.wait_group %0;" :: "n"(Ahead - 1) : "memory");
                     __syncthreads();
                     issue(base + slot + Ahead, slot_for(slot + Ahead), current);
-                    compute(slot_for(slot));
+                    compute(slot_for(slot), base + slot);
                 }
             }
             InputTile following{};
@@ -407,7 +437,7 @@ struct BlockProject {
                     if (following.activation)
                         issue(k + Ahead - KGroups, slot_for(slot + Ahead), following);
                 }
-                compute(slot_for(slot));
+                compute(slot_for(slot), k);
             }
         } else {
             int slot = 0;
@@ -420,7 +450,7 @@ struct BlockProject {
                 __syncthreads();
                 if (k + Ahead < KGroups)
                     issue(k + Ahead, stages[slot == 0 ? Stages - 1 : slot - 1], current);
-                compute(slot_for(slot));
+                compute(slot_for(slot), k);
                 slot = slot == Stages - 1 ? 0 : slot + 1;
             }
         }

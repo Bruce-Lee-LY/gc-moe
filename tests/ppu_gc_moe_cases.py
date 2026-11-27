@@ -30,7 +30,11 @@ FLASH41_READINESS_TOKENS = (
     0, 1, 2, 3, 8, 9, 17, 31, 32, 33, 39, 40, 63, 64, 65,
     71, 72, 73, 95, 96, 97, 128, 139, 140, 159, 160, 161, 191, 192, 193, 255, 256,
 )
-MODEL_PRESETS = {'dsv4.1-flash': (5120, 2304, 384, 6), 'dsv4-flash': (4096, 2048, 256, 6)}
+MODEL_PRESETS = {
+    'dsv4.1-flash': (5120, 2304, 384, 6),
+    'dsv4.1-flash-dspark': (5120, 2304, 128, 3),
+    'dsv4-flash': (4096, 2048, 256, 6),
+}
 _BOUNDARIES = None
 
 
@@ -537,7 +541,7 @@ def main(*, routed_precision, shared_fp8_fp8_ptpc=False, readiness=False):
     if readiness:
         args.graph = args.mode == 'graph'
         if args.tokens is None:
-            if args.model == 'dsv4.1-flash':
+            if args.model in ('dsv4.1-flash', 'dsv4.1-flash-dspark'):
                 args.tokens = FLASH41_READINESS_TOKENS
             else:
                 args.tokens = FLASH_SE_READINESS_TOKENS if shared_fp8_fp8_ptpc else FLASH_ROUTED_READINESS_TOKENS

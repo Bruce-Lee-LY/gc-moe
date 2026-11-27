@@ -8,7 +8,7 @@
 
 namespace gc_moe {
 
-template <int MTiles, int BlockRows = 0, bool PairedScales = false, bool ClampInTable = false>
+template <int MTiles, int BlockRows = 0, bool PairedScales = false, bool ClampInTable = false, bool PackW2Scales = false>
 __device__ __forceinline__ void routed_activation(const Launch& p, const Accumulator (&acc)[MTiles][4],
                                                   int rows, int base, int column, int lane, int row_offset = 0,
                                                   const float* cached_weights = nullptr) {
@@ -22,13 +22,16 @@ __device__ __forceinline__ void routed_activation(const Launch& p, const Accumul
         #pragma unroll
         for (int r = 0; r < 2; ++r) {
             const int row = row_offset + m * TileM + lane / 4 + r * 8;
+            const int scale_row = PairedScales ? paired_scale_row(row) : row;
+            const int scale_offset = BlockRows == 128 && PackW2Scales
+                ? (row / TileM * TileM) * (I / 32) + ((column / 2) * TileM + scale_row % TileM) * 2 + column % 2
+                : ((column / 2) * BlockRows + scale_row) * 2 + column % 2;
+            const int scale_index = base * (I / 32) + scale_offset;
             if constexpr (BlockRows >= 64) {
                 if (panel + r * 8 >= rows) {
                     if constexpr (PairedScales) {
-                        if (lane % 4 == 0) {
-                            const int scale_row = paired_scale_row(row);
-                            p.mid_sf[base * (I / 32) + ((column / 2) * BlockRows + scale_row) * 2 + column % 2] = 0;
-                        }
+                        if (lane % 4 == 0)
+                            p.mid_sf[scale_index] = 0;
                     }
                     continue;
                 }
@@ -49,8 +52,6 @@ __device__ __forceinline__ void routed_activation(const Launch& p, const Accumul
             }
             maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 1, 4));
             maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, 2, 4));
-            const int scale_row = PairedScales ? paired_scale_row(row) : row;
-            const int scale_index = base * (I / 32) + ((column / 2) * BlockRows + scale_row) * 2 + column % 2;
             if (row >= rows) {
                 if constexpr (PairedScales) {
                     if (lane % 4 == 0 && row_offset < rows)
@@ -156,12 +157,13 @@ __global__ void decode_experts(Launch p) {
     }
 }
 
-template <int Rows, int NTile, typename Project, bool Packed>
+template <int Rows, int NTile, typename Project, bool Packed, bool BulkReturns = false>
 __device__ __forceinline__ void routed_staged_store(const Launch& p, const typename Project::Result& acc,
                                                     int live_rows, int base, int column, uint8_t* memory) {
     constexpr int Vectors = NTile / 8;
     constexpr int StoreGroup = std::min(Vectors, 32);
     static_assert(Vectors % StoreGroup == 0);
+    static_assert(!BulkReturns || (Packed && StoreGroup == 32));
     static_assert(Project::ScratchBytes >= Rows * NTile * sizeof(bf16));
     const int tid = threadIdx.x;
     const int warp = tid / 32;
@@ -185,19 +187,58 @@ __device__ __forceinline__ void routed_staged_store(const Launch& p, const typen
         }
     }
     __syncthreads();
+    if constexpr (BulkReturns) {
+        constexpr int Batch = 2;
+        constexpr int WarpsPerBlock = Project::Threads / 32;
+        const int rank = __ppu_read_firstlane(p.rank);
+        const int scalar_column = __ppu_read_firstlane(column);
+        auto scatter_row = [&](int destination_rank, int vector, uint4 payload) {
+            auto* destination = reinterpret_cast<uint4*>(p.peers[destination_rank] + p.return_offset);
+            destination += vector + scalar_column * Vectors + lane;
+            if (destination_rank == rank)
+                __ppu_global_store_bulk_b32x4(destination, payload);
+            else
+                __ppu_remote_store_bulk_ncp_b32x4(destination, payload);
+        };
+        int row = __ppu_read_firstlane(warp);
+        for (; row + (Batch - 1) * WarpsPerBlock < live_rows; row += Batch * WarpsPerBlock) {
+            uint32_t descriptors[Batch];
+            uint4 payloads[Batch];
+            #pragma unroll
+            for (int i = 0; i < Batch; ++i) {
+                const int source_row = row + i * WarpsPerBlock;
+                descriptors[i] = __ppu_read_firstlane(uint32_t(p.return_rows[base + source_row]));
+                payloads[i] = __ppu_shared_load_bulk_b32x4(staging + source_row * Vectors + lane);
+            }
+            #pragma unroll
+            for (int i = 0; i < Batch; ++i)
+                scatter_row(descriptors[i] >> ReturnPeerShift,
+                            descriptors[i] & ((1u << ReturnPeerShift) - 1), payloads[i]);
+        }
+        if constexpr (Batch > 1)
+            for (; row < live_rows; row += WarpsPerBlock) {
+                const uint32_t descriptor = __ppu_read_firstlane(uint32_t(p.return_rows[base + row]));
+                const uint4 payload = __ppu_shared_load_bulk_b32x4(staging + row * Vectors + lane);
+                scatter_row(descriptor >> ReturnPeerShift, descriptor & ((1u << ReturnPeerShift) - 1), payload);
+            }
+        return;
+    }
     // Each group writes a contiguous column tile to one destination row.
     const int col = lane % StoreGroup;
     for (int row = tid / StoreGroup; row < live_rows; row += Project::Threads / StoreGroup) {
         auto* target = return_row<Packed>(p, base + row) + column * Vectors;
         #pragma unroll
-        for (int i = 0; i < Vectors; i += StoreGroup)
-            __stbl(target + col + i, staging[row * Vectors + col + i]);
+        for (int i = 0; i < Vectors; i += StoreGroup) {
+            const auto* source = staging + row * Vectors + col + i;
+            auto* destination = target + col + i;
+            __stbl(destination, *source);
+        }
     }
 }
 
 template <bool First, int Rows, int NTile, int Chunk, int StageCount = 3,
           bool PairedScales = false, bool StagedScatter = false, int RowPanels = 1,
-          bool ClampInTable = false, bool PageLayout = false, bool SplitColumns = false, bool RtWeights = false, int ComputeRows = Rows, bool StageReady = false, int PacketWidth = 0, int CycleCount = 1, bool TilePrefetch = false>
+          bool ClampInTable = false, bool PageLayout = false, bool SplitColumns = false, bool RtWeights = false, int ComputeRows = Rows, bool StageReady = false, int PacketWidth = 0, int CycleCount = 1, bool TilePrefetch = false, bool CacheDown = false>
 __device__ __forceinline__ void run_routed_tile_compute(const Launch& p, int tile, int column, uint8_t* memory,
                                                         int* next_job = nullptr, int total = 0, bool seeded = false,
                                                         int* next_down_tile = nullptr, bool swap_slots = false) {
@@ -207,8 +248,11 @@ __device__ __forceinline__ void run_routed_tile_compute(const Launch& p, int til
     // Wider expert pages keep W1 scale rows in order, so AIU can zero-pad
     // exactly the missing rows. W1 still produces the paired W2 layout.
     constexpr bool CompactW1Scales = PageLayout && Rows >= 64 && First;
+    constexpr bool CacheW1Scales = First && PageLayout && Rows == 128;
+    constexpr bool CacheScales = CacheW1Scales || (!First && CacheDown);
     using Project = BlockProject<ComputeRows, NTile, K, true, Chunk, StageCount, PairedScales && !CompactW1Scales, Panels,
-                                 PairedScales || ClampInTable, PageLayout && First && !CompactW1Scales, SplitColumns, Rows, PacketWidth>;
+                                 PairedScales || ClampInTable, CacheScales || (PageLayout && First && !CompactW1Scales),
+                                 SplitColumns, Rows, PacketWidth, false, 64, false, K, CacheScales>;
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
     const int warp_m = warp % Project::MWarps;
@@ -226,6 +270,20 @@ __device__ __forceinline__ void run_routed_tile_compute(const Launch& p, int til
         if (threadIdx.x < expert.rows)
             weights[threadIdx.x] = p.grouped_weights[base + threadIdx.x];
         cached_weights = weights;
+    }
+    if constexpr (CacheW1Scales) {
+        static_assert(First && SplitColumns && CompactW1Scales);
+        // Both column groups reuse the packed panel scales.
+        auto* cached = memory + Project::ScratchBytes;
+        constexpr int ScaleBytes = ComputeRows * (H / 32);
+        static_assert(ScaleBytes % 128 == 0);
+        if (threadIdx.x == 0) {
+            copy_linear_tile<ScaleBytes / 128>(cached, sa);
+            asm volatile("ppu.cp.async.commit_group;" ::: "memory");
+            asm volatile("ppu.cp.async.wait_all;" ::: "memory");
+        }
+        __syncthreads();
+        sa = reinterpret_cast<const uint16_t*>(cached);
     }
     const auto acc = [&] {
         if constexpr (SplitColumns)
@@ -273,11 +331,9 @@ __device__ __forceinline__ void run_routed_tile_compute(const Launch& p, int til
             return Project::template run<RtWeights, false, CycleCount, true>(
                 a, sa, b, expert.rows, reinterpret_cast<typename Project::Stage*>(memory), nullptr, seeded, prepare_next);
         } else {
-            constexpr uint32_t required_columns = [] {
-                if constexpr (StageReady && Rows == 64)
-                    return (1u << (2 * I / NTile)) - 1;
-                return 0u;
-            }();
+            // Acquire the complete W1 tile before issuing W2 activations.
+            // Weight prefetch can still proceed while the activation loader waits.
+            constexpr uint32_t required_columns = StageReady ? ~0u >> (32 - 2 * I / NTile) : 0u;
             return Project::template run<RtWeights, StageReady, CycleCount, false, 0, required_columns>(
                 a, sa, b, expert.rows, reinterpret_cast<typename Project::Stage*>(memory),
                 StageReady ? p.finished_first + tile : nullptr);
@@ -286,16 +342,16 @@ __device__ __forceinline__ void run_routed_tile_compute(const Launch& p, int til
     const int logical_column = column * Project::NWarps + warp_n;
     const int row_offset = warp_m * TileM * Panels;
     if constexpr (First)
-        routed_activation<Panels, Rows, PairedScales, ClampInTable>(p, acc.block, expert.rows, base, logical_column, lane, row_offset, cached_weights);
+        routed_activation<Panels, Rows, PairedScales, ClampInTable, CacheDown>(p, acc.block, expert.rows, base, logical_column, lane, row_offset, cached_weights);
     else if constexpr (StagedScatter && Project::ScratchBytes >= ComputeRows * NTile * sizeof(bf16))
-        routed_staged_store<ComputeRows, NTile, Project, Rows >= 64>(p, acc, expert.rows, base, column, memory);
+        routed_staged_store<ComputeRows, NTile, Project, Rows >= 64, Rows == 128 && PageLayout>(p, acc, expert.rows, base, column, memory);
     else
         routed_store<Panels, Rows >= 64>(p, acc.block, expert.rows, base, logical_column, lane, row_offset);
 }
 
 template <bool First, int Rows, int NTile, int Chunk, int StageCount = 3,
           bool PairedScales = false, bool StagedScatter = false, int RowPanels = 1,
-          bool ClampInTable = false, bool PageLayout = false, bool SplitColumns = false, bool RtWeights = false, int NarrowMode = 0, bool StageReady = false, int PacketWidth = 0, int W1NarrowStages = StageCount, int CycleCount = 1, bool TilePrefetch = false>
+          bool ClampInTable = false, bool PageLayout = false, bool SplitColumns = false, bool RtWeights = false, int NarrowMode = 0, bool StageReady = false, int PacketWidth = 0, int W1NarrowStages = StageCount, int CycleCount = 1, bool TilePrefetch = false, bool CacheDown = false>
 __device__ __forceinline__ void run_routed_tile(const Launch& p, int tile, int column, uint8_t* memory,
                                                 int* next_job = nullptr, int total = 0, bool seeded = false,
                                                 int* next_down_tile = nullptr, bool swap_slots = false) {
@@ -305,7 +361,7 @@ __device__ __forceinline__ void run_routed_tile(const Launch& p, int tile, int c
         if (rows <= 32) {
             run_routed_tile_compute<First, Rows, NTile, Chunk, First ? W1NarrowStages : StageCount,
                                     PairedScales, StagedScatter, RowPanels, ClampInTable, PageLayout,
-                                    SplitColumns, RtWeights, 32, StageReady, PacketWidth, CycleCount>(
+                                    SplitColumns, RtWeights, 32, StageReady, PacketWidth, CycleCount, false, CacheDown>(
                 p, tile, column, memory);
             return;
         }
@@ -313,7 +369,7 @@ __device__ __forceinline__ void run_routed_tile(const Launch& p, int tile, int c
             if (rows <= 64) {
                 run_routed_tile_compute<First, Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
                                         RowPanels, ClampInTable, PageLayout, SplitColumns, RtWeights,
-                                        64, StageReady, PacketWidth, CycleCount>(p, tile, column, memory);
+                                        64, StageReady, PacketWidth, CycleCount, false, CacheDown>(p, tile, column, memory);
                 return;
             }
         }
@@ -321,13 +377,13 @@ __device__ __forceinline__ void run_routed_tile(const Launch& p, int tile, int c
             if (rows <= 96) {
                 run_routed_tile_compute<First, Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
                                         RowPanels, ClampInTable, PageLayout, SplitColumns, RtWeights,
-                                        96, StageReady, PacketWidth, CycleCount>(p, tile, column, memory);
+                                        96, StageReady, PacketWidth, CycleCount, false, CacheDown>(p, tile, column, memory);
                 return;
             }
         }
     }
     run_routed_tile_compute<First, Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
-                            RowPanels, ClampInTable, PageLayout, SplitColumns, RtWeights, Rows, StageReady, PacketWidth, CycleCount, TilePrefetch>(
+                            RowPanels, ClampInTable, PageLayout, SplitColumns, RtWeights, Rows, StageReady, PacketWidth, CycleCount, TilePrefetch, CacheDown>(
         p, tile, column, memory, next_job, total, seeded, next_down_tile, swap_slots);
 }
 
@@ -464,8 +520,12 @@ void launch_fp4_fp4_interleaved_m16(const Launch& p, hggcStream_t stream) {
 }
 
 template <int Rows, int NTile, int Chunk, int StageCount, bool PairedScales, bool StagedScatter,
-          int RowPanels, bool ClampInTable, bool PageLayout, bool SplitColumns, bool RtWeights, int DownStages, int DownChunk, int NarrowMode, bool StageReady, int W1NarrowStages, int DownCycles, bool PrefetchTiles, int GateCycles>
+          int RowPanels, bool ClampInTable, bool PageLayout, bool SplitColumns, bool RtWeights, int DownStages, int DownChunk, int NarrowMode, bool StageReady, int W1NarrowStages, int DownCycles, bool PrefetchTiles, int GateCycles, bool CacheDown>
+#if GC_MOE_MAX_RANKS > 8
+__device__ __forceinline__ void run_fp4_fp4_pipeline(Launch p, uint8_t* memory) {
+#else
 __global__ void decode_fp4_fp4_pipeline(Launch p) {
+#endif
     constexpr int GateColumns = 2 * I / NTile;
     constexpr int DownColumns = H / NTile;
     // A W1 column tile produces half as many SwiGLU channels as its N width.
@@ -473,7 +533,9 @@ __global__ void decode_fp4_fp4_pipeline(Launch p) {
     // Short wide-page projections use smaller weight requests to balance
     // the activation and weight loaders.
     constexpr int PacketWidth = Rows == 64 && PageLayout && !SplitColumns && ClampInTable && ShortDown ? 64 : 0;
+#if GC_MOE_MAX_RANKS <= 8
     extern __shared__ __align__(128) uint8_t memory[];
+#endif
     __shared__ int job, down_tile, down_job;
     const int tid = threadIdx.x;
     const int tiles = *p.tile_count;
@@ -498,7 +560,8 @@ __global__ void decode_fp4_fp4_pipeline(Launch p) {
         if (first >= gate_jobs)
             break;
         const int tile = first / GateColumns;
-        run_routed_tile<true, Rows, NTile, Chunk, StageCount, PairedScales, false, RowPanels, ClampInTable, PageLayout, SplitColumns, RtWeights, NarrowMode, false, PacketWidth, W1NarrowStages, GateCycles, TilePrefetch>(
+        run_routed_tile<true, Rows, NTile, Chunk, StageCount, PairedScales, false, RowPanels, ClampInTable, PageLayout, SplitColumns || (Rows == 128 && PageLayout), RtWeights, NarrowMode,
+                        false, PacketWidth, W1NarrowStages, GateCycles, TilePrefetch, CacheDown>(
             p, tile, first % GateColumns, memory, &job, gate_jobs, seeded);
         __syncthreads();
         if constexpr (TilePrefetch)
@@ -518,8 +581,8 @@ __global__ void decode_fp4_fp4_pipeline(Launch p) {
         }
     }
 
-    // Every unfinished W1 job is already owned by a resident CTA. W2 can
-    // safely wait on individual K chunks without blocking unclaimed W1 jobs.
+    // Resident CTAs own all unfinished W1 jobs. W2 can wait for a whole W1
+    // tile without blocking unclaimed W1 work.
     if constexpr (!TilePrefetch)
         __syncthreads();
     if constexpr (TilePrefetch) {
@@ -578,14 +641,40 @@ __global__ void decode_fp4_fp4_pipeline(Launch p) {
         const int down = job;
         if (down >= tiles * DownColumns)
             break;
-        run_routed_tile<false, Rows, NTile, DownChunk, DownStages, PairedScales, StagedScatter, RowPanels, ClampInTable, PageLayout, SplitColumns, RtWeights, NarrowMode, StageReady, PacketWidth, DownStages, DownCycles>(
+        run_routed_tile<false, Rows, NTile, DownChunk, DownStages, PairedScales, StagedScatter, RowPanels, ClampInTable, PageLayout, SplitColumns, RtWeights, NarrowMode, StageReady, PacketWidth, DownStages, DownCycles, false, CacheDown>(
             p, StageReady ? down / DownColumns : down_tile, down % DownColumns, memory);
         __syncthreads();
     }
+    // Drain the bulk ICN stores before publishing this rank's returns.
+    if constexpr (Rows == 128 && PageLayout && StagedScatter)
+        __ppu_wait_remote_vstcnt(0);
     __syncwarp();
     if (tid % 32 == 0)
         __ppu_threadfence_system_uncache();
 }
+
+#if GC_MOE_MAX_RANKS > 8
+template <int Rows, int NTile, int Chunk, int StageCount, bool PairedScales, bool StagedScatter,
+          int RowPanels, bool ClampInTable, bool PageLayout, bool SplitColumns, bool RtWeights, int DownStages, int DownChunk, int NarrowMode, bool StageReady, int W1NarrowStages, int DownCycles, bool PrefetchTiles, int GateCycles, bool CacheDown>
+__global__
+void decode_fp4_fp4_pipeline(Launch p) {
+    extern __shared__ __align__(128) uint8_t memory[];
+    run_fp4_fp4_pipeline<Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
+                         RowPanels, ClampInTable, PageLayout, SplitColumns, RtWeights, DownStages, DownChunk,
+                         NarrowMode, StageReady, W1NarrowStages, DownCycles, PrefetchTiles, GateCycles, CacheDown>(p, memory);
+}
+
+template <int Rows, int NTile, int Chunk, int StageCount, bool PairedScales, bool StagedScatter,
+          int RowPanels, bool ClampInTable, bool PageLayout, bool SplitColumns, bool RtWeights, int DownStages, int DownChunk, int NarrowMode, bool StageReady, int W1NarrowStages, int DownCycles, bool PrefetchTiles, int GateCycles, bool CacheDown>
+__global__ __launch_bounds__(256, 1)
+void decode_fp4_fp4_pipeline_m128(Launch p) {
+    extern __shared__ __align__(128) uint8_t memory[];
+    run_fp4_fp4_pipeline<Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
+                         RowPanels, ClampInTable, PageLayout, SplitColumns, RtWeights, DownStages, DownChunk,
+                         NarrowMode, StageReady, W1NarrowStages, DownCycles, PrefetchTiles, GateCycles, CacheDown>(p, memory);
+}
+
+#endif
 
 template <bool First, ProjectionRole Role>
 void launch_experts(const Launch& p, hggcStream_t stream) {
@@ -672,16 +761,20 @@ void launch_shared_projection(const Launch& p, hggcStream_t stream) {
 
 template <int Rows, int NTile, int Chunk = 64, int StageCount = 3,
           bool PairedScales = false, bool StagedScatter = false, int RowPanels = 1,
-          bool PageLayout = false, bool SplitColumns = false, int DownStages = StageCount, int DownChunk = Chunk, int NarrowMode = 0, bool StageReady = false, int W1NarrowStages = StageCount, int DownCycles = 1, bool PrefetchTiles = false, int GateCycles = 1>
+          bool PageLayout = false, bool SplitColumns = false, int DownStages = StageCount, int DownChunk = Chunk, int NarrowMode = 0, bool StageReady = false, int W1NarrowStages = StageCount, int DownCycles = 1, bool PrefetchTiles = false, int GateCycles = 1, bool CacheDown = false>
 void launch_fp4_fp4_pipeline(const Launch& p, hggcStream_t stream, bool clamp_in_table,
                             int blocks_per_unit_override = 0) {
+    constexpr bool CacheW1Scales = Rows == 128 && PageLayout;
     using Project = BlockProject<Rows, NTile, H / 2, true, Chunk, StageCount, PairedScales, RowPanels,
-                                 false, false, SplitColumns>;
+                                 false, false, SplitColumns || CacheW1Scales>;
     using DownProject = BlockProject<Rows, NTile, I / 2, true, DownChunk, DownStages, PairedScales, RowPanels,
                                      false, false, SplitColumns>;
     using NarrowProject = BlockProject<32, NTile, H / 2, true, Chunk, W1NarrowStages, false>;
     constexpr int gate_bytes = PrefetchTiles ? Rows * sizeof(float) : 0;
-    constexpr int staging = std::max({Project::ScratchBytes + gate_bytes, DownProject::ScratchBytes,
+    constexpr int gate_scales = CacheW1Scales ? Rows * (H / 32) : 0;
+    constexpr int down_scales = CacheDown ? Rows * (I / 32) : 0;
+    constexpr int staging = std::max({Project::ScratchBytes + gate_bytes + gate_scales,
+                                      DownProject::ScratchBytes + down_scales,
                                       W1NarrowStages != StageCount ? NarrowProject::ScratchBytes : 0});
     constexpr int blocks_per_unit = Rows > 32 ? 16 : (Rows == TileM && NTile == 128 ? 8 : 4);
     const bool share_wide_grid = BalancedProjections && Rows == 64 && p.shared_x &&
@@ -691,15 +784,38 @@ void launch_fp4_fp4_pipeline(const Launch& p, hggcStream_t stream, bool clamp_in
     const int blocks = p.units * ctas_per_unit;
     auto launch = [&](auto rt_weights) {
         constexpr bool RtWeights = decltype(rt_weights)::value;
+#if GC_MOE_MAX_RANKS > 8
+        auto launch_kernel = [&](auto clamp_tag) {
+            constexpr bool Clamp = decltype(clamp_tag)::value;
+            if constexpr (Rows == 128) {
+                decode_fp4_fp4_pipeline_m128<Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
+                                            RowPanels, Clamp, PageLayout, SplitColumns, RtWeights, DownStages, DownChunk,
+                                            NarrowMode, Clamp && StageReady, W1NarrowStages, DownCycles,
+                                            PrefetchTiles, GateCycles, CacheDown>
+                    <<<blocks, Project::Threads, staging, stream>>>(p);
+            } else {
+                decode_fp4_fp4_pipeline<Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
+                                       RowPanels, Clamp, PageLayout, SplitColumns, RtWeights, DownStages, DownChunk,
+                                       NarrowMode, Clamp && StageReady, W1NarrowStages, DownCycles,
+                                       PrefetchTiles, GateCycles, CacheDown>
+                    <<<blocks, Project::Threads, staging, stream>>>(p);
+            }
+        };
+        if (clamp_in_table)
+            launch_kernel(std::true_type{});
+        else
+            launch_kernel(std::false_type{});
+#else
         if (clamp_in_table) {
             decode_fp4_fp4_pipeline<Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
-                                   RowPanels, true, PageLayout, SplitColumns, RtWeights, DownStages, DownChunk, NarrowMode, StageReady, W1NarrowStages, DownCycles, PrefetchTiles, GateCycles>
+                                   RowPanels, true, PageLayout, SplitColumns, RtWeights, DownStages, DownChunk, NarrowMode, StageReady, W1NarrowStages, DownCycles, PrefetchTiles, GateCycles, CacheDown>
                 <<<blocks, Project::Threads, staging, stream>>>(p);
             return;
         }
         decode_fp4_fp4_pipeline<Rows, NTile, Chunk, StageCount, PairedScales, StagedScatter,
-                               RowPanels, false, PageLayout, SplitColumns, RtWeights, DownStages, DownChunk, NarrowMode, false, W1NarrowStages, DownCycles, PrefetchTiles, GateCycles>
+                               RowPanels, false, PageLayout, SplitColumns, RtWeights, DownStages, DownChunk, NarrowMode, false, W1NarrowStages, DownCycles, PrefetchTiles, GateCycles, CacheDown>
             <<<blocks, Project::Threads, staging, stream>>>(p);
+#endif
     };
     if constexpr (!SplitColumns) {
         if ((!LongGate && !p.shared_x && p.ranks == MaxRanks) || clamp_in_table) {
@@ -708,6 +824,89 @@ void launch_fp4_fp4_pipeline(const Launch& p, hggcStream_t stream, bool clamp_in
         }
     }
     launch(std::false_type{});
+}
+
+template <bool ClampInTable, bool RtWeights>
+__global__
+#if GC_MOE_MAX_RANKS > 8
+__launch_bounds__(256, 1)
+#endif
+void decode_fp4_fp4_m128(Launch p) {
+    constexpr int GateColumns = 2 * I / 256;
+    constexpr int DownColumns = H / 256;
+    extern __shared__ __align__(128) uint8_t memory[];
+    __shared__ int job, down_tile;
+    const int tid = threadIdx.x;
+    const int tiles = *p.tile_count;
+    const int gate_jobs = tiles * GateColumns;
+    const int down_jobs = tiles * DownColumns;
+    auto& schedule = header(p, p.rank);
+    bool gate_done = false;
+    for (;;) {
+        if (tid == 0) {
+            down_tile = -1;
+            if (!gate_done) {
+                job = atomicAdd(&schedule.first_head, 1u);
+                gate_done = job >= gate_jobs;
+            }
+            if (gate_done) {
+                const int ticket = atomicAdd(&schedule.down_head, 1u);
+                job = ticket < down_jobs ? ticket : -1;
+                if (job >= 0) {
+                    // All remaining W1 jobs already belong to resident CTAs.
+                    uint32_t available;
+                    do {
+                        asm volatile("ppu.ld.acquire.gpu.b32 %0, [%1];"
+                                     : "=r"(available) : "l"(p.down_tiles + ticket / DownColumns) : "memory");
+                    } while (!available);
+                    down_tile = available - 1;
+                }
+            }
+        }
+        __syncthreads();
+        const int ticket = job;
+        if (ticket < 0)
+            break;
+        const int down = down_tile;
+        if (down >= 0) {
+            run_routed_tile<false, 128, 256, 64, 3, true, true, 4, ClampInTable, true, false,
+                            RtWeights, 3, false, 0, 3, 2>(
+                p, down, ticket % DownColumns, memory);
+            __syncthreads();
+        } else {
+            const int tile = ticket / GateColumns;
+            run_routed_tile<true, 128, 256, 64, 3, true, false, 4, ClampInTable, true, true,
+                            RtWeights, 3, false, 0, 3, 1>(
+                p, tile, ticket % GateColumns, memory);
+            __syncthreads();
+            if (tid == 0) {
+                uint32_t finished;
+                asm volatile("ppu.atom.add.acq_rel.gpu.u32 %0, [%1], %2;"
+                             : "=r"(finished) : "l"(p.finished_first + tile), "r"(1u) : "memory");
+                if (finished == GateColumns - 1) {
+                    const int cursor = atomicAdd(&schedule.down_tail, 1u);
+                    asm volatile("ppu.st.release.gpu.b32 [%0], %1;"
+                                 :: "l"(p.down_tiles + cursor), "r"(tile + 1) : "memory");
+                }
+            }
+        }
+    }
+    __ppu_wait_remote_vstcnt(0);
+    __syncwarp();
+    if (tid % 32 == 0)
+        __ppu_threadfence_system_uncache();
+}
+
+inline void launch_fp4_fp4_m128(const Launch& p, hggcStream_t stream, bool clamp) {
+    using Gate = BlockProject<128, 256, H / 2, true, 64, 3, true, 4, false, false, true>;
+    using Down = BlockProject<128, 256, I / 2, true, 64, 3, true, 4>;
+    constexpr int Scratch = std::max(Gate::ScratchBytes + 128 * (H / 32), Down::ScratchBytes);
+    if (clamp)
+        decode_fp4_fp4_m128<true, true><<<p.units * (CanUseM128 ? 2 : 8), Gate::Threads, Scratch, stream>>>(p);
+    else if (!LongGate)
+        decode_fp4_fp4_m128<false, true><<<p.units * (CanUseM128 ? 2 : 8), Gate::Threads, Scratch, stream>>>(p);
+    else
+        decode_fp4_fp4_m128<false, false><<<p.units * (CanUseM128 ? 2 : 8), Gate::Threads, Scratch, stream>>>(p);
 }
 
 inline void launch_fp4_fp4(const Launch& p, const DecodeSchedule& schedule, hggcStream_t stream) {
@@ -737,8 +936,23 @@ inline void launch_fp4_fp4(const Launch& p, const DecodeSchedule& schedule, hggc
         } else if (schedule.tall_pages) {
             if constexpr (CanUseM128) {
                 if (p.m_tiles == 8) {
+                    if (schedule.large_routed) {
+                        if constexpr (BalancedProjections) {
+                            const double rows = double(schedule.routes) / Experts;
+                            // Cache the whole W2 scale tile when expert loads usually fit M96.
+                            if (rows + std::sqrt(rows) <= 96) {
+                                launch_fp4_fp4_pipeline<128, 256, 64, 3, true, true, 4, true, false,
+                                                       3, 64, 3, false, 3, 2, false, 1, true>(
+                                    p, stream, schedule.clamp_in_table, 2);
+                                return;
+                            }
+                        } else if (schedule.routes <= 96 * Experts) {
+                            launch_fp4_fp4_m128(p, stream, schedule.clamp_in_table);
+                            return;
+                        }
+                    }
                     launch_fp4_fp4_pipeline<128, 256, 64, 3, true, true, 4, true, false,
-                                           3, 64, 3, false, 3, 2>(p, stream, schedule.clamp_in_table, 8);
+                                           3, 64, 3, false, 3, 2>(p, stream, schedule.clamp_in_table, schedule.large_routed ? 2 : 8);
                     return;
                 }
             }

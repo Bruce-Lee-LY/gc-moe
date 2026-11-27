@@ -49,9 +49,9 @@ inline DecodeSchedule select_schedule(Launch& p, bool side) {
             // With long W1 reductions, a second M16 page is more expensive
             // than padding the first page to M32.
             const int medium_threshold = large_routed && LongGate ? 9 : 12;
-            // Increase the page size before the tail of the expert load spills
-            // into a second M96 page.
-            if (CanUseM128 && routes >= 84 * Experts)
+            // Leave headroom for variation in expert load before a second M96
+            // page repeats the weight loads.
+            if (CanUseM128 && routes >= 67 * Experts)
                 p.m_tiles = 8;
             else if (routes >= tall_threshold * Experts)
                 p.m_tiles = 6;

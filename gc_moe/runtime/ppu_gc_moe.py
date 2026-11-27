@@ -107,7 +107,8 @@ class PPUGCSymmBuffer:
         local_experts = layout.local_experts
         max_tiles = (max_routes + 15) // 16 + local_experts
         # Every expert can own a partially filled tile in addition to the live rows.
-        max_page_panels = 8 if ranks > LOCAL_RANKS and hidden <= 2 * intermediate_hidden else 6
+        can_use_large_pages = ranks > LOCAL_RANKS and (not routed_fp8_fp4 or hidden <= 2 * intermediate_hidden)
+        max_page_panels = 8 if can_use_large_pages else 6
         rows = (max_tiles + local_experts * ((self._m_tiles or max_page_panels) - 1)) * 16
         activation_width = hidden if routed_fp8_fp4 else hidden // 2
         scale_width = 1 if routed_fp8_fp4 else hidden // 32

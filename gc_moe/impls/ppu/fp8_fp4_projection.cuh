@@ -323,17 +323,21 @@ inline void launch_fp8_fp4(const Launch& p, hggcStream_t stream) {
             if constexpr (LongGate) {
                 // Long reductions benefit from more smaller CTAs. At a tiny
                 // bound with an active SE, four wide CTAs per unit cover both streams.
+                const bool compact_routed = p.ranks > 8 && !p.shared_x &&
+                                            active_experts * (SmallerProjection / 256) <= 4 * p.units;
                 if constexpr (WideN) {
                     const bool small_fused = p.shared_x && routes_per_rank <= p.units / 4;
-                    const bool small_multinode = p.ranks > 8 && routes_per_rank > p.units / 4 &&
-                                                 routes_per_rank <= p.units / 2;
-                    if (wide_jobs && (small_fused || small_multinode)) {
+                    const bool sparse_local = p.ranks <= 8 && !p.shared_x && p.bound > 2;
+                    const bool sparse_multinode = p.ranks > 8 && !compact_routed && routes_per_rank > p.units / 4;
+                    const bool sparse_batch = (sparse_local || sparse_multinode) && routes_per_rank <= p.units / 2;
+                    if (wide_jobs && (small_fused || sparse_batch)) {
                         launch_fp8_fp4_tiles<16, 512, 1, 2>(p, stream, 4);
                         break;
                     }
                 }
+                const bool compact_grid = routes_per_rank <= p.units / 2 || compact_routed;
                 launch_fp8_fp4_tiles<16, 256, 1, 2>(
-                    p, stream, routes_per_rank <= p.units / 2 ? 4 : 6);
+                    p, stream, compact_grid ? 4 : 6);
             } else {
                 if constexpr (WideN) {
                     if (wide_jobs) {

@@ -145,12 +145,12 @@ __global__ void decode_inputs_ready(Launch p, bool pipeline) {
         publish_epoch(p, peer, pipeline);
 }
 
-template <bool ReleaseSignal = false>
+template <bool ReleaseSignal = false, bool LocalEpoch = false>
 __device__ __forceinline__ uint32_t publish_pull_epoch(const Launch& p, int peer,
                                                        bool single_stripe = false) {
     auto& local = header(p, p.rank);
     // The previous call publishes its return epoch before this stream can reenter dispatch.
-    const uint32_t prior = acquire(local.outputs_ready + p.rank);
+    const uint32_t prior = LocalEpoch ? __ldbl(local.outputs_ready + p.rank) : acquire(local.outputs_ready + p.rank);
     const uint32_t epoch = prior + 1;
     auto* published = local.published + peer;
     if (single_stripe)
@@ -400,9 +400,10 @@ __global__ void decode_dispatch(Launch p, bool pipeline) {
     }
 }
 
-template <bool PairedScales, bool PadScales = true, bool DirectActivation = false>
+template <bool PairedScales, bool PadScales = true, bool DirectActivation = false, bool PanelMajorScales = false, bool BulkActivation = false>
 __device__ __forceinline__ void store_pulled_routes(const Launch& p, const uint4* stage, uint32_t scale,
-                                                    int dest, uint32_t mask, int tile_rows, int lane, uint32_t tail_scale = 0) {
+                                                    int dest, uint32_t mask, int tile_rows, int lane, uint32_t tail_scale = 0, int owner = 0) {
+    static_assert(!PanelMajorScales || (DirectActivation && !RoutedFP8_FP4));
     if constexpr (!DirectActivation) {
         asm volatile("ppu.cp.async.wait_all;" ::: "memory");
         __syncwarp();
@@ -410,29 +411,77 @@ __device__ __forceinline__ void store_pulled_routes(const Launch& p, const uint4
     constexpr int Vectors = RoutedActivationBytes / sizeof(uint4);
     constexpr int Chunks = (Vectors + 31) / 32;
     uint4 x[Chunks];
-    #pragma unroll
-    for (int i = 0; i < Chunks; ++i) {
-        const int index = i * 32 + lane;
-        if (index < Vectors) {
-            if constexpr (DirectActivation)
-                x[i] = __ldbl(stage + index);
-            else
-                x[i] = stage[index];
+    bool use_bulk = false;
+    if constexpr (BulkActivation && Vectors % 32 == 0) {
+        const uint64_t address = reinterpret_cast<uint64_t>(stage);
+        const uint64_t low = __ppu_read_firstlane(uint32_t(address));
+        const uint64_t high = __ppu_read_firstlane(uint32_t(address >> 32));
+        use_bulk = !((low | reinterpret_cast<uint64_t>(p.grouped_x)) & 511u);
+        if (use_bulk) {
+            // Bulk transfers consume a warp-aligned base and one vector per lane.
+            const auto* src = reinterpret_cast<const uint4*>((high << 32) | low);
+            __syncwarp();
+            if (p.rank == owner) {
+                #pragma unroll
+                for (int i = 0; i < Chunks; ++i)
+                    x[i] = __ppu_global_ldcg_bulk_b32x4(src + i * 32 + lane);
+            } else {
+                #pragma unroll
+                for (int i = 0; i < Chunks; ++i) {
+                    x[i] = __ppu_remote_load_bulk_b32x4(src + i * 32 + lane);
+                }
+            }
+            __ppu_wait_vldcnt(0);
+        }
+    }
+    if (!use_bulk) {
+        #pragma unroll
+        for (int i = 0; i < Chunks; ++i) {
+            const int index = i * 32 + lane;
+            if (index < Vectors) {
+                if constexpr (DirectActivation)
+                    x[i] = __ldbl(stage + index);
+                else
+                    x[i] = stage[index];
+            }
         }
     }
     while (mask) {
         const int slot = __ffs(mask) - 1;
-        const int row = __shfl_sync(0xffffffff, dest, slot);
+        int row = __shfl_sync(0xffffffff, dest, slot);
+        if constexpr (BulkActivation)
+            row = __ppu_read_firstlane(uint32_t(row));
         auto* out = reinterpret_cast<uint4*>(p.grouped_x) + row * Vectors;
         #pragma unroll
         for (int i = 0; i < Chunks; ++i) {
             const int index = i * 32 + lane;
-            if (index < Vectors)
-                out[index] = x[i];
+            if (index < Vectors) {
+                if constexpr (BulkActivation && Vectors % 32 == 0) {
+                    if (use_bulk)
+                        __ppu_global_stbl_bulk_b32x4(out + index, x[i]);
+                    else
+                        out[index] = x[i];
+                } else {
+                    out[index] = x[i];
+                }
+            }
         }
         if constexpr (RoutedFP8_FP4) {
             if (lane == 0)
                 reinterpret_cast<uint32_t*>(p.grouped_sf)[row] = scale;
+        } else if constexpr (PanelMajorScales) {
+            static_assert(!PairedScales && !PadScales);
+            // Adjacent halves of each scale word belong to rows eight apart.
+            const int panel = row / TileM;
+            const int scale_row = paired_scale_row(row % TileM);
+            auto* scales = reinterpret_cast<uint16_t*>(p.grouped_sf) + panel * TileM * (H / 64);
+            #pragma unroll
+            for (int pair = lane; pair < H / 128; pair += 32) {
+                const uint32_t value = pair < 32 ? scale : tail_scale;
+                const int index = 2 * packed_gate_scale_index(scale_row / 2, 2 * pair) + scale_row % 2;
+                scales[index] = value;
+                scales[index + 2] = value >> 16;
+            }
         } else {
             const int offset = row % tile_rows;
             const int scale_row = PairedScales ? paired_scale_row(offset) : offset;
@@ -460,6 +509,8 @@ __device__ __forceinline__ void store_pulled_routes(const Launch& p, const uint4
         }
         mask &= mask - 1;
     }
+    if constexpr (BulkActivation)
+        __ppu_wait_vstcnt(0);
 }
 
 template <bool PairedScales>
@@ -520,7 +571,7 @@ __device__ __forceinline__ void copy_page_metadata(void* dst, const void* src) {
                  :: "r"(address), "l"(src), "n"(Bytes) : "memory");
 }
 
-template <int BlockWarps, int PageRows, int MetaMode, bool DirectActivation>
+template <int BlockWarps, int PageRows, int MetaMode, bool DirectActivation, bool PanelMajorScales, bool BulkActivation>
 __device__ __forceinline__ void gather_into_pages(const Launch& p, int owner, int tokens, uint4* storage) {
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
@@ -641,25 +692,25 @@ __device__ __forceinline__ void gather_into_pages(const Launch& p, int owner, in
     const uint4* activation = stage;
     if constexpr (DirectActivation)
         activation = reinterpret_cast<const uint4*>(peer + p.x_offset + token * RoutedActivationBytes);
-    store_pulled_routes<PageRows == TileM, false, DirectActivation>(
-        p, activation, scale, dest, active, PageRows, lane, tail_scale);
+    store_pulled_routes<PageRows == TileM, false, DirectActivation, PanelMajorScales, BulkActivation>(
+        p, activation, scale, dest, active, PageRows, lane, tail_scale, owner);
 }
 
-template <int BlockWarps, int PageRows = TileM, int MetaMode = 0, bool DirectActivation = false>
+template <int BlockWarps, int PageRows = TileM, int MetaMode = 0, bool DirectActivation = false, bool PanelMajorScales = false, bool OrderedPull = false>
 __global__ void decode_page_dispatch(Launch p) {
     extern __shared__ __align__(128) uint8_t storage[];
     __shared__ int tokens;
     __shared__ bool last;
     const int tid = threadIdx.x;
-    const int owner = blockIdx.x;
+    const int owner = OrderedPull ? (blockIdx.x + p.rank) % MaxRanks : blockIdx.x;
     auto& local = header(p, p.rank);
     if (tid == 0) {
         const bool single_stripe = PageRows == TileM && gridDim.y == 1;
-        const uint32_t epoch = publish_pull_epoch<PageRows != 32>(p, owner, single_stripe);
-        tokens = published_slots(p, owner, epoch) / TopK;
+        const uint32_t epoch = publish_pull_epoch<PageRows != 32, OrderedPull>(p, owner, single_stripe);
+        tokens = OrderedPull && owner == p.rank ? p.tokens : published_slots(p, owner, epoch) / TopK;
     }
     __syncthreads();
-    gather_into_pages<BlockWarps, PageRows, MetaMode, DirectActivation>(
+    gather_into_pages<BlockWarps, PageRows, MetaMode, DirectActivation, PanelMajorScales, OrderedPull>(
         p, owner, tokens, reinterpret_cast<uint4*>(storage));
     __syncthreads();
     if (tid == 0) {
@@ -720,10 +771,10 @@ void launch_page_dispatch(const Launch& p, hggcStream_t stream) {
     decode_page_dispatch<WarpsPerBlock, PageRows><<<grid, WarpsPerBlock * 32, Scratch, stream>>>(p);
 }
 
-template <int BlockWarps, int PageRows>
+template <int BlockWarps, int PageRows, bool PanelMajorScales = false, bool OrderedPull = false>
 void launch_direct_page_dispatch(const Launch& p, hggcStream_t stream) {
     const dim3 grid(p.ranks, (p.bound + BlockWarps - 1) / BlockWarps);
-    decode_page_dispatch<BlockWarps, PageRows, 3, true>
+    decode_page_dispatch<BlockWarps, PageRows, 3, true, PanelMajorScales, OrderedPull>
         <<<grid, BlockWarps * 32, BlockWarps * PageMetadataBytes, stream>>>(p);
 }
 
@@ -758,7 +809,10 @@ inline void launch_dispatch(const Launch& p, const DecodeSchedule& schedule, hgg
     if (schedule.tall_pages) {
         if constexpr (CanUseM128) {
             if (p.m_tiles == 8) {
-                launch_direct_page_dispatch<16, 128>(p, stream);
+                if (!RoutedFP8_FP4 && schedule.large_routed)
+                    launch_direct_page_dispatch<16, 128, !RoutedFP8_FP4, true>(p, stream);
+                else
+                    launch_direct_page_dispatch<16, 128, !RoutedFP8_FP4>(p, stream);
                 return;
             }
         }

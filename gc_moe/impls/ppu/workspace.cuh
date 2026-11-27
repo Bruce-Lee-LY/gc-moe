@@ -42,7 +42,7 @@ constexpr int FullDownChunk = I % 256 == 0 ? 128 : 64;
 constexpr int GateStages = H / 128 % 5 == 0 ? 5 : 4;
 constexpr bool LongGate = H / 128 > 32;
 constexpr bool BalancedProjections = H <= 2 * I;
-constexpr bool CanUseM128 = MaxRanks > 8 && BalancedProjections;
+constexpr bool CanUseM128 = MaxRanks > 8 && (!RoutedFP8_FP4 || BalancedProjections);
 constexpr bool ShortDown = I / 128 <= 20;
 
 struct Tile {
