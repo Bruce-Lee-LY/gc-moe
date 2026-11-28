@@ -51,4 +51,4 @@ __all__ = [
     'sm120_fp8_fp4_gc_moe',
 ]
 
-__version__ = '0.7.0'
+__version__ = '0.7.1'

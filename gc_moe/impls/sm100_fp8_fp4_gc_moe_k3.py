@@ -985,14 +985,17 @@ class GCK3MoERoleKernel:
                  nvlink_timeout_secs: int = DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS,
                  *, role_config, per_source_ready: bool, single_cta_routes: bool,
                  combine_geometry: tuple[int, int, int] | None = None,
-                 routed_weight_linger: bool = False, full_split_k_tile: bool = False,
+                 routed_weight_linger: bool = False, routed_weight_reuse: bool = False,
+                 full_split_k_tile: bool = False,
                  shared_weight_linger: bool = False,
                  shared_block_m: int | None = None, epilogue_config=None,
                  projection_tile_rows: int = 0, projection_stages: int = 0,
                  projection_channels: int = PROJECTION_CHANNELS_PER_CTA,
                  has_prefix: bool = False, projection_splits: int = 1,
-                 early_shared: bool = False, routed_assist: bool = False):
+                 early_shared: bool = False, routed_assist: bool = False,
+                 routed_midpoint_min_tokens: int = 0):
         self.routed_assist = routed_assist
+        self.routed_midpoint_min_tokens = routed_midpoint_min_tokens
         shared_block_m = block_m if shared_block_m is None else shared_block_m
         storage_block_m = max(block_m, shared_block_m) if role == COMPUTE_ROLE else block_m
         if role_config.role != role or role_config.block_m != storage_block_m:
@@ -1052,11 +1055,11 @@ class GCK3MoERoleKernel:
         if self.data_barrier_stages > 32:
             raise ValueError('GC data barrier banks exceed one initialization warp')
         self.nvlink_timeout_secs = nvlink_timeout_secs
-        # Routed weights stream with EVICT_NORMAL when an expert spans two
-        # or more M-blocks, otherwise EVICT_FIRST. BF16 shared weights with
-        # paired M-blocks get their own EVICT_LAST residency hint. There are
-        # no shared SFs.
+        # The default routed hint estimates reuse from the launch geometry.
+        # The weight loader can also detect likely reuse from each task's M block.
+        # BF16 shared weights with paired M blocks use their own EVICT_LAST hint.
         self.routed_weight_linger = routed_weight_linger
+        self.routed_weight_reuse = routed_weight_reuse
         self.full_split_k_tile = full_split_k_tile
         self.shared_weight_linger = shared_weight_linger
         # The compact dual-ring layout sizes scratch from the routed epilogue.
@@ -1555,7 +1558,7 @@ class GCK3MoERoleKernel:
                tensor_map_7=None, tensor_map_8=None, tensor_map_9=None,
                tensor_map_10=None, tensor_map_11=None, tensor_map_12=None,
                tensor_map_13=None, tensor_map_14=None, tensor_map_15=None,
-               tensor_map_16=None, tensor_map_17=None,
+               tensor_map_16=None, tensor_map_17=None, valid_token_count=None,
                routed_norm=None, norm_eps=None, routed_scale=None, final_out=None, shared_out=None, prefix_sum=None,
                projection_weight_map=None, projection_latent_map=None):
         tid, _, _ = cute.arch.thread_idx()
@@ -2094,6 +2097,7 @@ class GCK3MoERoleKernel:
                     0 if self.routed_assist else self.shared_experts, self.shared_hidden, self.shared_intermediate,
                     self.shared_block_m, self.shared_w2_stage_ready,
                     self.ring_blocks, self.routed_assist,
+                    self.routed_midpoint_min_tokens, valid_token_count,
                 )
             # The same two-slot task stream drives both TMA producer warps
             # and the leader MMA warp. All three consume every valid phase.
@@ -2316,8 +2320,12 @@ class GCK3MoERoleKernel:
                         n_block = n_cluster * Uint32(2) + cta_rank
                         weight_n = cta_rank * Uint32(128)
                         weight_k_base = n_cluster * k_tiles
+                        repeated_weight = None
+                        if cutlass.const_expr(self.routed_weight_reuse):
+                            expert_block = task_words[task_stage * 8 + 2]
+                            repeated_weight = Uint32(
+                                valid_m == Uint32(self.block_m) or expert_block != Uint32(0))
                         while k_block < k_tiles:
-                            # The weight loader ignores the activation geometry.
                             _load_k3_tma(
                                 activation_map, activation_sf_map,
                                 weight_map, weight_sf_map,
@@ -2335,9 +2343,7 @@ class GCK3MoERoleKernel:
                                 self.routed_weight_linger,
                                 self.shared_weight_linger,
                                 shared_block_m=self.shared_block_m,
-                                repeated_weight=(Uint32(valid_m == Uint32(self.block_m) or
-                                                        task_words[task_stage * 8 + 2] != Uint32(0))
-                                                 if cutlass.const_expr(self.full_split_k_tile) else None))
+                                repeated_weight=repeated_weight)
                             data_stage = Uint32(0) if data_stage == \
                                 data_stages - Uint32(1) else data_stage + Uint32(1)
                             data_phase ^= Uint32(data_stage == Uint32(0))
@@ -2939,7 +2945,7 @@ class GCK3MoERoleKernel:
                  tensor_map_7=None, tensor_map_8=None, tensor_map_9=None,
                  tensor_map_10=None, tensor_map_11=None, tensor_map_12=None,
                  tensor_map_13=None, tensor_map_14=None, tensor_map_15=None,
-                 tensor_map_16=None, tensor_map_17=None,
+                 tensor_map_16=None, tensor_map_17=None, valid_token_count=None,
                  routed_norm=None, norm_eps=None, routed_scale=None, final_out=None, shared_out=None, prefix_sum=None,
                projection_weight_map=None, projection_latent_map=None):
         if cutlass.const_expr(self.role == DISPATCH_ROLE):
@@ -2956,7 +2962,7 @@ class GCK3MoERoleKernel:
                         tensor_map_7, tensor_map_8, tensor_map_9,
                         tensor_map_10, tensor_map_11, tensor_map_12,
                         tensor_map_13, tensor_map_14, tensor_map_15,
-                        tensor_map_16, tensor_map_17).launch(
+                        tensor_map_16, tensor_map_17, valid_token_count).launch(
                 grid=(self.dispatch_sms if self.routed_assist else self.compute_sms, 1, 1), block=(384, 1, 1),
                 max_number_threads=(384, 1, 1),
                 cluster=(2, 1, 1), min_blocks_per_mp=1)

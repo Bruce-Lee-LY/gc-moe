@@ -227,6 +227,7 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                    shared_block_m: cutlass.Constexpr,
                    shared_w2_stage_ready: cutlass.Constexpr,
                    ring_blocks: cutlass.Constexpr, routed_assist: cutlass.Constexpr,
+                   midpoint_min_tokens: cutlass.Constexpr, valid_token_count,
 ) -> None:
     """Publish shared and interleaved routed tasks, then the end sentinel."""
     shared_m_blocks = (num_tokens + Uint32(shared_block_m - 1)) // \
@@ -297,15 +298,18 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
         interleave_warmup = (l1_clusters +
                              (routed_m_blocks - 1) * interleave_diff +
                              num_clusters - 1) // num_clusters + 1
-        total_l1_waves = (routed_m_blocks * l1_clusters +
-                          num_clusters - 1) // num_clusters
+        total_l1_waves = (routed_m_blocks * l1_clusters + num_clusters - 1) // num_clusters
         l1_warmup = min(total_l1_waves,
                         max(Uint32(first_l2_warmup), interleave_warmup))
-    if cutlass.const_expr(ring_blocks > 0):
-        # With one slot per live block, W2 does not need to free a slot
-        # before a later W1 can run. Batch the W1 weight traversal.
-        if routed_m_blocks <= Uint32(ring_blocks):
-            l1_warmup = (routed_m_blocks * l1_clusters + num_clusters - 1) // num_clusters
+        if cutlass.const_expr(ring_blocks > 0):
+            if routed_m_blocks <= Uint32(ring_blocks):
+                use_midpoint = midpoint_min_tokens > 0
+                if cutlass.const_expr(valid_token_count is not None):
+                    use_midpoint = valid_token_count[0] >= Int32(midpoint_min_tokens)
+                if use_midpoint:
+                    l1_warmup += (total_l1_waves - l1_warmup) // Uint32(2)
+                else:
+                    l1_warmup = total_l1_waves
     l1_done = Uint32(0xffffffff)
     scheduling = True
     if cutlass.const_expr(routed_assist):

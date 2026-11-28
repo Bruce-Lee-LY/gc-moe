@@ -427,17 +427,21 @@ def _entry_formals(ptx: str) -> list[str]:
     return lines
 
 
-def _order_compute_value_formals(ptx: str) -> str:
+def _order_compute_value_formals(ptx: str, with_live_count: bool) -> str:
     """Keep ordinary scalars ahead of the configuration-selected value maps."""
     formals = _entry_formals(ptx)
-    if len(formals) != TMA_MAP_COUNT + 6:
-        raise RuntimeError(f'compute value-formal count changed: expected={TMA_MAP_COUNT + 6}, observed={len(formals)}')
+    expected_count = TMA_MAP_COUNT + 6 + int(with_live_count)
+    if len(formals) != expected_count:
+        raise RuntimeError(f'compute value-formal count changed: expected={expected_count}, observed={len(formals)}')
     for index, line in enumerate(formals):
         if re.search(r"\b[A-Za-z0-9_.$]+_param_" + str(index) +
                      r"(?:\[[0-9]+\])?,?[ \t]*$", line) is None:
             raise RuntimeError(f'compute value-formal order changed: expected param_{index}, observed={line!r}')
     # Put the clamp and the shared workspace pointer before the value maps.
     order = (0, 1, 2, 3, 6, 5, *_COMPUTE_MAP_ORDINALS)
+    if with_live_count:
+        # Keep the optional live-count pointer after the value maps.
+        order += (expected_count - 1,)
     ordered = [formals[i].rstrip().rstrip(',') for i in order]
     original = '\n'.join(formals)
     if ptx.count(original) != 1:
@@ -448,7 +452,7 @@ def _order_compute_value_formals(ptx: str) -> str:
 def _assemble_role_value_params(ptx: str, role: int,
                                 dump_dir: str, *, target: str,
                                 has_shared: bool = False, routed_assist: bool = False,
-                                with_projection: bool = False,
+                                with_projection: bool = False, with_live_count: bool = False,
                                 ptxas_options: tuple[str, ...] = PTXAS_OPTIONS) -> tuple[str, bytes, str]:
     """Build each role with relative peer value, plus compute's value maps."""
     ptx = _clean_cute_ptx(ptx)
@@ -460,6 +464,8 @@ def _assemble_role_value_params(ptx: str, role: int,
         COMPUTE_ROLE: common + ('ptr', 'ptr', 'f32') + ('ptr',) * (TMA_MAP_COUNT - 1),
         FINALIZE_ROLE: common + ('ptr',),
     }[role]
+    if with_live_count:
+        expected += ('ptr',)
     if with_projection:
         expected += ('ptr', 'f32', 'f32') + ('ptr',) * 5
     formals = _entry_formals(ptx)
@@ -479,7 +485,7 @@ def _assemble_role_value_params(ptx: str, role: int,
             ptx = _rewrite_value_formal(
                 ptx, map_ordinal, 128, 128, raw_param_address=True)
         ptx = _convert_compute_map_uses(ptx, has_shared, routed_assist)
-        ptx = _order_compute_value_formals(ptx)
+        ptx = _order_compute_value_formals(ptx, with_live_count)
     elif with_projection:
         for ordinal in range(len(expected) - 2, len(expected)):
             ptx = _rewrite_value_formal(ptx, ordinal, 128, 128)
@@ -694,13 +700,25 @@ def prepare_role_binaries(config, y: torch.Tensor,
                 break
         if not projection_stages:
             raise ValueError('K3 combine and projection exceed the available shared memory')
-    # Enable the measured weight hints for one fully occupied, widest
-    # split-K tile. A live row count can change on each graph replay.
-    full_split_k_tile = (projection_splits > 1 and tile_rows == PROJECTION_ROW_TILES[-1]
-                         and config.tokens == tile_rows and (front is None or front[2] is None))
+    valid_token_count = front[2] if front else None
+    # Use the midpoint when local live routes divided by local experts
+    # can fill one CTA's M tile on average.
+    midpoint_min_tokens = ceil_div(
+        config.local_experts * (config.block_m // 2), sym_buffer.num_topk)
+    if config.tokens < midpoint_min_tokens:
+        midpoint_min_tokens = 0
+    compute_valid_count = valid_token_count if midpoint_min_tokens else None
+
+    # Enable the per-task routed hint in the largest split-K projection
+    # capture bucket. Each task uses its own valid rows and expert block,
+    # including on replays with partial valid rows.
+    routed_weight_reuse = (projection_splits > 1 and tile_rows == PROJECTION_ROW_TILES[-1]
+                           and config.tokens == tile_rows)
+    # The projection hint still requires a fully occupied split-K tile.
+    full_split_k_tile = routed_weight_reuse and valid_token_count is None
     combine_resources = (combine_reusable_bytes, combine_geometry,
                          tile_rows, projection_stages, projection_channels, projection_splits,
-                         full_split_k_tile)
+                         full_split_k_tile, routed_weight_reuse)
     key = _capture_key(config, sym_buffer, context, y, l1_weights, l2_weights,
                        shared_l1_weights, shared_l2_weights,
                        nvlink_timeout_secs, routed_weight_linger,
@@ -733,7 +751,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                 front_kernels = ()
                 front_maps = b''
                 if front:
-                    front_weight, _, valid_token_count, renormalize = front
+                    front_weight, _, _, renormalize = front
                     available_sms = context.compute_sms
                     if context.primary_ctx_roles:
                         available_sms += context.dispatch_sms
@@ -803,7 +821,10 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         fast_math=config.fast_math,
                         nvlink_timeout_secs=nvlink_timeout_secs,
                         routed_weight_linger=routed_weight_linger,
-                        full_split_k_tile=full_split_k_tile and role in (COMPUTE_ROLE, FINALIZE_ROLE),
+                        routed_weight_reuse=(
+                            role == COMPUTE_ROLE and routed_weight_reuse and not routed_weight_linger),
+                        routed_midpoint_min_tokens=midpoint_min_tokens if role == COMPUTE_ROLE else 0,
+                        full_split_k_tile=full_split_k_tile and role == FINALIZE_ROLE,
                         shared_weight_linger=shared_weight_linger,
                         role_config=role_configs[index],
                         per_source_ready=per_source_ready,
@@ -835,10 +856,10 @@ def prepare_role_binaries(config, y: torch.Tensor,
                     shared_y_view = from_dlpack(shared_y)
                     common_views = (signal_view, peer_view, Uint32(0), Uint32(0))
                     compiled_binaries = []
+                    valid_view = None if valid_token_count is None else from_dlpack(valid_token_count.view(1))
                     if front_kernels:
                         gemm_policy, router_policy = front_kernels
                         workspace_view = from_dlpack(map_storage)
-                        valid_view = None if valid_token_count is None else from_dlpack(valid_token_count.view(1))
 
                         def assemble_front(ptx, dump_dir):
                             ptx = _clean_cute_ptx(ptx)
@@ -870,12 +891,13 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         index = WORKER_ROLES.index(role)
                         compile_args = common_views
                         if role == COMPUTE_ROLE:
-                            compile_args += (map_views[0], shared_y_view, Float32(0.0), *map_views[1:])
+                            compile_args += (map_views[0], shared_y_view, Float32(0.0), *map_views[1:],
+                                             valid_view if compute_valid_count is not None else None)
                         elif role == FINALIZE_ROLE:
                             compile_args += (None, y_view, None)
                             if projection:
                                 _, prefix, out = projection
-                                compile_args += ((None,) * (TMA_MAP_COUNT - 1) +
+                                compile_args += ((None,) * TMA_MAP_COUNT +
                                     (from_dlpack(routed_norm), Float32(1e-6), Float32(1.0),
                                      from_dlpack(out), shared_y_view,
                                      from_dlpack(out if prefix is None else prefix), *map_views[:2]))
@@ -886,6 +908,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                                 has_shared=config.shared_experts > 0,
                                 routed_assist=role_kernel.routed_assist,
                                 with_projection=role == FINALIZE_ROLE and bool(projection),
+                                with_live_count=role == COMPUTE_ROLE and compute_valid_count is not None,
                                 ptxas_options=compiler_identity.ptxas_options))
                         role_config = role_configs[index]
                         compiled_binaries.append(RoleBinary(
@@ -935,8 +958,11 @@ def prepare_role_binaries(config, y: torch.Tensor,
     # compute writes shared output to the workspace for finalize.
     shared_y_arg = ctypes.c_void_p(shared_y.data_ptr())
     common_args = (signal_arg, peer_arg, rank_arg, token_arg)
+    compute_args = (*common_args, clamp_arg, shared_y_arg, *map_args)
+    if compute_valid_count is not None:
+        compute_args += (ctypes.c_void_p(compute_valid_count.data_ptr()),)
     arguments = (common_args,
-                 (*common_args, clamp_arg, shared_y_arg, *map_args),
+                 compute_args,
                  (*common_args, ctypes.c_void_p(y.data_ptr())))
     if projection:
         if len(prepared.projection_maps) != 256:

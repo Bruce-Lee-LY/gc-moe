@@ -53,6 +53,7 @@ import torch.distributed as dist
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import gc_moe
+from gc_moe.layout.gc_moe_k3 import ceil_div
 
 assert Path(gc_moe.__file__).resolve().is_relative_to(ROOT), gc_moe.__file__
 import deep_gemm
@@ -2602,6 +2603,63 @@ def check_front_workspace(ops, states, expected, prefix, expected_output):
                 and partial_live_output and full_outputs)
 
 
+def check_routed_warmup_replay(ops, states, expected_routes, prefix, expected_output,
+                               block_m, midpoint_min_tokens):
+    """Replay both in-ring routed warmup policies at fixed tensor addresses."""
+    a = ops.a
+    t = states.shape[0]
+    live = min(t // 2 + 1, midpoint_min_tokens - 1)
+    live_counts = (t, live, t)
+    buffer = ops.buffers[1]
+    ring_blocks = buffer.layout.ring_tokens // block_m
+
+    # Keep routing dispersed in both replays. Count incoming routes across
+    # all source ranks to verify that both live counts have in-ring work.
+    received = torch.stack([
+        torch.bincount(expected_routes[:n].flatten().long(), minlength=a.num_experts)
+        for n in (t, live)
+    ])
+    dist.all_reduce(received)
+    m_blocks = ((received + block_m - 1) // block_m).view(2, a.world, -1).sum(dim=-1)
+    full_blocks, partial_blocks = m_blocks[:, a.rank].tolist()
+    in_ring = 0 < full_blocks <= ring_blocks and 0 < partial_blocks <= ring_blocks
+
+    count = torch.tensor(t, dtype=torch.int32, device=a.device)
+    out = ops.output(1, t)
+
+    def call():
+        ops.call_gc(out, states, prefix, ops.norm_weight, ops.up_weight,
+                    valid_token_count=count)
+
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+
+    routes_ok = []
+    outputs_ok = []
+    for n in live_counts:
+        count.fill_(n)
+        out.fill_(float("nan"))
+        graph.replay()
+        routes_ok.append(
+            torch.equal(buffer.topk_idx[:n], expected_routes[:n])
+            and bool((buffer.topk_idx[n:t] == -1).all())
+            and bool((buffer.topk_weights[n:t] == 0).all())
+        )
+        outputs_ok.append(
+            cosine(out[:n], expected_output[:n]) >= a.cosine_threshold
+            and relative_l2(out[:n], expected_output[:n]) <= 0.02
+        )
+    torch.cuda.synchronize()
+    graph.reset()
+    return dict(rank=a.rank, graph_live_counts=live_counts,
+                midpoint_min_tokens=midpoint_min_tokens, ring_blocks=ring_blocks,
+                routed_m_blocks=[full_blocks, partial_blocks, full_blocks],
+                routes_ok=routes_ok, outputs_ok=outputs_ok,
+                passed=in_ring and all(routes_ok) and all(outputs_ok))
+
+
 def final_reference(ops, routed, shared, prefix, *, fused_beta, routed_scale=None,
                     round_norm_before_weight=False):
     scale = ops.a.routed_scaling_factor if routed_scale is None else routed_scale
@@ -2666,6 +2724,7 @@ def run():
     results = []
     lifetime = []
     front_checks = []
+    warmup_replay_checks = []
     invalid_count = torch.zeros((), device=a.device, dtype=torch.int32)
     for vector in a.vectors:
         t = vector[a.rank]
@@ -2686,7 +2745,8 @@ def run():
         ]
         values = check_outputs(ops, data, prefix, expected)
 
-        if a.case_category == "default" and not lifetime and len(set(vector)) == 1 and t >= 32:
+        symmetric_default = a.case_category == "default" and len(set(vector)) == 1
+        if symmetric_default and not lifetime and t >= 32:
             lifetime = [None] * a.world
             front_checks = [None] * a.world
             check_expert_weight_aliases(ops, data[1], prefix)
@@ -2694,6 +2754,17 @@ def run():
             dist.all_gather_object(front_checks, front_check)
             local = check_gc_storage_lifetime(a, ops, data[1], prefix, expected[1][1])
             dist.all_gather_object(lifetime, local)
+
+        if symmetric_default and not warmup_replay_checks and t:
+            buffer = ops.buffers[1]
+            block_m = gc_moe.get_block_m_for_gc_moe_k3(
+                a.world, a.num_experts, buffer.num_max_tokens_per_rank, t, a.num_topk)
+            midpoint_min_tokens = ceil_div((a.num_experts // a.world) * (block_m // 2), a.num_topk)
+            if 1 < midpoint_min_tokens <= t:
+                local = check_routed_warmup_replay(
+                    ops, data[1], staged[1][2], prefix, expected[1][1], block_m, midpoint_min_tokens)
+                warmup_replay_checks = [None] * a.world
+                dist.all_gather_object(warmup_replay_checks, local)
 
         # A fully padded local bucket still invalidates every old route.
         out = ops.output(1, t)
@@ -2732,10 +2803,13 @@ def run():
                   f'{BASELINE_NAMES[a.baseline]} cos={entry[f"{a.baseline_key}_cos_min"]:.6f} '
                   f'[{status}]', flush=True)
 
-    passed = all(x["passed"] for checks in (results, lifetime, front_checks) for x in checks)
+    passed = all(x["passed"]
+                 for checks in (results, lifetime, front_checks, warmup_replay_checks)
+                 for x in checks)
     report = evidence(a, ops)
     report.update(all_pass=passed, threshold=a.cosine_threshold, relative_l2_threshold=0.02,
-                  lifecycle_checks=lifetime, front_checks=front_checks, case_count=len(results),
+                  lifecycle_checks=lifetime, front_checks=front_checks,
+                  warmup_replay_checks=warmup_replay_checks, case_count=len(results),
                   rank_case_count=len(results) * a.world, results=results)
     write_result(a, report)
     if a.rank == 0:
